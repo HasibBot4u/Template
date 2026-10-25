@@ -1,0 +1,19 @@
+# Sowveil Studio Robots Configuration
+# Disallow indexing of authenticated workspaces, user project libraries, export jobs, and administrative/technical diagnostic paths.
+User-agent: *
+Allow: /
+Allow: /features
+Allow: /docs
+Allow: /terms
+Allow: /privacy
+Disallow: /admin
+Disallow: /admin/
+Disallow: /technical
+Disallow: /app/jobs
+Disallow: /app/projects
+Disallow: /app/project-library
+Disallow: /app/favorites
+Disallow: /app/settings
+Disallow: /api/
+
+Sitemap: https://ais-dev-nn4jeltvqjefaodoembxbd-775414035263.asia-southeast1.run.app/sitemap.xml

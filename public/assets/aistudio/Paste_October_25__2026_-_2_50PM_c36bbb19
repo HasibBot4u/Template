@@ -1,0 +1,863 @@
+
+You are the principal product architect, senior full-stack engineer, frontend design engineer, backend/API engineer, database architect, Adobe After Effects scripting/extension engineer, DevOps engineer, application-security engineer, accessibility specialist, QA lead, and technical writer for this project.
+
+Build **SOWVEIL STUDIO**, a polished, production-oriented motion-design toolkit inspired by the observable interface in the reference video. Treat this specification as an implementation contract. Do not merely explain a plan, draw a static screen, or create a decorative prototype. Generate and maintain real files, routes, state, data models, API handlers, validation, error states, tests, docs, and a working user interface.
+
+## A. Non-negotiable delivery rules
+
+1. **Inspect before changing.** Inspect the actual generated project structure, installed packages, available runtime, and current app state before making major changes. Preserve the platform's working scaffold. Do not blindly replace a working project with a new framework.
+2. **Implement in vertical slices.** Every visible control must have an intentional behavior. Do not create buttons that only animate visually, forms that never submit, fake progress bars, fake API success, fake analytics, fake login, fake downloads, or fake save operations.
+3. **Do not misrepresent unfinished capability.** If a feature needs a desktop companion, API credential, OS dependency, external service, or unsupported After Effects version, show a precise status and setup path. Never label an unimplemented feature “Ready.” Use explicit states such as `Available`, `Needs setup`, `Disconnected`, `Unsupported`, `Failed`, and `Not yet implemented` where appropriate.
+4. **No mystery backend.** Explain and document which work executes in the browser, which executes in the Node server, which persists in Firestore, and which runs on the local desktop companion. Validate requests on the server even if the UI validates them first.
+5. **Security first.** Never expose a server secret, Gemini API key, Firebase Admin credential, long-lived connector token, or private storage URL in client bundles, browser logs, source maps, URLs, or public Firestore documents. Use server-side secrets and least-privilege access.
+6. **Build for a phone-first owner.** The owner may use Google AI Studio from an Android phone. Prefer changes that can be performed in the AI Studio browser UI, produce clear copy/paste-ready instructions, and avoid requiring a local desktop just to inspect or manage the web app. Be honest that After Effects execution, local Whisper/FFmpeg processing, and extension testing need a compatible desktop.
+7. **Make it maintainable.** Use strict TypeScript where supported, small modules, typed API contracts, server-side validation, consistent error handling, reusable UI components, a documented environment configuration, migrations/seed strategy, and meaningful tests.
+8. **No accidental scope shortcuts.** Do not omit database rules, authorization, admin functions, loading/empty/error states, responsive behavior, audit logs, testing, deployment documentation, or accessibility because they are less visually interesting.
+9. **Do not invent hidden original features.** Reproduce known visible labels and known visible examples. For undocumented behavior, build a coherent original implementation and label assumptions in `docs/REFERENCE_GAPS.md`.
+10. **Do not copy proprietary template files or artwork.** Use original CSS/SVG/canvas-generated previews or assets supplied by the project owner. Keep the overall visual design and observable information architecture faithful without pretending to own original media.
+11. **Verify every claim.** After changes, report the exact files changed, commands/checks actually run, results, unresolved blockers, and which actions still require manual desktop/Cloud setup. Never say “deployed,” “tested,” “secure,” or “fully working” unless the corresponding test or deployment evidence exists.
+12. **Keep a durable project state.** Maintain `docs/PROJECT_STATUS.md`, `docs/ARCHITECTURE.md`, `docs/FEATURE_MATRIX.md`, `docs/SECURITY.md`, `docs/TESTING.md`, `docs/DEPLOYMENT.md`, `docs/REFERENCE_GAPS.md`, and `CHANGELOG.md`. Update them as implementation changes.
+
+## B. Product definition
+
+**Product name:** Sowveil Studio (working recreation).  
+**Product type:** A dark, professional motion-design productivity workspace with a browser-based dashboard and a desktop companion/After Effects integration layer.  
+**Primary user:** Motion designers and video editors who need reusable presets, animation helpers, composition builders, sound effects, device mockups, visual templates, captioning, media intake, and project organization.  
+**Core promise:** Browse a curated library, inspect a preview, configure a preset, and either apply it to a compatible After Effects project through a connected desktop companion or save/manage it in the web library.  
+**Visual identity:** Dark near-black/deep-brown surfaces, muted beige secondary text, bright orange/red action color, warm white labels, rounded cards, compact filters, small icon-based module navigation, preview-first detail panels, and dense but controlled information layout.
+
+The product must work meaningfully even when the desktop companion is not installed. In disconnected mode, users can browse assets, search, favorite items, inspect original previews, manage their cloud library, edit metadata they own, and configure settings. Operations that require the host application must be disabled with an explanation, not simulated as successful.
+
+## C. Platform-aware technical strategy
+
+Use the stack already provided by Google AI Studio Build mode where possible. Its current web-app workflow provides a React frontend and Node.js server runtime; it can provision Firebase Authentication and Cloud Firestore, store configured secrets for server-side code, sync with GitHub, and deploy the web application to Cloud Run. Confirm the actual scaffold and feature availability in this project before relying on a capability.
+
+### Web application stack
+
+- **Frontend:** React + TypeScript using the generated scaffold; reuse its current build tool and routing arrangement unless there is a demonstrated blocker.
+- **Styling:** CSS variables/design tokens and the existing styling tool. Use Tailwind only if already installed or easily supported; do not install multiple competing CSS frameworks. Keep the design system explicit.
+- **Icons:** `lucide-react` if available; otherwise use the installed icon package or lightweight inline SVG. No emoji as functional UI icons.
+- **Routing:** Use the existing router if present; otherwise React Router. All protected routes must check both authentication and role.
+- **Server:** Node.js/TypeScript server-side runtime provided by the project; create clear route/controller/service/repository boundaries. Keep Gemini API calls and secrets server-side.
+- **Database:** Cloud Firestore for accounts, catalog metadata, favorites, project metadata, settings, audit logs, connector state, and jobs. Do not put large binary media or huge template source files inside Firestore documents.
+- **Authentication:** Firebase Authentication, with Google Sign-In as the first supported method through AI Studio’s Firebase integration. Keep auth code behind an abstraction so other configured providers can be added later.
+- **Object storage:** Use Firebase Storage or another configured private object store for uploaded previews, thumbnails, and user-owned files only if the project can actually provision/configure it. If unavailable, implement a storage adapter interface and show `Storage not configured`; never pretend the upload succeeded. Enforce access policies and file limits.
+- **Validation:** Zod for incoming API payloads and environment configuration if package support permits; otherwise equivalent explicit typed validators. Server-side validation is mandatory.
+- **Client data:** Use the existing query/cache tooling if present; otherwise use a small typed fetch layer and React state. Avoid duplicating server state in several libraries. Use a small UI-state store only where genuinely useful.
+- **Testing:** Unit tests for pure business rules and validation; component/integration tests using available tooling; browser end-to-end tests if a supported test runner can be run. If the preview platform cannot run a test, write the test and record that it was not executed rather than inventing a pass.
+- **Deployment:** AI Studio preview during development, then Cloud Run through the supported AI Studio path or a documented alternative. Store secrets in the server environment, never in frontend `.env` variables.
+- **Version control:** GitHub two-way sync through AI Studio if the user connects it. Create logical checkpoints after phases and keep generated code reviewable.
+
+### Desktop integration strategy
+
+A browser app cannot directly manipulate a user's local After Effects timeline, access arbitrary desktop files, invoke Python, or run FFmpeg merely because its UI is shown in a browser. Treat host integration as a separate, explicit capability.
+
+Create a **separate companion package** in the repository, for example:
+
+- `packages/ae-panel/` — After Effects panel/script code and host-side command handlers, with compatibility notes.
+- `packages/desktop-connector/` — Node.js companion service/agent that runs on the editor's desktop, checks local dependencies, authenticates to the cloud using short-lived paired-device credentials, fetches queued jobs, forwards validated commands to the AE panel over a local file-backed queue or another documented local bridge, and reports structured results.
+- `packages/shared-contracts/` — command schemas, job types, validation rules, supported-operation allowlist, and error codes shared across the app and companion.
+
+Start with a conservative, documented ExtendScript/ScriptUI bridge for broad practical compatibility unless current official Adobe documentation and the actual installed host SDK prove a modern UXP implementation can be built and loaded for the target After Effects version. Design the host adapter so UXP can be added later without rewriting the cloud business logic. Adobe's UXP direction is evolving; do not claim compatibility based only on a future announcement. Provide a `HostAdapter` abstraction and record tested versions.
+
+The companion must connect **outbound** to the cloud API using HTTPS; do not expose an unauthenticated arbitrary-code HTTP server on the desktop. Use per-device pairing, revocation, a restricted command allowlist, request IDs, timeouts, idempotency checks, payload-size limits, and visible status. Never execute arbitrary code received from the cloud. Any raw scripting escape hatch must be disabled by default, limited to trusted owner-only mode, conspicuously warned, and not offered as a general public-user feature.
+
+If a complete AE panel cannot be executed or validated in AI Studio, still generate the source structure and installation guide, but mark the code as **generated, not host-verified**. Build the web product without depending on the extension being connected.
+
+## D. Product architecture and trust boundaries
+
+Create and document the following logical layers:
+
+1. **Browser UI:** navigation, catalog, preview controls, forms, user settings, status badges. It never possesses privileged server credentials.
+2. **API layer:** authenticated routes, input schemas, rate limits, request IDs, centralized errors, role checks and audit hooks.
+3. **Business services:** catalog search, favorites, template versioning, project library actions, caption/download job creation, device pairing, job state machines, audit events and analytics aggregation.
+4. **Persistence layer:** Firestore repositories. Avoid scattering direct database calls across unrelated components.
+5. **Asset storage adapter:** private uploads and generated previews where configured; access URLs are short-lived or proxy-protected as appropriate.
+6. **Desktop connector:** device-authenticated polling/long-polling of queued jobs and execution of the narrow set of supported operations.
+7. **After Effects host adapter:** validated operations in the running project. Never assume the current composition, selected layer, active document or playhead exists; inspect and validate before modifying anything.
+8. **Local utilities:** optional Whisper/Python/FFmpeg/yt-dlp dependency check and execution on the desktop where configured. Do not silently move the user's files to cloud storage.
+9. **Operations/observability:** structured server logs, audit records, health checks, safe status telemetry, and aggregate feature metrics without collecting private project contents unnecessarily.
+
+Document the flow in Mermaid diagrams in `docs/ARCHITECTURE.md` and include trust boundaries, data flows, error paths, and what happens if the browser, server, Firebase, connector, AE panel, or external binary is unavailable.
+
+## E. Main navigation and visual modules
+
+Recreate the reference's compact two-row module selector, preserving the module order and visible labels listed below. On wide screens the modules occupy the top area of the workspace; on narrow screens they become a horizontally scrollable/tappable module strip or a compact responsive grid without clipping. Every module must have a route or a well-defined workspace state and must have search/filter/empty/loading/error behavior appropriate to it.
+
+The reference shows these 20 modules:
+
+1. Text Animation
+2. Expressions
+3. Easing
+4. SFX
+5. Ready-made
+6. UI & SaaS
+7. Liquid Glass
+8. Carousel
+9. Transitions
+10. 3D Models
+11. Mockups
+12. Logo Reveals
+13. Backgrounds
+14. Overlays & FX
+15. Maps
+16. SaaS Effects
+17. Templates
+18. Auto Captions
+19. Downloader
+20. Project Library
+
+Keep module metadata data-driven. Each module record should include `id`, `label`, `icon`, `description`, `route`, `capabilityType`, `enabled`, `requiresDesktop`, `requiresNetwork`, `requiresLocalDependency`, `displayOrder`, and `permissions`. Hide/disable a module only by clear configuration or role policy. Do not fork the workspace into twenty unrelated implementations.
+
+## F. Reference-derived catalog seeds
+
+Use the following names as **known visible examples**, not a claim that the complete original library is available. Seed original demo implementations for the visible examples that can be built now. A catalog card must accurately indicate whether its action is supported by the current implementation. Count badges must derive from real stored records. Do not display fake catalog totals while only storing a handful of items. Store `referenceReportedCount` separately if needed for documentation, but do not present it as the actual available count unless the full underlying catalog is genuinely populated.
+
+### 1. Text Animation
+Reference showed a count badge of 220 and filters resembling `All text animations`, `Favorites`, `Text Animators`, `Source Text`, `Apple Silky Text`, and `Digital Decoder Text Animation`.
+Known examples include:
+- `Rise Up`
+- `Soft Focus`
+- `Pop`
+- `Slide In`
+- `Drop & Bounce`
+- `Typewriter`
+- `Scatter Fade`
+- `Spread Open`
+- `Shrink Out`
+- `Typing with Cursor`
+- `Word by Word`
+- `Count Up`
+- `Percent Loader`
+- `Decode`
+- `Countdown`
+- `Blinking Cursor`
+- `Apple Silky Text`
+- `Apple Silky Text - match cut…`
+- `GE Title 01 Color` and other numbered `GE Title … Color` entries
+- `Scene 1` and numbered scenes
+- `Modern Title 16`
+
+The `Slide In` example describes words sliding in from the left with a soft stop. `Decode` is labelled `SourceText` and describes random symbols resolving to text from left to right. Host-side behavior must check whether a compatible text layer is selected.
+
+### 2. Expressions
+Reference count: 12. Visible presets:
+- `Wiggle` — signature shown as `wiggle(freq, amp, octaves)`
+- `Bounce`
+- `Bounce Out`
+- `Loop Out`
+- `Random Seed`
+- `Sine Wave`
+- `Hover Float`
+- `Throw`
+- `Breathe`
+- `Auto-Fade`
+- `Flicker`
+- `Spin`
+
+The reference states that expressions apply to selected timeline properties; if only layers are selected, Position is the fallback. Require a confirmation/preview of the target properties before applying. Include `Remove expressions from selection` and `Add to favorites` where supported.
+
+### 3. Easing
+Reference count: 26. Groups: Basic 9, Ease In 6, Ease Out 6, Ease In-Out 7. Known labels:
+- `Linear`
+- `Soft Ease`
+- `Smooth`
+- `Decelerate`
+- `Accelerate`
+- `Snappy`
+- `Apple Glide`
+- `Early Peak`
+- `Late Peak`
+- `Sine In`
+- `Quad In`
+- `Cubic In`
+- `Quart In`
+- `Expo In`
+- `Sine Out`
+- `Quad Out`
+- `Cubic Out`
+- `Quart Out`
+
+Render a real SVG/canvas curve preview for the selected preset. The graph is illustrative until keyframes are selected in After Effects. When operating in AE, preserve selected properties and provide undoable changes.
+
+### 4. SFX
+Reference count: 60. Visible filters include `Whooshes`, `Pops`, `Clicks`, `UI`, `Typing`, `Notifications`, `Risers & Hits`, `Misc`. Known examples:
+- `UI Enter`
+- `UI Bookpage`
+- `UI Glitch Click`
+- `UI Select`
+- `UI Stretch`
+- `UI Tone`
+- `Type and Delete`
+- `Typing`
+- `Laptop Typing`
+- `Glass Notification`
+- `Soft Shine`
+- `Reward`
+- `Rising Notification`
+- `Shiny`
+- `Incoming Message`
+- `Notification Pop`
+- `Wrong`
+- `Premium Riser`
+- `Cinematic Fast Whoosh`
+
+The reference shows a waveform, play/pause, volume slider in dB and `Add to comp`. Use original/appropriately licensed demo sound files only. If the sound asset is missing, show a broken/missing-asset state rather than synthesizing fake playback. Use an actual audio element for browser preview and a host operation to import/insert it into AE.
+
+### 5. Ready-made
+Reference shows groups with templates and compositions. Visible examples include:
+- `AI Model Switcher`
+- `Dental Treatment Options C…`
+- `Digital Wallets`
+- `Folder Scene 01` through `Folder Scene 06`
+- `Glass UI List`
+- `Idea Branch Network Reveal`
+- `New Follower Notification`
+- `UI Glass Folder`
+- `UI Music App Animation`
+- `UI Text Animation`
+
+Metadata examples include `AI Model Switcher` at `1080 × 1920 · 12s · 30 fps` and `Folder Scene 04` at `2160 × 3840 · 1:00 min · 30 fps`. Actions shown include `Add to comp`, `Open as new comp`, and `Reset values`. Treat these names as composition/template labels only; do not infer an actual AI-model integration from the words `AI Model Switcher`.
+
+### 6. UI & SaaS
+Reference count: 104. Known groups include `3D Keyboard Buttons Kit`, `Gift Animation`, `SaaS Motion Kit Pack 01`, `Tracking Interface`, and `UI Packs`. Visible examples:
+- `31. Widget`
+- `Keyboard`
+- `Gift #01`
+- `Animation_01`
+- `Animation_03`
+- `Btn 1 - Azure Glass`
+- `Btn 2 - Prism Outline`
+
+A `Keyboard` example shows `2500 × 833 · 10s · 30 fps`. Include a useful preview and, when available, editable template parameters. Do not imply the shown high-resolution AE comp itself exists in the app until its asset is uploaded or generated.
+
+### 7. Liquid Glass
+Reference count: 30. Groups include `Glass effects`, `Glass UI List`, `Liquid Glass Social Lower Th…`, `Liquid Glass UI Pack`, and `UI Glass Folder`. Visible names:
+- `Glass Panel`
+- `Glass From Selection`
+- `Liquid Glass`
+- `Track Liquid Glass`
+- `Remove Glass`
+- `Glass UI List`
+
+`Glass Panel` is described as adding a rounded glass card with blurred backdrop, soft white fill, fine edge and drop shadow; its blur should track its layer when moved/scaled/rotated in AE. Browser preview should use real CSS/SVG visual treatment, while host effects must be explicitly supported by the extension adapter.
+
+### 8. Carousel
+Reference count: 12. Groups include `Carousel builder`, `3D Sphere Carousel`, `Dental Treatment Options C…`, and `Realistic 3D Glass Carousel`. Names include `Carousel builder`, `SPHERE 1`, `SPHERE 2`, `SPHERE 3`, `SPHERE 4`, `SPHERE vertical 1`, `SPHERE vertical 2`, `SPHERE vertical 3`, `SPHERE vertical 4`.
+
+Builder controls shown:
+- Cards source: `Placeholders`, `Selected layers`, `Files`
+- `Number of cards` slider (reference example: 8)
+- Color swatches
+- `Card size (% of width)` slider (reference example: 13)
+- `Shape` section
+- `Add to comp`
+
+The reference description says the generated AE scene contains cards, a camera, a tilt-control null, and a spin null. For Files source, validate file types and size. For Selected layers source, require selected compatible layers. In browser-only mode, let users configure and preview a JSON scene specification but do not claim it has created an AE composition.
+
+### 9. Transitions
+Reference showed 8 entries under `Vertical Glow Transitions Unfold`, with visible names `Anim 1` through `Anim 8`. A sample shows `1100 × 1956 · 5s · 30 fps`. Build original transition previews and a compatible AE operation for supported templates only.
+
+### 10. 3D Models
+Reference count: 34, with groups like `3D Glossy Inflated Pack`, `Abstract Neon Glossy 3D Shapes`, and `Glossy 3D Abstract Shapes`. Known names include `Shape_07`, `Shape_08`, `Shape_09`, `Shape_10`, `Abstract Shapes_01`, `_02`, `_04`, `_05`, `_06`, `_07`, `_08`, `_09`, `_10`, `_11`. A sample `Abstract Shapes_05` shows `3840 × 2160 · 10s · 24 fps`. Do not claim a true editable 3D model where only an AE template or rendered preview exists. Asset records must include `assetKind` such as `image`, `video`, `audio`, `ae-project`, `ae-template`, `svg`, `model3d`, or `scene-spec`.
+
+### 11. Mockups
+Reference count: 24; groups include `Laptop Mockup`, `Laptop Screen Mockup - Co…`, and `Laptop Screen Mockup - Ex…`. Visible examples:
+- `Screen_2`, `Screen_3`, `Screen_4`, `Screen_5`, `Screen_6`
+- `Phone 18 Pro Mockup`
+- `Scene_03_comp`
+- `Screen Comp 01`
+- `SCENE_01` through `SCENE_06`
+
+Some visible metadata examples: `Scene_03_comp` has `1920 × 1080 · 5s · 30 fps`; `SCENE_02` shows `3840 × 2160 · 1:00 min · 60 fps`. These are reference metadata samples, not guaranteed real bundled media.
+
+### 12. Logo Reveals
+Reference count: 13. Groups include `Camera Logo Reveal`, `Cyber Glitch Rain Reveal`, and `Digital Futuristic Logo Intro`. Names include:
+- `Camera Logo Reveal`
+- `Cyber Rain Glitch Intro`
+- `Main_Comp_Final`
+- `Horizontal 1920x1080`
+- `Square 1080x1350`
+- `Vertical 1080x1920`
+- `Final Render`
+- `Idea Branch Network Reveal`
+- `Render Comp`
+- `Main Logo`
+- `Main Logo 2`
+- `Main Logo 3`
+- `Main Logo 4`
+
+A `Main Logo` reference shows a retro sunset/palm-tree treatment and `3840 × 2160 · 10s · 30 fps`. Build original demo artwork, not a copy of copyrighted assets.
+
+### 13. Backgrounds
+Reference count: 24; groups include `Animated gradients`, `Dynamic Grid Background`, and `Flash Grid Effect`. Visible assets:
+- `Animated gradients`
+- `Dynamic Grid Background 1` and numbered variants
+- `Horizontal Grid 01 CC`
+- `Horizontal Grid 02 CC`
+- `Vertical Grid 01 CC`
+- `Vertical Grid 03 CC`
+- `Vertical Grid 04 CC`
+
+A sample `Dynamic Grid Background 5` shows `3840 × 2160 · 10s · 30 fps`. Use CSS/canvas/SVG for original previews and allow downloadable/exportable source only when the feature actually creates it.
+
+### 14. Overlays & FX
+Reference count: 72. Groups include `40 Y2K Abstract Shapes`, `8-Bit Pixel Bursts`, `8-Bit Pixel Overlay`, `ASCII Overlay`, and `Old TV Poster Stories`. Known names include `Pixel Burst 19`, `Pixel Burst 20`, `HD_Pixel_Overlay_01` through `_05`, `ASCII Overlay`, `Titles 01`, `Titles 02`, `Titles 03`, `Painting Effect FHD`, `Overlays_01`, `Overlays_02`, `Pixel Burst 15`. Visible sample metadata: a pixel burst `900 × 900 · 2s · 24 fps`; a vertical title example `1080 × 1920 · 15s · 25 fps`; an overlay example `1920 × 1080 · 1:00 min · 30 fps`.
+
+### 15. Maps
+Reference count: 10; groups: `Map Points - Location Markers`, `Map Route Widgets`, `World Route Map`. Visible examples:
+- `Change_Point`
+- `Render_Map_Dark`
+- `Render_Map_Light`
+- `Map Route Widgets 01` through `06`
+- `WORLD_ROUTE_MAP`
+
+Map-based previews may use original SVG routes/markers. Do not call external map APIs unless configured and documented.
+
+### 16. SaaS Effects
+The reference badge says `All 8` while nine card names appear visible; treat this as a source-count discrepancy. Names include `Depth Reveal 1`, `Depth Reveal 2`, `Depth Reveal 3`, three `Cursor` items, `Splash Click`, `Smoke Click`, and `Dot Burst Click`. The `Depth Reveal` description says it builds a depth map from an image and reveals near-to-far; first use downloads a Python runtime and Depth Anything V2 model after confirmation. Do not auto-download a large model silently. Show dependency size/status, terms/license, disk estimate where known, confirmation, progress, cancellation and failure recovery. Do not promise local depth processing until the dependency is actually installed and verified.
+
+### 17. Templates
+Reference showed `Search 20 templates` and filters `All`, `UI`, `Data`, `Marketing`, `Typography`, `Logo`, `Social`, `Backgrounds`, `Device`, and `3D / Glass`. Visible examples include:
+- `Click Burst Prompt` — UI
+- `Notification Stack` — UI
+- `Analytics Card` — Data
+- `Line Graph Draw` — Data
+- `Search Typing Re…` — UI
+- `Chat Conversation` — UI
+- `Pricing Cards` — Marketing
+- `Toggle Switches` — UI
+- `Loading → Success…` — UI
+- `Kinetic Title Slam` — Typography
+- `NIGHT DRIVE`
+
+Build a searchable gallery with working category chips and a useful detail view. `Search 20 templates` must reflect the actual item count, unless clearly labelled as a reference annotation.
+
+### 18. Auto Captions
+Reference workflow shows:
+1. **Source:** `Use selected layer` or `Choose file…`.
+2. **Transcribe:** model dropdown (example: `Turbo (best speed/quality)`), language (`Auto detect`), words-per-caption (example: `3`).
+3. **Edit text:** editable transcription text.
+
+A status note says: `Ready: Python + Whisper + ffmpeg. Everything runs on this computer.` Implement the real system as an optional **desktop companion job**, not a browser promise. Required behavior:
+- Check for Python, Whisper/model availability and FFmpeg on the desktop.
+- Show which dependencies are installed and their versions; do not download without explicit confirmation.
+- Accept a user-owned local file or a validated AE selection path only when permissions allow.
+- Show queued/running/completed/failed/cancelled states, elapsed time, logs with private paths redacted, and retry where safe.
+- Store transcript text and caption settings only if the user elects to save them.
+- Provide editable text, timestamped segments, language/model metadata, confidence where provided by the actual transcription engine, and export to SRT/VTT/JSON when implemented.
+- Never invent a transcript, claim “100% accurate,” or fake a progress result.
+- Explain that browser-only preview cannot access arbitrary local desktop files.
+
+### 19. Downloader
+Reference modes: `Video`, `Audio only`, `Thumbnail`. Visible controls include a URL input, `Paste`, a `Download` button, quality dropdown set to `1080p`, a `SAVE TO` section, `Import into project`, and `Add to active comp`. A status note says `yt-dlp + ffmpeg ready`. The UI shows examples of YouTube, Vimeo, X and TikTok URLs and a warning to download only media the user owns or is permitted to use.
+
+Implement a policy-safe and secure media-intake workflow. It must only process direct downloadable media or platform/source methods that are permitted and configured. Do not bypass DRM, login walls, paywalls, technical restrictions, or platform access controls. Do not scrape private content. Require rights/permission acknowledgement. Run downloaded files through file-size and type limits; normalize filenames; prevent path traversal; protect against SSRF (block loopback, private, link-local and metadata IPs, revalidate every redirect and resolved address, restrict schemes, cap redirects, and guard DNS rebinding). Use a desktop job via the companion when local `yt-dlp`/`ffmpeg` is needed. If binaries are missing or unsupported, show a useful setup checklist and disable execution. Do not expose a public anonymous URL-fetching endpoint.
+
+### 20. Project Library
+Reference controls include:
+- `Search projects and comps`
+- `+ Save project`
+- `Add .aep`
+- A folder icon
+
+Visible project/comp names include `Apple Silky Text`, `Wave Text Animation`, `Folder Animation…`, `UI Text Animation`, `Glass UI List`, `Digital Wallets`, `UI Glass Folder`, `AI Model Switcher`, `Dental Treatment Options C…`, `Folder Scene 01`–`Folder Scene 06`, `Idea Branch Network Reveal`, `New Follower Notification`, and `UI Music App Animation`.
+
+Visible metadata examples include counts, dates, file sizes, composition resolution, duration and frame rate. Implement search, owner-scoped persistence, upload/import of allowed project metadata/assets, project cards, details, last-opened state, and archive/delete confirmations. A cloud library entry does not imply that an `.aep` file has been uploaded; differentiate metadata-only records from actual stored files. Warn if a project includes external footage paths and do not promise a portable project unless its dependencies are packaged.
+
+## G. Shared module browser interaction contract
+
+Every applicable module must use a consistent selection/detail layout:
+
+1. Module selector with tooltip/accessible name.
+2. Title and description.
+3. Category/pack filters with active-state styling and item counts derived from actual data.
+4. Search field with clear button, debounced filtering, keyboard support and useful no-results state.
+5. Sort options where meaningful (name, recently added, favorites, newest).
+6. Card grid/list with selected state; no click target without action.
+7. Detail panel with title, tags, pack, capability/status, asset type, duration, resolution, frame rate, license/origin metadata when known, favorite action and preview.
+8. Preview area with actual content, loading state, error fallback, play/pause when animation/audio supports it, and `Template` / `Your edits` comparison for templates that truly support configurable variants.
+9. A primary action appropriate to the item (`Apply`, `Add to comp`, `Add glass panel`, `Open as new comp`, `Download`, or `Preview`), plus secondary actions such as `Reset values`, `Add to favorites` and `Remove from favorites` when applicable.
+10. A setup/permission/connection notice if the action needs After Effects, a local binary, a missing asset, or a privileged role.
+11. Confirm destructive or expensive operations. Preserve a clear Undo/reversal path for AE edits where technically supported.
+
+Do not use one generic handler for all modules. Define typed action contracts per capability. The UI may reuse components, but each module must call the correct service and receive typed success/failure results.
+
+## H. UI/UX and responsive behavior
+
+Create a faithful dark technical creative-tool appearance. Prioritize the After Effects panel-like dense browser on desktop while making the web version genuinely usable on phones.
+
+### Design tokens
+Use CSS custom properties with a single source of truth. Suggested starting point:
+- `--app-bg: #080707`
+- `--surface-1: #11100F`
+- `--surface-2: #191614`
+- `--surface-3: #211B17`
+- `--border: #342A24`
+- `--text-primary: #F3EEE8`
+- `--text-secondary: #B8AAA0`
+- `--text-muted: #83766D`
+- `--accent: #F06424`
+- `--accent-strong: #FF4B24`
+- `--accent-soft: rgba(240,100,36,.14)`
+- `--warning: #E4B45A`
+- `--success: #55B98B`
+- `--danger: #F06464`
+- `--focus: #FFC08C`
+
+These are starting values, not claims of exact sampled original hex values. Keep contrast accessible and tune based on the preview. Avoid large generic gradients unrelated to the reference. Reserve bright accent for selected states, action controls, progress and focus indicators.
+
+### Layout
+- Header/brand area: compact `SOWVEIL STUDIO` branding and visible workspace status; a settings control opens a real settings panel.
+- Main module row: 20 items in two rows on large screens, with clear selected state and keyboard focus; on mobile, horizontally scrollable categories with no hidden navigation.
+- Main body: left filters/catalog region; right preview/details region. On small screens, use an explicit list → detail navigation or stacked layout; never shrink text into illegibility.
+- Cards: rounded, low-contrast surfaces, subtle borders, orange selected outline/fill, label and compact category/status badges.
+- Keep typography compact but readable. Do not sacrifice touch targets for pixel density. Interactive targets should generally be at least 44 × 44 CSS pixels on mobile where layout allows.
+- Support reduced-motion preference. Provide motion previews only when the user starts them or the preview is lightweight and safe.
+- Keep sticky headers and scroll regions intentional; ensure the detail panel can scroll to controls below the fold.
+
+### Required states
+Every page and component that fetches or writes data needs loading, empty, success, warning, error and retry states as applicable. Use toast feedback for transient results, inline validation for form issues, and a visible connection status for Firebase/API/desktop companion. Do not use color alone to indicate state.
+
+### Accessibility
+Use semantic landmarks, heading hierarchy, visible focus, keyboard navigation, labels for icon-only buttons, accessible dialogs, Escape-to-close where appropriate, focus restoration, reduced motion, captions/alt text for preview assets, and WCAG AA contrast targets. Do not put every control in a tooltip-only interface.
+
+## I. Pages, routes and panels
+
+Implement the following page map. If the existing router differs, adapt the route names while preserving equivalent navigation and protection.
+
+### Public routes
+- `/` — public landing page showing the product concept, a restrained hero, capability grid, preview gallery with original sample visuals, legal links and clear sign-in/open-workspace action. Do not claim all features are available if status says otherwise.
+- `/features` — feature catalog grouped by module and capability.
+- `/docs` — user documentation, supported operations, local companion setup and troubleshooting.
+- `/privacy` — privacy/data processing summary matching the actual implementation.
+- `/terms` — terms placeholder only if clearly labelled for owner/legal review; do not invent legal compliance certification.
+- `/sign-in` — Firebase sign-in flow and error handling.
+- `/auth/callback` — callback/redirect handling if the chosen auth flow needs it.
+
+### Authenticated user routes
+- `/app` — dashboard with recent projects, favorites, available modules, connector state, recent jobs, useful shortcuts and onboarding checklist.
+- `/app/workspace` — shared module browser shell with the 20 module routes or module-state pages.
+- `/app/text-animation`
+- `/app/expressions`
+- `/app/easing`
+- `/app/sfx`
+- `/app/ready-made`
+- `/app/ui-saas`
+- `/app/liquid-glass`
+- `/app/carousel`
+- `/app/transitions`
+- `/app/3d-models`
+- `/app/mockups`
+- `/app/logo-reveals`
+- `/app/backgrounds`
+- `/app/overlays-fx`
+- `/app/maps`
+- `/app/saas-effects`
+- `/app/templates`
+- `/app/auto-captions`
+- `/app/downloader`
+- `/app/project-library`
+- `/app/favorites` — global favorites with filters.
+- `/app/jobs` — captioning, downloading and AE operation job history, with accurate status.
+- `/app/settings/profile` — basic account preferences.
+- `/app/settings/preferences` — theme, preview quality, reduced motion and default behavior.
+- `/app/settings/devices` — paired desktop devices, status and revoke action.
+- `/app/help` — searchable help and support details.
+
+### Technical status page
+- `/technical` — low-risk diagnostics for the signed-in user: web app version/build, frontend/API reachability, Firebase readiness, database check only via a safe server health route, desktop connector state/last-seen time, supported host version, local dependency report returned by the paired companion, pending jobs, last errors with secrets/paths redacted. Never expose raw environment variables or service credentials.
+
+### Admin routes (admin or owner only)
+- `/admin` — overview of actual active users, catalog/asset counts, job success/failure summaries, error trends, connector versions and audit alerts; metrics must be real or explicitly marked demo data.
+- `/admin/catalog` — CRUD for modules, categories, presets/templates, search terms, tags, capability type, visibility, version and status.
+- `/admin/assets` — uploaded asset metadata, license/origin, file validation, replacement, thumbnail generation status, storage state and orphan cleanup.
+- `/admin/users` — account list, role, account status, created/last-seen metadata if actually collected; prevent changing own final owner role without a safe handoff path.
+- `/admin/roles` — explicit role/permission matrix.
+- `/admin/jobs` — operational job queue, failure details with redaction, retry/cancel where safe.
+- `/admin/devices` — paired devices, connector version, revocation and policy state.
+- `/admin/analytics` — event definitions, time window, cohort and retention settings; only show real aggregated data.
+- `/admin/audit` — append-only event viewer with filters and actor/action/object/time; no secrets.
+- `/admin/settings` — feature flags, safe limits, retention settings, configured integration health, maintenance banner and brand metadata. Critical security settings must not be editable by arbitrary admins.
+
+All admin paths and actions must be enforced by server-side authorization, not only hidden in the UI.
+
+## J. Data model and Firestore design
+
+Use stable document IDs, server timestamps, ownership fields, indexes for actual queries and collection-level documentation. Define explicit types in shared code. Use cursor pagination rather than loading unlimited collections. Avoid storing sensitive data in public-facing documents.
+
+Suggested collections (adjust if the scaffold requires different naming, but retain these logical records):
+
+1. **`users/{uid}`**
+   - `uid`, `email`, `displayName`, `photoURL` (optional, provider-derived)
+   - `role` (`user`, `admin`, `owner`)
+   - `status` (`active`, `suspended`, `pending`)
+   - `createdAt`, `updatedAt`, `lastLoginAt` (only when recorded honestly)
+   - `preferences` (theme, reducedMotion, previewSettings)
+   - never accept role from public client writes.
+
+2. **`modules/{moduleId}`**
+   - stable id, label, description, icon key, route, display order
+   - capability type, enabled state, required permission, desktop/dependency requirements
+   - created/updated timestamps and schema version.
+
+3. **`catalogItems/{itemId}`**
+   - `moduleId`, `name`, `slug`, `summary`, `description`, `tags[]`, `categoryId`, `packId`
+   - `assetKind`, `capabilityType`, `previewAssetId`, `sourceAssetId` (optional)
+   - `metadata`: duration, width, height, fps, version, file size only where known
+   - `supportedOperations[]`, `requiredHostCapabilities[]`, `requiredDependencies[]`
+   - `licenseType`, `licenseNote`, `sourceType`, `sourceURL` (where legitimate and known)
+   - `visibility` (`draft`, `published`, `archived`), `createdBy`, timestamps, revision/version.
+   - Add `referenceLabels[]` and `referenceReportedCount` only as documentation metadata; never confuse these with functioning items.
+
+4. **`categories/{categoryId}`**
+   - module, label, slug, order, visibility, timestamps.
+
+5. **`assets/{assetId}`**
+   - owner/visibility, storage key, public/private state, MIME type, byte size, checksum, dimensions/duration if inspected, preview location, license, processing state, createdAt.
+   - No secret bucket credentials or unbounded direct download URL.
+
+6. **`favorites/{uid}/items/{itemId}`** or an equivalent owner-scoped representation
+   - user id, item id, createdAt. Enforce uniqueness/idempotence by deterministic ID.
+
+7. **`projects/{projectId}`**
+   - owner uid, title, description, asset reference, project-file status (`metadata-only`, `uploaded`, `linked-local`, `packaged`), file size, checksum, AE version if known, composition summary if inspected, source path excluded unless the user explicitly stores it locally and does not upload it, tags, createdAt/updatedAt/lastOpenedAt, archive/delete state.
+   - Check owner access for every read/write.
+
+8. **`jobs/{jobId}`**
+   - owner uid, type (`caption`, `download`, `ae-operation`, `asset-process`), status (`queued`, `claimed`, `running`, `succeeded`, `failed`, `cancelled`, `needs-setup`, `expired`)
+   - validated input schema/version, safe output metadata, progress only when reported by worker, createdAt/startedAt/finishedAt/updatedAt, attempt count, idempotency key, device id, error code and redacted message.
+   - Do not store arbitrary executable code in a job payload.
+
+9. **`devices/{deviceId}`** (sensitive server-only or carefully rule-gated)
+   - owner uid, display label, OS, connector version, host version, capabilities, lastSeenAt, status, revokedAt, pairing metadata. Credential hashes only; never store plaintext long-lived tokens in readable documents.
+
+10. **`devicePairingTokens/{tokenId}`** (server-only)
+    - hash of one-time token, owner uid, expiresAt, usedAt, intended purpose. Expire quickly and invalidate after use.
+
+11. **`auditEvents/{eventId}`**
+    - actor id/role, action, object type/id, timestamp, result, requestId, minimal redacted metadata. Append-only for clients; server-controlled creation.
+
+12. **`analyticsEvents/{eventId}`** or a safer aggregate system
+    - event type, timestamp, pseudonymous uid where justified, module/action category, app version, coarse outcome. Do not capture project filenames, transcript text, URLs with query secrets, file contents, or private prompt contents. Provide consent/opt-out and retention policy.
+
+13. **`appConfig/public`** and **server-only configuration**
+    - Public safe configuration such as maintenance message and visible feature flags. Server-only limits and secrets are not in client-readable documents.
+
+Use Firestore composite indexes as needed. Document required indexes and setup. Create secure Firestore rules and test them: users can read/update only allowed profile fields on their own profile; they cannot self-promote roles; users can access only their favorites/projects/jobs/devices; catalog read access depends on visibility; only admins manage published catalog; audit logs are not client-writable; pairing token collections are server-only; and sensitive jobs/devices are accessed via authorized server routes where practical.
+
+If the AI Studio agent cannot configure Firebase or the user has not approved setup, make setup state visible and provide precise steps. Do not silently fall back to `localStorage` as if it were a cloud database. Local storage may only hold harmless UI preferences/cache.
+
+## K. Authentication, authorization and session security
+
+- Use Firebase Authentication with Google Sign-In as the first flow, subject to explicit Firebase setup.
+- Distinguish **authentication** (who the user is) from **authorization** (what the user can do).
+- Use least-privilege roles: `user`, `admin`, `owner`. The first owner must be bootstrapped through a documented, server-controlled one-time process or secure environment configuration; never grant owner to the first arbitrary visitor.
+- For sensitive writes, verify the Firebase ID token server-side using the appropriate Firebase Admin/server mechanism supported by the runtime. Do not trust a client-supplied `uid`, `role`, `email`, `isAdmin`, or `ownerId`.
+- Authorization matrix: users manage their own favorites/projects/preferences/jobs/devices; catalog is read-only for standard users except favorites; admin manages catalog/assets/users at restricted granularity; owner manages high-risk roles and system settings.
+- Do not create open public registration that grants elevated role. A suspended user cannot create jobs or access protected resources.
+- Handle login cancellation, popup blockers, expired sessions, revoked sessions, sign-out, redirect state, and permission denial gracefully.
+- Keep session persistence deliberate; never put access tokens in query parameters or logs.
+- Add rate limits for sign-in-dependent sensitive operations, pairing, job creation, media URL processing, and admin mutations.
+
+## L. API contracts and business logic
+
+Create a documented API route table. Prefer versioned API paths such as `/api/v1/...`. Every route must have a consistent response shape, request validation, auth requirements, rate limit and error mapping.
+
+Suggested response convention:
+
+- Success: `{ "ok": true, "data": ..., "requestId": "..." }`
+- Failure: `{ "ok": false, "error": { "code": "...", "message": "...", "details": ... }, "requestId": "..." }`
+
+Never return stack traces, secrets, internal file paths or raw database errors to the browser. Include proper HTTP status codes.
+
+### Required API families
+
+**Health/config**
+- `GET /api/v1/health` — safe readiness/liveness summary; no secrets.
+- `GET /api/v1/config/public` — safe client-visible settings only.
+- `GET /api/v1/me` — current verified account/profile/permissions.
+
+**Catalog**
+- `GET /api/v1/modules` — available modules filtered by permissions and feature flags.
+- `GET /api/v1/catalog` — search/filter/paginate published catalog items.
+- `GET /api/v1/catalog/:id` — item details if user may read it.
+- `POST /api/v1/catalog` — admin create.
+- `PATCH /api/v1/catalog/:id` — admin update with optimistic/version checks.
+- `POST /api/v1/catalog/:id/publish` and `/archive` — admin lifecycle transitions.
+- `GET /api/v1/categories` — categories and actual counts based on published records.
+
+**Favorites**
+- `GET /api/v1/me/favorites`
+- `PUT /api/v1/me/favorites/:itemId` — idempotent add.
+- `DELETE /api/v1/me/favorites/:itemId` — idempotent remove.
+
+**Projects**
+- `GET /api/v1/projects` — owner-scoped paginated list/search.
+- `POST /api/v1/projects` — save metadata or register an uploaded file.
+- `GET /api/v1/projects/:id`
+- `PATCH /api/v1/projects/:id`
+- `DELETE /api/v1/projects/:id` — soft delete where possible; require explicit confirmation in UI.
+- `POST /api/v1/projects/:id/import` — create a job only after file and permission validation.
+
+**Assets**
+- `POST /api/v1/assets/upload-intent` — server validates permitted MIME, size and user authorization before issuing narrowly scoped upload instructions if storage is configured.
+- `POST /api/v1/assets/:id/complete` — validate actual uploaded object metadata/checksum before marking ready.
+- `GET /api/v1/assets/:id` — authorize and return safe metadata or short-lived access URL.
+- `DELETE /api/v1/assets/:id` — owner/admin checks, reference checks and safe cleanup.
+
+**Desktop devices**
+- `POST /api/v1/devices/pairing/start` — issue one-time expiring pairing challenge to an authenticated user.
+- `POST /api/v1/devices/pairing/complete` — verify challenge; never accept an expired/reused token.
+- `GET /api/v1/devices` — list current user's devices.
+- `POST /api/v1/devices/:id/revoke` — revoke device and credentials.
+- `POST /api/v1/connector/heartbeat` — device-token auth, status/capabilities only.
+- `POST /api/v1/connector/jobs/claim` — atomically claim one compatible job.
+- `POST /api/v1/connector/jobs/:id/heartbeat` — progress only if reported by connector; lease expiry handling.
+- `POST /api/v1/connector/jobs/:id/result` — accept validated result from the authorized device; prevent duplicate completion.
+
+**Jobs**
+- `POST /api/v1/jobs` — create job only for allowed type/action, validate user consent and required device capabilities.
+- `GET /api/v1/jobs` — current user paginated history.
+- `GET /api/v1/jobs/:id` — owner or authorized admin only.
+- `POST /api/v1/jobs/:id/cancel` — cancel queued or cancellable running jobs.
+- `POST /api/v1/jobs/:id/retry` — safe retry, new attempt and idempotency guard.
+
+**Admin/operations**
+- `GET /api/v1/admin/overview`
+- `GET/POST/PATCH/DELETE /api/v1/admin/catalog/...` as appropriate.
+- `GET /api/v1/admin/users`, `PATCH /api/v1/admin/users/:uid` with tightly restricted allowed fields.
+- `GET /api/v1/admin/jobs`, `POST /api/v1/admin/jobs/:id/retry`.
+- `GET /api/v1/admin/audit`.
+- `GET /api/v1/admin/analytics` with aggregation only.
+
+List exact request/response schemas, validation rules, status codes, authorization rules and idempotency behavior in `docs/API_CONTRACTS.md`.
+
+### Business rules
+
+- Search/filter/sort operate on actual catalog records. Sanitize search terms and constrain page size.
+- Counts are derived from real published records, except separately labelled reference metadata.
+- Favorites are idempotent and owner-scoped.
+- Preset actions resolve a catalog item, check support status, active connection, host capabilities, selection requirements and user permission before creating an operation job.
+- Every AE job includes a validated operation name and typed parameters, never arbitrary cloud-supplied JSX or executable source.
+- A job has a state machine and valid transitions. Duplicate job result submissions must not execute the operation twice.
+- Failed operations return a human-readable safe message plus a stable error code and a correlation/request ID.
+- Retry only when the operation is safe and idempotent, or after explicit user confirmation.
+- Project file metadata is distinct from an uploaded file. A local file path is not portable cloud storage.
+- For caption and downloader jobs, report only progress emitted by the actual local process. Respect cancel/timeout and clean temporary files safely.
+- Catalog publish/unpublish and asset deletion should be auditable. Keep a revision/rollback path for catalog edits.
+- Do not allow the admin UI to mutate arbitrary server environment variables or secret values.
+
+## M. After Effects action model and bridge safety
+
+Define a narrow set of typed operations, for example:
+
+- `getHostStatus`
+- `getProjectSummary`
+- `getActiveCompSummary`
+- `listSelectedLayers`
+- `applyTextAnimation`
+- `applyExpressionPreset`
+- `applyEasingPreset`
+- `importAndAddAudio`
+- `insertTemplateComp`
+- `openTemplateAsComp`
+- `buildCarousel`
+- `addGlassPanel`
+- `applySaaSEffect`
+- `importAllowedFootage`
+- `queueRender` (optional and explicitly configured)
+- `getOperationResult`
+
+Each handler must validate parameters and required selection. Use AE undo groups for multi-step changes where supported. Preserve current comp/layer state where possible. If no active project/comp exists, return `NO_ACTIVE_PROJECT` or `NO_ACTIVE_COMP`; if the wrong layer type is selected, return `INCOMPATIBLE_SELECTION`; if the asset is missing, return `ASSET_NOT_FOUND`; if host scripting permissions are disabled, return `HOST_PERMISSION_REQUIRED`.
+
+Use a file-backed local command queue or documented bridge transport with:
+- unique `commandId`, `jobId`, `schemaVersion`, `createdAt`, `expiresAt`, `operation`, `parameters`, `requestedBy`, `resultStatus`;
+- an allowlist of operation names;
+- JSON size limit and strict schema validation;
+- no arbitrary filesystem paths unless imported through a scoped picker/root policy;
+- an import-root restriction where possible;
+- clear user confirmation for destructive operations or render jobs;
+- safe timeout, stale-job cleanup and duplicate detection;
+- explicit `Auto-run commands` default **off** until the user enables it in the local panel;
+- visible command log with paths, tokens and personal file names redacted;
+- host/connector version and compatibility checks.
+
+Do not claim an operation succeeds until AE returns an actual result. The companion must report whether it is disconnected, waiting for AE, waiting for the panel, running, succeeded, failed or timed out.
+
+## N. Asset, content and preview strategy
+
+Do not rely on random remote images or hotlinked copyrighted art for the main UI. Use a stable, original visual system:
+
+- Generate small original CSS/SVG/canvas demo previews for text, easing curves, abstract shapes, dashboards, glass cards, maps and carousel concepts.
+- For audio, use original licensed sample assets supplied by the owner or show a clearly labelled placeholder state; never pretend a nonexistent audio file is playable.
+- Keep full AE template/source assets outside code where possible and store metadata separately from binary files.
+- Every asset record needs provenance/license state; do not ingest an asset with unknown rights into a public catalog without review.
+- Use responsive image sizes, lazy loading, posters for video, and cleanup/revoke object URLs after preview use.
+- Validate user uploads by MIME and actual file signature where feasible; do not trust filename extension alone.
+- Enforce upload limits and show them in the UI. Scan or quarantine untrusted files if an available service is configured; otherwise state the limitation and keep files private.
+- A missing preview must show a neutral fallback and status, not a random image.
+
+Implement a preview component API, e.g. `PreviewRenderer`, that maps item `previewType` to specific renderers. Use reusable but real previews. Provide `Template` / `Your edits` only for items whose editable parameters are actually implemented.
+
+## O. Local media processing: captioning, depth engine and download
+
+Local processing belongs to the desktop companion by default to preserve the reference's promise that work stays on the user's computer. The web app should queue/display jobs and collect results, not pretend the browser has direct filesystem access.
+
+### Dependency manager
+- `GET /api/v1/connector/status` or a device-status endpoint returns named dependency presence/version/capabilities only.
+- In the desktop companion, expose a dependency check for Node, Python, Whisper/model, FFmpeg, yt-dlp and the optional depth-model runtime, with path/version details stored locally and redacted in cloud telemetry.
+- Offer installation instructions and explicit confirmation before downloads or large model installation.
+- Verify checksums/signatures when the upstream distribution makes them available; document if not available.
+- Do not execute installers downloaded from arbitrary URLs; use official package sources and pinned/versioned instructions.
+- Handle permissions, low disk, no network, unsupported OS, missing binary and process termination.
+
+### Caption job lifecycle
+`queued → claimed → running → succeeded|failed|cancelled|needs-setup|expired`.
+Store the actual transcript/segments only as per user choice and with access controls. For long media, return chunk/segment updates rather than freezing UI. Sanitize log output and avoid uploading original media unless the user explicitly opts into a secure upload path.
+
+### Downloader lifecycle
+Validate URL and permitted source before starting. Prefer downloading to a user-selected local folder through the companion. Never use a cloud server as an unrestricted proxy to arbitrary URLs. Prevent SSRF and path traversal. Warn users they must have the rights/permission to download. Do not bypass DRM or access controls. Expose real progress and final file path locally; cloud only receives job status and safe metadata unless user opts in to upload.
+
+### Depth Reveal
+Do not automatically download large models. Show model name/version, source/license, approximate download size only if verified, disk usage estimate only if calculable, and explicit consent. Cache model only on the desktop; provide a cleanup action and clear status. If no verified implementation can run, label it `Needs local model integration` and keep the apply action disabled.
+
+## P. Caching, performance and reliability
+
+- Cache public published catalog queries safely, keyed by filters and catalog version; do not cache private user data across accounts.
+- Keep Firestore reads bounded with pagination, server-side filtering/indexes where practical, and avoid read-per-card patterns.
+- Use server response caching only where authorization and staleness rules are explicit. Private responses should be `private`/`no-store` where appropriate.
+- Add request timeouts, cancellation and retries with exponential backoff/jitter for transient failures; never retry unsafe mutations automatically.
+- Use optimistic UI only for reversible low-risk actions such as favorite toggles and roll back on failure.
+- Debounce search; virtualize long lists if needed; lazy-load previews and code-split larger module pages where supported.
+- Avoid loading every full-size preview on app startup. Provide thumbnail/poster sizes and image dimensions to avoid layout shifts.
+- Use pagination for projects, jobs, audit logs and catalog. Never fetch unbounded lists.
+- Add safe concurrency limits for desktop jobs; one host mutation at a time per connected AE instance unless a verified capability allows more.
+- Add idempotency keys for job creation and operation submissions.
+- Provide meaningful offline/disconnected state and preserve unsent harmless UI state; never queue a dangerous AE command silently while offline.
+- Measure bundle size and performance using available tools. Treat performance targets as targets until measured: mobile LCP target ≤ 2.5 seconds for the public shell on a representative fast connection; avoid blocking main-thread preview work; keep input responsiveness high. Document the test environment.
+
+## Q. Security, privacy and abuse resistance
+
+Implement and document:
+- server-side authentication token verification;
+- server-side role/ownership checks on every protected route;
+- Firestore security rules and tests;
+- strict request/body size limits and schema validation;
+- rate limiting for API, pairing, caption jobs, media jobs and admin operations;
+- safe CORS allowlist, secure headers and CSP where compatible;
+- CSRF protection where cookie-based state or browser credential semantics require it;
+- output encoding and safe Markdown rendering; avoid unsafe raw HTML injection;
+- SSRF protections for user-provided URLs, including DNS resolution, private IP blocking and redirect revalidation;
+- file upload validation, path traversal protections, filename normalization, size limits and storage authorization;
+- malware/untrusted file handling disclosure;
+- secrets stored only in server-side secret storage/environment;
+- dependency lockfile and vulnerability scan where available;
+- privacy-minimized logs and structured redaction;
+- secure pairing with expiration, one-time use and revocation;
+- narrow command allowlist and no arbitrary remote code execution;
+- explicit destructive-action confirmation and audit event;
+- security review of owner bootstrap and admin role changes;
+- data deletion/export pathway where feasible and retention rules for jobs/logs;
+- rate-limit and error response that do not leak account existence or secrets;
+- clear public privacy policy that matches actual telemetry and processing.
+
+Do not promise encryption-at-rest/in-transit guarantees beyond those supplied by the configured infrastructure and implementation. Do not claim security certification. Record risk, mitigation and residual risks in `docs/SECURITY.md`.
+
+## R. Middleware and cross-cutting server concerns
+
+Implement common server middleware/helpers for:
+- request/correlation ID creation and propagation;
+- verified user authentication;
+- role/permission enforcement;
+- input parsing and validation;
+- request size caps and timeout policy;
+- rate limiting (distributed or service-appropriate; document limitations if in-memory only);
+- safe CORS/security headers;
+- centralized exception/error mapping;
+- redacted structured logging;
+- audit hooks for sensitive mutations;
+- idempotency handling for jobs/operations;
+- performance timing and sanitized endpoint metrics.
+
+Middleware must be ordered and tested. Health endpoints may be public only to the extent that they expose no sensitive details. A status endpoint must not dump environment variables, internal stack traces, service-account information or private host paths.
+
+## S. Analytics, SEO and public discoverability
+
+### Analytics
+- Track only useful product events such as `module_opened`, `catalog_search`, `favorite_added`, `preview_started`, `job_created`, `job_finished`, `connector_paired`, and `feature_setup_failed`.
+- Do not track file contents, raw transcript text, private composition names, full personal paths, sensitive URLs or secrets.
+- Use consent/opt-out and a retention setting. Aggregate admin dashboards server-side. Clearly label sample/test records.
+- If no analytics provider is configured, provide a privacy-preserving internal event pipeline or show `Analytics not configured`; do not draw fake charts.
+
+### SEO
+- SEO applies to public routes only. Set unique titles, descriptions, canonical URLs when deployed, Open Graph/Twitter metadata, favicons, sitemap and robots rules where applicable.
+- Keep authenticated workspace, admin, private project and signed file routes `noindex` and protected regardless of robots metadata.
+- Add semantic HTML, fast public hero, helpful feature and documentation pages, and no keyword stuffing.
+- Do not include user projects, private filenames or account data in sitemaps or public metadata.
+
+## T. Observability, technical panel and release operations
+
+- Provide `/technical` and an admin operations view with app version/commit, environment label (development/staging/production), safe health checks, feature/dependency status, recent job failures and connector version/capabilities.
+- Add request IDs to errors and support copy-to-clipboard for a redacted diagnostic bundle.
+- Do not report live deployment URL or production status unless it is obtained from the actual deployment.
+- Provide structured logs at server and companion levels. Default to no logs containing tokens, transcript text, downloaded URLs with query parameters, source paths or raw file contents.
+- Add deployment checklist, rollback instructions, secret configuration, Firebase rules/index deployment, migration/seed instructions, and backup/restore notes.
+- Provide environment-specific configuration, with no production secrets checked into Git.
+- Use automated build/typecheck/lint/test commands that exist in the project; create scripts only when packages are actually available.
+- Add a release version and changelog. Do not run destructive database migrations without explicit approval and backup plan.
+
+## U. Admin CMS and content operations
+
+The admin system must manage the library, not just show counters. Implement:
+- create/edit/publish/archive catalog items;
+- category/module order and visibility;
+- preview/source asset association;
+- metadata fields (duration, resolution, fps, file size) with unknown values represented as unknown rather than made up;
+- supported operations and prerequisites;
+- license/provenance notes and moderation/status fields;
+- asset upload/validation status and replacement;
+- draft/published/archived lifecycle with version history/rollback where practical;
+- search/filter/pagination/bulk selection for safe operations;
+- confirmation and audit event for delete/publish/role changes;
+- CSV/JSON export of catalog metadata if safe and implemented;
+- data validation before publishing so broken preview references, unknown license, unsupported operation or missing required fields are clearly flagged.
+
+## V. Required documentation files
+
+Create and maintain:
+- `README.md` — overview, local/development start if applicable, AI Studio setup, known limitations.
+- `docs/ARCHITECTURE.md` — components, trust boundaries, Mermaid system/sequence diagrams, data flow.
+- `docs/FEATURE_MATRIX.md` — each module, supported actions, requirements and actual status.
+- `docs/PROJECT_STATUS.md` — current phase, working features, unverified features, blockers, next steps.
+- `docs/DATA_MODEL.md` — collections, fields, ownership, retention and indexes.
+- `docs/API_CONTRACTS.md` — every route, auth rule, request/response, error code and idempotency rule.
+- `docs/SECURITY.md` — threat model, Firebase rules, secrets, pairing, file/URL security, residual risks.
+- `docs/TESTING.md` — automated/manual tests and exact executed results.
+- `docs/DEPLOYMENT.md` — AI Studio/Cloud Run, Firebase setup, environment variables, GitHub sync, rollback.
+- `docs/AE_COMPANION.md` — installation, host/version compatibility, permissions, pairing, dependency checks, troubleshooting, removal.
+- `docs/LOCAL_MEDIA.md` — caption/depth/download dependencies, consent, supported OS, privacy.
+- `docs/REFERENCE_GAPS.md` — video-observed facts, uncertain items, assumptions, and what cannot be inferred.
+- `CHANGELOG.md` — chronological changes and breaking changes.
+
+## W. Phase order and stopping rule
+
+Do not attempt an uncontrolled, single-pass rewrite of every layer. Use the following release phases, keeping the app runnable after each phase:
+
+**Phase 1 — Scaffold + visual shell:** establish design tokens, responsive navigation, all route placeholders, public landing, authenticated app shell, shared catalog card/detail layout, module metadata and original preview primitives. Seed only records whose labels and capabilities are clearly defined. Keep controls honest.
+
+**Phase 2 — Core catalog + user state:** working search/filter/sort, favorites, details, real item counts, project library metadata, preferences, loading/empty/error states and persistence.
+
+**Phase 3 — Firebase backend + auth/RBAC:** provision Firebase after approval; add verified auth, Firestore model/rules/indexes, server API layer, server-side authorization, user-scoped records, seed setup and tests.
+
+**Phase 4 — Admin CMS + technical status:** catalog/asset CRUD, draft/publish/archive, user/role controls, audit trail, real aggregate metrics and safe health checks.
+
+**Phase 5 — Desktop companion + AE integration source:** generate typed shared contracts, pairing lifecycle, job queue, local bridge, AE handlers for supported operations, connector status, install/docs, security tests. Mark host integration unverified until it has been tested in real After Effects.
+
+**Phase 6 — Local media utilities:** captioning, dependency manager, depth feature gates and policy-safe downloader. Use real desktop jobs, not fake browser-side status.
+
+**Phase 7 — production hardening:** accessibility, security, performance, SEO, tests, error handling, versioning, release checklist and deployment verification.
+
+For each phase, finish with: (a) summary of implemented work, (b) changed files, (c) checks actually executed and their actual results, (d) features still unverified, (e) blockers requiring user action, (f) next phase prompt. Do not claim a phase is complete if its acceptance checks fail.
+
+Start now with Phase 1 only. Inspect the scaffold, then implement Phase 1 rather than returning a plan-only answer. Keep the initial scope polished and runnable. At the end, list the exact next prompt the owner should use for Phase 2.

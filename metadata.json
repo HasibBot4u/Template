@@ -1,0 +1,6 @@
+{
+  "name": "Sowveil Studio",
+  "description": "Mobile-first motion-design platform and mobile editor export gateway for Android, CapCut, Alight Motion, Node Video, and KineMaster with live procedural previews and Project Library.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,362 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. Global Safety Net (Default-Deny Catch-All)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Boot connectivity check endpoint
+    match /test/{docId} {
+      allow get: if docId == 'connection';
+      allow list, create, update, delete: if false;
+    }
+
+    // 2. Hardened Global Primitives
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(uid) {
+      return isVerifiedUser() && request.auth.uid == uid;
+    }
+
+    function isAdmin() {
+      return isVerifiedUser() && (
+        request.auth.token.email == 'mdhasibul4u@gmail.com' ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    // 3. Entity Validation Blueprints (Anti-Update-Gap)
+    function isValidUserProfile(data) {
+      return data.keys().hasAll(['uid', 'displayName', 'role', 'status', 'preferences', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['uid', 'displayName', 'photoURL', 'role', 'status', 'preferences', 'createdAt', 'updatedAt']) &&
+        data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128 && data.uid.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120 &&
+        (!('photoURL' in data) || (data.photoURL is string && data.photoURL.size() <= 500)) &&
+        data.role in ['user', 'admin', 'owner'] &&
+        data.status in ['active', 'suspended', 'pending'] &&
+        data.preferences is map &&
+        data.createdAt is string && data.createdAt.size() <= 64 &&
+        data.updatedAt is string && data.updatedAt.size() <= 64;
+    }
+
+    function isValidUserPrivateInfo(data) {
+      return data.keys().hasAll(['uid', 'email', 'updatedAt']) &&
+        data.keys().hasOnly(['uid', 'email', 'updatedAt']) &&
+        data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128 && data.uid.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 254 &&
+        data.updatedAt is string && data.updatedAt.size() <= 64;
+    }
+
+    function isValidAdminGrant(data) {
+      return data.keys().hasAll(['uid', 'role', 'grantedBy', 'createdAt']) &&
+        data.keys().hasOnly(['uid', 'role', 'grantedBy', 'createdAt']) &&
+        data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128 && data.uid.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.role in ['admin', 'owner'] &&
+        data.grantedBy is string && data.grantedBy.size() >= 1 && data.grantedBy.size() <= 128 &&
+        data.createdAt is string && data.createdAt.size() <= 64;
+    }
+
+    function isValidModuleRecord(data) {
+      return data.keys().hasAll(['id', 'label', 'route', 'enabled', 'displayOrder']) &&
+        data.keys().hasOnly(['id', 'label', 'shortLabel', 'icon', 'description', 'route', 'capabilityType', 'enabled', 'requiresDesktop', 'requiresNetwork', 'requiresLocalDependency', 'localDependencies', 'displayOrder', 'permissions', 'referenceReportedCount', 'referenceDiscrepancyNote', 'workspaceKind']) &&
+        data.id is string && data.id.size() >= 1 && data.id.size() <= 64 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.label is string && data.label.size() >= 1 && data.label.size() <= 80 &&
+        data.route is string && data.route.size() >= 1 && data.route.size() <= 120 &&
+        data.enabled is bool &&
+        data.displayOrder is number;
+    }
+
+    function isValidCategoryRecord(data) {
+      return data.keys().hasAll(['id', 'moduleId', 'label', 'slug', 'order']) &&
+        data.keys().hasOnly(['id', 'moduleId', 'label', 'slug', 'order', 'referenceCount']) &&
+        data.id is string && data.id.size() >= 1 && data.id.size() <= 64 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.moduleId is string && data.moduleId.size() >= 1 && data.moduleId.size() <= 64 &&
+        data.label is string && data.label.size() >= 1 && data.label.size() <= 80 &&
+        data.slug is string && data.slug.size() >= 1 && data.slug.size() <= 80 &&
+        data.order is number;
+    }
+
+    function isValidCatalogItemRecord(data) {
+      return data.keys().hasAll(['id', 'moduleId', 'name', 'slug', 'summary', 'description', 'categoryId', 'packLabel', 'visibility', 'updatedAt']) &&
+        data.keys().hasOnly(['id', 'moduleId', 'name', 'slug', 'summary', 'description', 'tags', 'categoryId', 'packLabel', 'assetKind', 'capabilityType', 'previewKind', 'metadata', 'primaryActionLabel', 'secondaryActionLabel', 'supportedOperations', 'requiredHostCapabilities', 'requiredDependencies', 'selectionRequirement', 'status', 'statusReason', 'licenseType', 'licenseNote', 'sourceType', 'visibility', 'supportsTemplateComparison', 'editableParams', 'createdAt', 'updatedAt']) &&
+        data.id is string && data.id.size() >= 1 && data.id.size() <= 128 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.moduleId is string && data.moduleId.size() >= 1 && data.moduleId.size() <= 64 &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 140 &&
+        data.slug is string && data.slug.size() >= 1 && data.slug.size() <= 140 &&
+        data.summary is string && data.summary.size() <= 500 &&
+        data.description is string && data.description.size() <= 2000 &&
+        data.categoryId is string && data.categoryId.size() <= 64 &&
+        data.packLabel is string && data.packLabel.size() <= 120 &&
+        data.visibility in ['published', 'draft', 'archived'] &&
+        data.updatedAt is string && data.updatedAt.size() <= 64;
+    }
+
+    function isValidFavoriteRecord(data) {
+      return data.keys().hasAll(['itemId', 'ownerUid', 'createdAt']) &&
+        data.keys().hasOnly(['itemId', 'ownerUid', 'createdAt']) &&
+        data.itemId is string && data.itemId.size() >= 1 && data.itemId.size() <= 128 && data.itemId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128 && data.ownerUid.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.ownerUid == request.auth.uid &&
+        data.createdAt is string && data.createdAt.size() <= 64;
+    }
+
+    function isValidProjectRecord(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'title', 'description', 'projectFileStatus', 'fileSizeLabel', 'hasExternalFootageWarning', 'archived', 'tags', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['id', 'ownerUid', 'title', 'description', 'compCount', 'projectFileStatus', 'fileSizeBytes', 'fileSizeLabel', 'resolution', 'durationLabel', 'fps', 'aeVersion', 'targetEditor', 'aspectRatio', 'sowveilSpecJson', 'hasExternalFootageWarning', 'archived', 'lastOpenedAt', 'tags', 'createdAt', 'updatedAt']) &&
+        data.id is string && data.id.size() >= 1 && data.id.size() <= 128 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128 && data.ownerUid.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.ownerUid == request.auth.uid &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 160 &&
+        data.description is string && data.description.size() <= 2000 &&
+        data.projectFileStatus in ['sowveil-native', 'alight-motion-xml', 'media-bundle', 'metadata-only', 'uploaded', 'linked-local', 'packaged'] &&
+        data.fileSizeLabel is string && data.fileSizeLabel.size() <= 80 &&
+        data.hasExternalFootageWarning is bool &&
+        data.archived is bool &&
+        data.tags is list && data.tags.size() <= 20 &&
+        (data.tags.size() == 0 || (data.tags[0] is string && data.tags[0].size() <= 64)) &&
+        data.createdAt is string && data.createdAt.size() <= 64 &&
+        data.updatedAt is string && data.updatedAt.size() <= 64;
+    }
+
+    function isValidJobRecord(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'type', 'title', 'moduleId', 'status', 'attemptCount', 'idempotencyKey', 'redactedMessage', 'requestId', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['id', 'ownerUid', 'type', 'title', 'moduleId', 'itemId', 'operation', 'targetEditor', 'exportFormat', 'aspectRatio', 'outputFileName', 'outputMimeType', 'outputSizeBytes', 'status', 'createdAt', 'updatedAt', 'startedAt', 'finishedAt', 'attemptCount', 'idempotencyKey', 'deviceId', 'errorCode', 'redactedMessage', 'requestId']) &&
+        data.id is string && data.id.size() >= 1 && data.id.size() <= 128 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128 && data.ownerUid.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.ownerUid == request.auth.uid &&
+        data.type in ['mobile-export', 'ae-operation', 'caption', 'download', 'asset-process'] &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 200 &&
+        data.moduleId is string && data.moduleId.size() >= 1 && data.moduleId.size() <= 64 &&
+        data.status in ['queued', 'claimed', 'running', 'ready', 'downloaded', 'succeeded', 'failed', 'cancelled', 'needs-setup', 'expired'] &&
+        data.attemptCount is number && data.attemptCount >= 1 && data.attemptCount <= 50 &&
+        data.idempotencyKey is string && data.idempotencyKey.size() >= 1 && data.idempotencyKey.size() <= 200 &&
+        data.redactedMessage is string && data.redactedMessage.size() <= 1000 &&
+        data.requestId is string && data.requestId.size() >= 1 && data.requestId.size() <= 128 &&
+        data.createdAt is string && data.createdAt.size() <= 64 &&
+        data.updatedAt is string && data.updatedAt.size() <= 64;
+    }
+
+    function isValidDeviceRecord(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'deviceName', 'platform', 'status', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['id', 'ownerUid', 'deviceName', 'platform', 'status', 'connectorVersion', 'hostVersion', 'lastSeenAt', 'createdAt', 'updatedAt']) &&
+        data.id is string && data.id.size() >= 1 && data.id.size() <= 128 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128 && data.ownerUid.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.ownerUid == request.auth.uid &&
+        data.deviceName is string && data.deviceName.size() >= 1 && data.deviceName.size() <= 120 &&
+        data.platform in ['Android', 'iOS', 'macOS', 'Windows', 'Linux'] &&
+        data.status in ['active', 'revoked'] &&
+        data.createdAt is string && data.createdAt.size() <= 64 &&
+        data.updatedAt is string && data.updatedAt.size() <= 64;
+    }
+
+    // 4. Collection Match Blocks
+    // /users/{uid} — Non-PII profile & preferences
+    match /users/{uid} {
+      allow get: if isValidId(uid) && (isOwner(uid) || isAdmin());
+      allow list: if isAdmin() || (isVerifiedUser() && existing().uid == request.auth.uid);
+      allow create: if isValidId(uid) &&
+        isOwner(uid) &&
+        isValidUserProfile(incoming()) &&
+        incoming().uid == uid &&
+        incoming().status == 'active' &&
+        (incoming().role == 'user' || isAdmin());
+      allow update: if isValidId(uid) &&
+        isVerifiedUser() &&
+        isValidUserProfile(incoming()) &&
+        incoming().uid == existing().uid &&
+        incoming().createdAt == existing().createdAt && (
+          isAdmin() ||
+          (
+            isOwner(uid) &&
+            incoming().role == existing().role &&
+            incoming().status == existing().status &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL', 'preferences', 'updatedAt'])
+          )
+        );
+      allow delete: if isValidId(uid) && isAdmin();
+
+      // /users/{uid}/private/{docId} — PII Isolation (Email)
+      match /private/{docId} {
+        allow get: if isValidId(uid) && isValidId(docId) && (isOwner(uid) || isAdmin()) &&
+          exists(/databases/$(database)/documents/users/$(uid));
+        allow list: if false;
+        allow create: if isValidId(uid) && isValidId(docId) && isOwner(uid) &&
+          isValidUserPrivateInfo(incoming()) &&
+          incoming().uid == uid &&
+          exists(/databases/$(database)/documents/users/$(uid));
+        allow update: if isValidId(uid) && isValidId(docId) && isOwner(uid) &&
+          isValidUserPrivateInfo(incoming()) &&
+          incoming().uid == existing().uid &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['email', 'updatedAt']) &&
+          exists(/databases/$(database)/documents/users/$(uid));
+        allow delete: if isValidId(uid) && isValidId(docId) && isAdmin();
+      }
+    }
+
+    // /admins/{uid} — Trusted RBAC Registry
+    match /admins/{uid} {
+      allow get: if isValidId(uid) && (isOwner(uid) || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isValidId(uid) && isAdmin() && isValidAdminGrant(incoming()) && incoming().uid == uid;
+      allow update: if isValidId(uid) && isAdmin() && isValidAdminGrant(incoming()) &&
+        incoming().uid == existing().uid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['role', 'grantedBy']);
+      allow delete: if isValidId(uid) && isAdmin();
+    }
+
+    // /modules/{moduleId}
+    match /modules/{moduleId} {
+      allow get: if isValidId(moduleId) && (existing().enabled == true || isAdmin());
+      allow list: if existing().enabled == true || isAdmin();
+      allow create: if isValidId(moduleId) && isAdmin() && isValidModuleRecord(incoming()) && incoming().id == moduleId;
+      allow update: if isValidId(moduleId) && isAdmin() && isValidModuleRecord(incoming()) &&
+        incoming().id == existing().id &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['label', 'description', 'enabled', 'displayOrder']);
+      allow delete: if isValidId(moduleId) && isAdmin();
+    }
+
+    // /categories/{categoryId}
+    match /categories/{categoryId} {
+      allow get: if isValidId(categoryId) && existing().moduleId is string;
+      allow list: if existing().moduleId is string;
+      allow create: if isValidId(categoryId) && isAdmin() && isValidCategoryRecord(incoming()) && incoming().id == categoryId;
+      allow update: if isValidId(categoryId) && isAdmin() && isValidCategoryRecord(incoming()) &&
+        incoming().id == existing().id &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['label', 'slug', 'order', 'referenceCount']);
+      allow delete: if isValidId(categoryId) && isAdmin();
+    }
+
+    // /catalogItems/{itemId} — Ordinary users may only read published items
+    match /catalogItems/{itemId} {
+      allow get: if isValidId(itemId) && (existing().visibility == 'published' || isAdmin());
+      allow list: if existing().visibility == 'published' || isAdmin();
+      allow create: if isValidId(itemId) && isAdmin() && isValidCatalogItemRecord(incoming()) && incoming().id == itemId;
+      allow update: if isValidId(itemId) && isAdmin() && isValidCatalogItemRecord(incoming()) &&
+        incoming().id == existing().id &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['name', 'slug', 'summary', 'description', 'tags', 'categoryId', 'packLabel', 'metadata', 'status', 'statusReason', 'visibility', 'supportsTemplateComparison', 'editableParams', 'updatedAt']);
+      allow delete: if isValidId(itemId) && isAdmin();
+    }
+
+    // /favorites/{uid}/items/{itemId} — Master Gate checks /users/{uid}
+    match /favorites/{uid}/items/{itemId} {
+      allow get: if isValidId(uid) && isValidId(itemId) && isOwner(uid) &&
+        existing().ownerUid == request.auth.uid &&
+        exists(/databases/$(database)/documents/users/$(uid));
+      allow list: if isOwner(uid) && existing().ownerUid == request.auth.uid;
+      allow create: if isValidId(uid) && isValidId(itemId) && isOwner(uid) &&
+        isValidFavoriteRecord(incoming()) &&
+        incoming().itemId == itemId &&
+        exists(/databases/$(database)/documents/users/$(uid));
+      allow update: if isValidId(uid) && isValidId(itemId) && isOwner(uid) &&
+        isValidFavoriteRecord(incoming()) &&
+        incoming().itemId == existing().itemId &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['createdAt']) &&
+        exists(/databases/$(database)/documents/users/$(uid));
+      allow delete: if isValidId(uid) && isValidId(itemId) && isOwner(uid) &&
+        existing().ownerUid == request.auth.uid &&
+        exists(/databases/$(database)/documents/users/$(uid));
+    }
+
+    // /projects/{projectId} — Strictly owner-scoped Project Library records
+    match /projects/{projectId} {
+      allow get: if isValidId(projectId) && isVerifiedUser() && (existing().ownerUid == request.auth.uid || isAdmin());
+      allow list: if isVerifiedUser() && (existing().ownerUid == request.auth.uid || isAdmin());
+      allow create: if isValidId(projectId) && isVerifiedUser() &&
+        isValidProjectRecord(incoming()) &&
+        incoming().id == projectId &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid));
+      allow update: if isValidId(projectId) && isVerifiedUser() &&
+        isValidProjectRecord(incoming()) &&
+        incoming().id == existing().id &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().createdAt == existing().createdAt && (
+          isAdmin() ||
+          (
+            existing().ownerUid == request.auth.uid &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['title', 'description', 'compCount', 'projectFileStatus', 'fileSizeBytes', 'fileSizeLabel', 'resolution', 'durationLabel', 'fps', 'aeVersion', 'targetEditor', 'aspectRatio', 'sowveilSpecJson', 'checkpoints', 'hasExternalFootageWarning', 'archived', 'lastOpenedAt', 'tags', 'updatedAt'])
+          )
+        );
+      allow delete: if isValidId(projectId) && isVerifiedUser() && (existing().ownerUid == request.auth.uid || isAdmin());
+    }
+
+    // /jobs/{jobId} — Strictly owner-scoped with Terminal State Locking
+    match /jobs/{jobId} {
+      allow get: if isValidId(jobId) && isVerifiedUser() && (existing().ownerUid == request.auth.uid || isAdmin());
+      allow list: if isVerifiedUser() && (existing().ownerUid == request.auth.uid || isAdmin());
+      allow create: if isValidId(jobId) && isVerifiedUser() &&
+        isValidJobRecord(incoming()) &&
+        incoming().id == jobId &&
+        incoming().status in ['draft', 'queued', 'uploading', 'running', 'finalizing', 'ready', 'needs-setup', 'quota-reached'] &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid));
+      allow update: if isValidId(jobId) && isVerifiedUser() &&
+        isValidJobRecord(incoming()) &&
+        incoming().id == existing().id &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().createdAt == existing().createdAt && (
+          isAdmin() ||
+          (
+            existing().ownerUid == request.auth.uid &&
+            !(existing().status in ['downloaded', 'succeeded', 'cancelled', 'expired']) &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt', 'startedAt', 'finishedAt', 'attemptCount', 'deviceId', 'errorCode', 'processedBytes', 'totalBytes', 'completedStageIndex', 'totalStages', 'stageLabel', 'redactedMessage'])
+          )
+        );
+      allow delete: if isValidId(jobId) && isVerifiedUser() && (existing().ownerUid == request.auth.uid || isAdmin());
+    }
+
+    // /devices/{deviceId} — Strictly owner-scoped paired workstation records
+    match /devices/{deviceId} {
+      allow get: if isValidId(deviceId) && isVerifiedUser() && (existing().ownerUid == request.auth.uid || isAdmin());
+      allow list: if isVerifiedUser() && (existing().ownerUid == request.auth.uid || isAdmin());
+      allow create: if isValidId(deviceId) && isVerifiedUser() &&
+        isValidDeviceRecord(incoming()) &&
+        incoming().id == deviceId &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid));
+      allow update: if isValidId(deviceId) && isVerifiedUser() &&
+        isValidDeviceRecord(incoming()) &&
+        incoming().id == existing().id &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().createdAt == existing().createdAt && (
+          isAdmin() ||
+          (
+            existing().ownerUid == request.auth.uid &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['deviceName', 'status', 'connectorVersion', 'hostVersion', 'lastSeenAt', 'updatedAt'])
+          )
+        );
+      allow delete: if isValidId(deviceId) && isVerifiedUser() && (existing().ownerUid == request.auth.uid || isAdmin());
+    }
+
+    // /devicePairingTokens/{tokenId} — Private server-only pairing tokens
+    match /devicePairingTokens/{tokenId} {
+      allow read, write: if false;
+    }
+
+    // /auditEvents/{eventId} — Append-only server-written audit records
+    match /auditEvents/{eventId} {
+      allow get: if isValidId(eventId) && isAdmin();
+      allow list: if isAdmin();
+      allow create, update, delete: if false;
+    }
+  }
+}

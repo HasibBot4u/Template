@@ -1,0 +1,72 @@
+@import "tailwindcss";
+
+:root {
+  --app-bg: #080707;
+  --surface-1: #11100F;
+  --surface-2: #191614;
+  --surface-3: #211B17;
+  --border: #342A24;
+  --text-primary: #F3EEE8;
+  --text-secondary: #B8AAA0;
+  --text-muted: #83766D;
+  --accent: #F06424;
+  --accent-strong: #FF4B24;
+  --accent-soft: rgba(240, 100, 36, 0.14);
+  --warning: #E4B45A;
+  --success: #55B98B;
+  --danger: #F06464;
+  --focus: #FFC08C;
+
+  font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+  color-scheme: dark;
+}
+
+body {
+  background-color: var(--app-bg);
+  color: var(--text-primary);
+  margin: 0;
+  padding: 0;
+  overflow-x: hidden;
+}
+
+.font-mono-tabular {
+  font-family: 'JetBrains Mono', monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Accessible focus ring */
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+/* Custom subtle dark scrollbar matching After Effects panel aesthetic */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: var(--surface-1);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

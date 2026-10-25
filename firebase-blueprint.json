@@ -1,0 +1,472 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Authenticated user workspace profile and non-PII preferences.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "photoURL": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "role": {
+          "type": "string",
+          "enum": ["user", "admin", "owner"]
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "suspended", "pending"]
+        },
+        "preferences": {
+          "type": "object"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "displayName", "role", "status", "preferences", "createdAt", "updatedAt"]
+    },
+    "UserPrivateInfo": {
+      "title": "UserPrivateInfo",
+      "description": "Isolated PII document containing user email address.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 254
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "email", "updatedAt"]
+    },
+    "AdminGrant": {
+      "title": "AdminGrant",
+      "description": "Trusted role lookup record for admin and owner accounts.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "role": {
+          "type": "string",
+          "enum": ["admin", "owner"]
+        },
+        "grantedBy": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "role", "grantedBy", "createdAt"]
+    },
+    "ModuleRecord": {
+      "title": "ModuleRecord",
+      "description": "Workspace module metadata definition.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "route": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "displayOrder": {
+          "type": "number"
+        }
+      },
+      "required": ["id", "label", "route", "enabled", "displayOrder"]
+    },
+    "CategoryRecord": {
+      "title": "CategoryRecord",
+      "description": "Module category filter definition.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "moduleId": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "slug": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "order": {
+          "type": "number"
+        }
+      },
+      "required": ["id", "moduleId", "label", "slug", "order"]
+    },
+    "CatalogItemRecord": {
+      "title": "CatalogItemRecord",
+      "description": "Published or draft motion preset catalog item.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "moduleId": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 140
+        },
+        "slug": {
+          "type": "string",
+          "maxLength": 140
+        },
+        "summary": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 2000
+        },
+        "categoryId": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "packLabel": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "visibility": {
+          "type": "string",
+          "enum": ["published", "draft", "archived"]
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["id", "moduleId", "name", "slug", "summary", "description", "categoryId", "packLabel", "visibility", "updatedAt"]
+    },
+    "FavoriteRecord": {
+      "title": "FavoriteRecord",
+      "description": "Idempotent user-scoped favorite preset link.",
+      "type": "object",
+      "properties": {
+        "itemId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["itemId", "ownerUid", "createdAt"]
+    },
+    "ProjectRecord": {
+      "title": "ProjectRecord",
+      "description": "User-scoped After Effects Project Library metadata record.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 2000
+        },
+        "projectFileStatus": {
+          "type": "string",
+          "enum": ["sowveil-native", "alight-motion-xml", "media-bundle", "metadata-only", "uploaded", "linked-local", "packaged"]
+        },
+        "fileSizeLabel": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "hasExternalFootageWarning": {
+          "type": "boolean"
+        },
+        "archived": {
+          "type": "boolean"
+        },
+        "tags": {
+          "type": "array"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["id", "ownerUid", "title", "description", "projectFileStatus", "fileSizeLabel", "hasExternalFootageWarning", "archived", "tags", "createdAt", "updatedAt"]
+    },
+    "JobQueueRecord": {
+      "title": "JobQueueRecord",
+      "description": "User-scoped mobile export or companion job record.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "type": {
+          "type": "string",
+          "enum": ["mobile-export", "ae-operation", "caption", "download", "asset-process"]
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "moduleId": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "status": {
+          "type": "string",
+          "enum": ["queued", "claimed", "running", "ready", "downloaded", "succeeded", "failed", "cancelled", "needs-setup", "expired"]
+        },
+        "attemptCount": {
+          "type": "number"
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "redactedMessage": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "requestId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["id", "ownerUid", "type", "title", "moduleId", "status", "attemptCount", "idempotencyKey", "redactedMessage", "requestId", "createdAt", "updatedAt"]
+    },
+    "DeviceRecord": {
+      "title": "DeviceRecord",
+      "description": "Paired device metadata.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "deviceName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "platform": {
+          "type": "string",
+          "enum": ["Android", "iOS", "macOS", "Windows", "Linux"]
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "revoked"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["id", "ownerUid", "deviceName", "platform", "status", "createdAt", "updatedAt"]
+    },
+    "DevicePairingTokenRecord": {
+      "title": "DevicePairingTokenRecord",
+      "description": "Server-only short-lived pairing token hash.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "ownerUid": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "tokenHash": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "expiresAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["id", "ownerUid", "tokenHash", "expiresAt"]
+    },
+    "AuditEventRecord": {
+      "title": "AuditEventRecord",
+      "description": "Append-only server audit log record.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "actorUid": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "action": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "targetId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "requestId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["id", "actorUid", "action", "targetId", "requestId", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{uid}": {
+      "schema": "UserProfile",
+      "description": "User workspace profile and preferences."
+    },
+    "/users/{uid}/private/{docId}": {
+      "schema": "UserPrivateInfo",
+      "description": "Isolated PII subcollection for user email."
+    },
+    "/admins/{uid}": {
+      "schema": "AdminGrant",
+      "description": "Trusted admin/owner role registry."
+    },
+    "/modules/{moduleId}": {
+      "schema": "ModuleRecord",
+      "description": "Publicly readable module configuration records."
+    },
+    "/categories/{categoryId}": {
+      "schema": "CategoryRecord",
+      "description": "Publicly readable module category records."
+    },
+    "/catalogItems/{itemId}": {
+      "schema": "CatalogItemRecord",
+      "description": "Catalog preset records; only published items are readable by standard users."
+    },
+    "/favorites/{uid}/items/{itemId}": {
+      "schema": "FavoriteRecord",
+      "description": "User-scoped idempotent favorite preset records."
+    },
+    "/projects/{projectId}": {
+      "schema": "ProjectRecord",
+      "description": "Owner-scoped Project Library records."
+    },
+    "/jobs/{jobId}": {
+      "schema": "JobQueueRecord",
+      "description": "Owner-scoped host and companion job records."
+    },
+    "/devices/{deviceId}": {
+      "schema": "DeviceRecord",
+      "description": "Owner-scoped paired workstation records."
+    },
+    "/devicePairingTokens/{tokenId}": {
+      "schema": "DevicePairingTokenRecord",
+      "description": "Server-only one-time pairing tokens; forbidden to client SDK."
+    },
+    "/auditEvents/{eventId}": {
+      "schema": "AuditEventRecord",
+      "description": "Append-only audit trail; readable only by admins, never client-writable."
+    }
+  }
+}

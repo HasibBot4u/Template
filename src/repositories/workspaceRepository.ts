@@ -1,0 +1,674 @@
+import {
+  collection,
+  deleteDoc,
+  doc,
+  getDoc,
+  getDocs,
+  query,
+  setDoc,
+  updateDoc,
+  where,
+} from 'firebase/firestore';
+import {
+  DeviceRecord,
+  JobRecord,
+  JobStatus,
+  ProjectLibraryItem,
+  UserPreferences,
+} from '../types/sowveil';
+import { SEED_PROJECT_LIBRARY } from '../data/catalogSeeds';
+import { transitionJobRecord } from '../services/jobStateMachine';
+import {
+  auth,
+  db,
+  DEFAULT_USER_PREFERENCES,
+  handleFirestoreError,
+  OperationType,
+} from '../services/firebaseClient';
+
+export interface IWorkspaceRepository {
+  readonly modeLabel: string;
+  getFavorites(): Promise<string[]>;
+  addFavorite(itemId: string): Promise<string[]>;
+  removeFavorite(itemId: string): Promise<string[]>;
+  listProjects(): Promise<ProjectLibraryItem[]>;
+  createProject(
+    input: Omit<ProjectLibraryItem, 'id' | 'updatedAt'>
+  ): Promise<ProjectLibraryItem>;
+  updateProject(
+    id: string,
+    patch: Partial<
+      Pick<
+        ProjectLibraryItem,
+        | 'title'
+        | 'description'
+        | 'compCount'
+        | 'projectFileStatus'
+        | 'fileSizeBytes'
+        | 'fileSizeLabel'
+        | 'resolution'
+        | 'durationLabel'
+        | 'fps'
+        | 'aeVersion'
+        | 'hasExternalFootageWarning'
+        | 'archived'
+        | 'lastOpenedAt'
+        | 'tags'
+      >
+    >
+  ): Promise<ProjectLibraryItem>;
+  deleteProject(id: string): Promise<void>;
+  listJobs(): Promise<JobRecord[]>;
+  createJob(
+    input: Omit<
+      JobRecord,
+      'id' | 'createdAt' | 'updatedAt' | 'requestId' | 'attemptCount' | 'idempotencyKey'
+    > & { idempotencyKey?: string }
+  ): Promise<JobRecord>;
+  transitionJob(
+    id: string,
+    nextStatus: JobStatus,
+    options?: { redactedMessage?: string; errorCode?: string; deviceId?: string | null }
+  ): Promise<JobRecord>;
+  clearJobs(): Promise<void>;
+  getPreferences(): Promise<UserPreferences>;
+  savePreferences(prefs: Partial<UserPreferences>): Promise<UserPreferences>;
+  listDevices?(): Promise<DeviceRecord[]>;
+}
+
+const VALID_ID_REGEX = /^[a-zA-Z0-9_\-]+$/;
+
+function sanitizeFirestoreId(raw: string): string {
+  const cleaned = raw.trim().replace(/[^a-zA-Z0-9_\-]/g, '_').slice(0, 128);
+  if (!cleaned || !VALID_ID_REGEX.test(cleaned)) {
+    throw new Error('Invalid resource identifier format');
+  }
+  return cleaned;
+}
+
+/**
+ * Production Cloud Firestore Repository.
+ * Never falls back to localStorage for private user data.
+ * Requires an authenticated Firebase user (request.auth.uid).
+ */
+export class FirestoreWorkspaceRepository implements IWorkspaceRepository {
+  public readonly modeLabel =
+    'Cloud Firestore (sacred-tune-blxdt · RBAC & Rules Enforced)';
+
+  private requireUid(): string {
+    const uid = auth.currentUser?.uid;
+    if (!uid) {
+      throw new Error('UNAUTHENTICATED: Sign in with Google to access private cloud records.');
+    }
+    return uid;
+  }
+
+  public async getFavorites(): Promise<string[]> {
+    const uid = auth.currentUser?.uid;
+    if (!uid) return [];
+    const favPath = `favorites/${uid}/items`;
+    try {
+      const q = query(
+        collection(db, 'favorites', uid, 'items'),
+        where('ownerUid', '==', uid)
+      );
+      const snap = await getDocs(q);
+      return snap.docs.map((d) => String(d.data().itemId || d.id));
+    } catch (err) {
+      handleFirestoreError(err, OperationType.LIST, favPath);
+    }
+  }
+
+  public async addFavorite(itemId: string): Promise<string[]> {
+    const uid = this.requireUid();
+    const safeId = sanitizeFirestoreId(itemId);
+    const favDocPath = `favorites/${uid}/items/${safeId}`;
+    const now = new Date().toISOString();
+
+    try {
+      const existingSnap = await getDoc(doc(db, 'favorites', uid, 'items', safeId));
+      if (!existingSnap.exists()) {
+        await setDoc(doc(db, 'favorites', uid, 'items', safeId), {
+          itemId: safeId,
+          ownerUid: uid,
+          createdAt: now,
+        });
+      }
+      return await this.getFavorites();
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, favDocPath);
+    }
+  }
+
+  public async removeFavorite(itemId: string): Promise<string[]> {
+    const uid = this.requireUid();
+    const safeId = sanitizeFirestoreId(itemId);
+    const favDocPath = `favorites/${uid}/items/${safeId}`;
+
+    try {
+      const existingSnap = await getDoc(doc(db, 'favorites', uid, 'items', safeId));
+      if (existingSnap.exists()) {
+        await deleteDoc(doc(db, 'favorites', uid, 'items', safeId));
+      }
+      return await this.getFavorites();
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, favDocPath);
+    }
+  }
+
+  public async listProjects(): Promise<ProjectLibraryItem[]> {
+    const uid = auth.currentUser?.uid;
+    if (!uid) return [];
+    const path = 'projects';
+    try {
+      const q = query(collection(db, 'projects'), where('ownerUid', '==', uid));
+      const snap = await getDocs(q);
+      const list = snap.docs.map((d) => d.data() as ProjectLibraryItem);
+      return list.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
+    } catch (err) {
+      handleFirestoreError(err, OperationType.LIST, path);
+    }
+  }
+
+  public async seedStarterProjectsForUserIfEmpty(): Promise<ProjectLibraryItem[]> {
+    const uid = auth.currentUser?.uid;
+    if (!uid) return [];
+    const current = await this.listProjects();
+    if (current.length > 0) return current;
+
+    const now = new Date().toISOString();
+    const created: ProjectLibraryItem[] = [];
+    for (const seed of SEED_PROJECT_LIBRARY.slice(0, 4)) {
+      const projId = sanitizeFirestoreId(`${uid.slice(0, 8)}_${seed.id}`);
+      const payload: ProjectLibraryItem = {
+        id: projId,
+        ownerUid: uid,
+        title: seed.title.slice(0, 160),
+        description: seed.description.slice(0, 2000),
+        compCount: seed.compCount,
+        projectFileStatus: seed.projectFileStatus,
+        fileSizeBytes: seed.fileSizeBytes,
+        fileSizeLabel: seed.fileSizeLabel.slice(0, 80),
+        ...(seed.resolution ? { resolution: seed.resolution } : {}),
+        ...(seed.durationLabel ? { durationLabel: seed.durationLabel } : {}),
+        ...(seed.fps !== undefined ? { fps: seed.fps } : {}),
+        ...(seed.aeVersion ? { aeVersion: seed.aeVersion } : {}),
+        hasExternalFootageWarning: Boolean(seed.hasExternalFootageWarning),
+        archived: Boolean(seed.archived),
+        tags: (seed.tags || []).slice(0, 20).map((t) => String(t).slice(0, 64)),
+        createdAt: now,
+        updatedAt: now,
+      };
+      try {
+        await setDoc(doc(db, 'projects', projId), payload);
+        created.push(payload);
+      } catch (err) {
+        handleFirestoreError(err, OperationType.CREATE, `projects/${projId}`);
+      }
+    }
+    return created;
+  }
+
+  public async createProject(
+    input: Omit<ProjectLibraryItem, 'id' | 'updatedAt'>
+  ): Promise<ProjectLibraryItem> {
+    const uid = this.requireUid();
+    const projId = sanitizeFirestoreId(
+      `proj_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
+    );
+    const now = new Date().toISOString();
+
+    if (
+      input.description?.includes('blob:') ||
+      input.title?.includes('blob:')
+    ) {
+      throw new Error(
+        'STORAGE_NOT_CONFIGURED: Local blob URLs cannot be saved as persistent cloud URLs.'
+      );
+    }
+
+    const record: ProjectLibraryItem = {
+      id: projId,
+      ownerUid: uid,
+      title: input.title.trim().slice(0, 160),
+      description: (input.description || '').trim().slice(0, 2000),
+      compCount: input.compCount ?? null,
+      projectFileStatus: input.projectFileStatus || 'metadata-only',
+      fileSizeBytes: input.fileSizeBytes ?? null,
+      fileSizeLabel: (input.fileSizeLabel || 'Unknown (metadata-only)').slice(0, 80),
+      ...(input.resolution ? { resolution: input.resolution.slice(0, 64) } : {}),
+      ...(input.durationLabel ? { durationLabel: input.durationLabel.slice(0, 64) } : {}),
+      ...(input.fps !== undefined ? { fps: input.fps } : {}),
+      ...(input.aeVersion ? { aeVersion: input.aeVersion.slice(0, 64) } : {}),
+      ...(input.targetEditor ? { targetEditor: input.targetEditor } : {}),
+      ...(input.aspectRatio ? { aspectRatio: input.aspectRatio } : {}),
+      ...(input.sowveilSpecJson ? { sowveilSpecJson: input.sowveilSpecJson.slice(0, 15000) } : {}),
+      ...(input.checkpoints ? { checkpoints: input.checkpoints.slice(0, 20) } : {}),
+      hasExternalFootageWarning: Boolean(input.hasExternalFootageWarning),
+      archived: Boolean(input.archived),
+      tags: (input.tags || []).slice(0, 20).map((t) => String(t).slice(0, 64)),
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    try {
+      await setDoc(doc(db, 'projects', projId), record);
+      return record;
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, `projects/${projId}`);
+    }
+  }
+
+  public async updateProject(
+    id: string,
+    patch: Partial<ProjectLibraryItem>
+  ): Promise<ProjectLibraryItem> {
+    this.requireUid();
+    const safeId = sanitizeFirestoreId(id);
+    const docRef = doc(db, 'projects', safeId);
+    const now = new Date().toISOString();
+
+    try {
+      const snap = await getDoc(docRef);
+      if (!snap.exists()) {
+        throw new Error(`Project "${safeId}" not found`);
+      }
+      const existing = snap.data() as ProjectLibraryItem;
+      const updatePayload: Record<string, unknown> = {
+        updatedAt: now,
+      };
+      if (patch.title !== undefined) updatePayload.title = patch.title.trim().slice(0, 160);
+      if (patch.description !== undefined)
+        updatePayload.description = patch.description.trim().slice(0, 2000);
+      if (patch.compCount !== undefined) updatePayload.compCount = patch.compCount;
+      if (patch.projectFileStatus !== undefined)
+        updatePayload.projectFileStatus = patch.projectFileStatus;
+      if (patch.fileSizeBytes !== undefined) updatePayload.fileSizeBytes = patch.fileSizeBytes;
+      if (patch.fileSizeLabel !== undefined)
+        updatePayload.fileSizeLabel = patch.fileSizeLabel.slice(0, 80);
+      if (patch.resolution !== undefined) updatePayload.resolution = patch.resolution;
+      if (patch.targetEditor !== undefined) updatePayload.targetEditor = patch.targetEditor;
+      if (patch.aspectRatio !== undefined) updatePayload.aspectRatio = patch.aspectRatio;
+      if (patch.sowveilSpecJson !== undefined)
+        updatePayload.sowveilSpecJson = patch.sowveilSpecJson.slice(0, 15000);
+      if (patch.checkpoints !== undefined)
+        updatePayload.checkpoints = patch.checkpoints.slice(0, 20);
+      if (patch.hasExternalFootageWarning !== undefined)
+        updatePayload.hasExternalFootageWarning = Boolean(patch.hasExternalFootageWarning);
+      if (patch.archived !== undefined) updatePayload.archived = Boolean(patch.archived);
+      if (patch.tags !== undefined)
+        updatePayload.tags = patch.tags.slice(0, 20).map((t) => String(t).slice(0, 64));
+
+      await updateDoc(docRef, updatePayload);
+      return {
+        ...existing,
+        ...(updatePayload as Partial<ProjectLibraryItem>),
+      };
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `projects/${safeId}`);
+    }
+  }
+
+  public async deleteProject(id: string): Promise<void> {
+    this.requireUid();
+    const safeId = sanitizeFirestoreId(id);
+    try {
+      await deleteDoc(doc(db, 'projects', safeId));
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, `projects/${safeId}`);
+    }
+  }
+
+  public async listJobs(): Promise<JobRecord[]> {
+    const uid = auth.currentUser?.uid;
+    if (!uid) return [];
+    try {
+      const q = query(collection(db, 'jobs'), where('ownerUid', '==', uid));
+      const snap = await getDocs(q);
+      const list = snap.docs.map((d) => d.data() as JobRecord);
+      return list.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+    } catch (err) {
+      handleFirestoreError(err, OperationType.LIST, 'jobs');
+    }
+  }
+
+  public async createJob(
+    input: Omit<
+      JobRecord,
+      'id' | 'createdAt' | 'updatedAt' | 'requestId' | 'attemptCount' | 'idempotencyKey'
+    > & { idempotencyKey?: string }
+  ): Promise<JobRecord> {
+    const uid = this.requireUid();
+    const current = await this.listJobs();
+    const idemKey = (
+      input.idempotencyKey ||
+      `${input.type}:${input.moduleId}:${input.operation || 'none'}:${input.title}`
+    ).slice(0, 200);
+
+    const existingActive = current.find(
+      (j) =>
+        j.idempotencyKey === idemKey &&
+        (j.status === 'queued' ||
+          j.status === 'uploading' ||
+          j.status === 'claimed' ||
+          j.status === 'running' ||
+          j.status === 'finalizing')
+    );
+    if (existingActive) {
+      return existingActive;
+    }
+
+    const now = new Date().toISOString();
+    const jobId = sanitizeFirestoreId(
+      `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
+    );
+    const allowedInitialStatuses: JobStatus[] = [
+      'draft',
+      'queued',
+      'uploading',
+      'running',
+      'finalizing',
+      'ready',
+      'needs-setup',
+      'quota-reached',
+    ];
+    const initialStatus: JobStatus = allowedInitialStatuses.includes(input.status)
+      ? input.status
+      : 'queued';
+
+    const record: JobRecord = {
+      id: jobId,
+      ownerUid: uid,
+      type: input.type,
+      title: input.title.trim().slice(0, 200),
+      moduleId: input.moduleId,
+      ...(input.itemId ? { itemId: input.itemId } : {}),
+      ...(input.operation ? { operation: input.operation } : {}),
+      ...(input.targetEditor ? { targetEditor: input.targetEditor } : {}),
+      ...(input.exportFormat ? { exportFormat: input.exportFormat } : {}),
+      ...(input.aspectRatio ? { aspectRatio: input.aspectRatio } : {}),
+      ...(input.outputFileName ? { outputFileName: input.outputFileName } : {}),
+      ...(input.outputMimeType ? { outputMimeType: input.outputMimeType } : {}),
+      ...(input.outputSizeBytes !== undefined ? { outputSizeBytes: input.outputSizeBytes } : {}),
+      ...(input.processedBytes !== undefined ? { processedBytes: input.processedBytes } : {}),
+      ...(input.totalBytes !== undefined ? { totalBytes: input.totalBytes } : {}),
+      ...(input.completedStageIndex !== undefined
+        ? { completedStageIndex: input.completedStageIndex }
+        : {}),
+      ...(input.totalStages !== undefined ? { totalStages: input.totalStages } : {}),
+      ...(input.stageLabel ? { stageLabel: input.stageLabel } : {}),
+      status: initialStatus,
+      createdAt: now,
+      updatedAt: now,
+      attemptCount: 1,
+      idempotencyKey: idemKey,
+      deviceId: input.deviceId ?? null,
+      ...(input.errorCode ? { errorCode: input.errorCode } : {}),
+      redactedMessage: (input.redactedMessage || '').slice(0, 1000),
+      requestId: `req_${Math.random().toString(36).slice(2, 10)}`,
+    };
+
+    try {
+      await setDoc(doc(db, 'jobs', jobId), record);
+      return record;
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, `jobs/${jobId}`);
+    }
+  }
+
+  public async transitionJob(
+    id: string,
+    nextStatus: JobStatus,
+    options?: { redactedMessage?: string; errorCode?: string; deviceId?: string | null }
+  ): Promise<JobRecord> {
+    this.requireUid();
+    const safeId = sanitizeFirestoreId(id);
+    const docRef = doc(db, 'jobs', safeId);
+
+    try {
+      const snap = await getDoc(docRef);
+      if (!snap.exists()) {
+        throw new Error(`Job "${safeId}" not found`);
+      }
+      const existing = snap.data() as JobRecord;
+      const updated = transitionJobRecord(existing, nextStatus, options);
+      const updatePayload: Record<string, unknown> = {
+        status: updated.status,
+        updatedAt: updated.updatedAt,
+        attemptCount: updated.attemptCount,
+        redactedMessage: updated.redactedMessage.slice(0, 1000),
+      };
+      if (updated.startedAt) updatePayload.startedAt = updated.startedAt;
+      if (updated.finishedAt) updatePayload.finishedAt = updated.finishedAt;
+      if (updated.deviceId !== undefined) updatePayload.deviceId = updated.deviceId;
+      if (updated.errorCode !== undefined) updatePayload.errorCode = updated.errorCode;
+
+      await updateDoc(docRef, updatePayload);
+      return updated;
+    } catch (err) {
+      if (err instanceof Error && err.message.startsWith('INVALID_JOB_TRANSITION')) {
+        throw err;
+      }
+      handleFirestoreError(err, OperationType.UPDATE, `jobs/${safeId}`);
+    }
+  }
+
+  public async clearJobs(): Promise<void> {
+    const jobs = await this.listJobs();
+    for (const j of jobs) {
+      try {
+        await deleteDoc(doc(db, 'jobs', j.id));
+      } catch (err) {
+        handleFirestoreError(err, OperationType.DELETE, `jobs/${j.id}`);
+      }
+    }
+  }
+
+  public async getPreferences(): Promise<UserPreferences> {
+    const uid = auth.currentUser?.uid;
+    if (!uid) return DEFAULT_USER_PREFERENCES;
+    try {
+      const snap = await getDoc(doc(db, 'users', uid));
+      if (!snap.exists()) return DEFAULT_USER_PREFERENCES;
+      const prefs = snap.data().preferences || {};
+      return {
+        ...DEFAULT_USER_PREFERENCES,
+        ...prefs,
+      };
+    } catch (err) {
+      handleFirestoreError(err, OperationType.GET, `users/${uid}`);
+    }
+  }
+
+  public async savePreferences(
+    patch: Partial<UserPreferences>
+  ): Promise<UserPreferences> {
+    const uid = this.requireUid();
+    const current = await this.getPreferences();
+    const next: UserPreferences = { ...current, ...patch };
+    const now = new Date().toISOString();
+
+    try {
+      await updateDoc(doc(db, 'users', uid), {
+        preferences: next,
+        updatedAt: now,
+      });
+      return next;
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `users/${uid}`);
+    }
+  }
+
+  public async listDevices(): Promise<DeviceRecord[]> {
+    const uid = auth.currentUser?.uid;
+    if (!uid) return [];
+    try {
+      const q = query(collection(db, 'devices'), where('ownerUid', '==', uid));
+      const snap = await getDocs(q);
+      return snap.docs.map((d) => d.data() as DeviceRecord);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.LIST, 'devices');
+    }
+  }
+}
+
+/**
+ * Deterministic in-memory repository used strictly by automated Node unit tests
+ * (`src/tests/phase2.test.ts` and `src/tests/phase3.security.test.ts`).
+ * Never touches browser localStorage.
+ */
+export class InMemoryTestWorkspaceRepository implements IWorkspaceRepository {
+  public readonly modeLabel = 'In-Memory Test Repository (Automated Test Suite Only)';
+  private favorites: string[] = ['ta-rise-up', 'exp-sine-wave', 'car-builder-main'];
+  private projects: ProjectLibraryItem[] = [...SEED_PROJECT_LIBRARY];
+  private jobs: JobRecord[] = [];
+  private preferences: UserPreferences = { ...DEFAULT_USER_PREFERENCES };
+  private shouldSimulateWriteFailure = false;
+
+  public setSimulateWriteFailure(fail: boolean): void {
+    this.shouldSimulateWriteFailure = fail;
+  }
+
+  private assertWritable(): void {
+    if (this.shouldSimulateWriteFailure) {
+      throw new Error('REPOSITORY_WRITE_FAILED: Simulated storage write failure');
+    }
+  }
+
+  public async getFavorites(): Promise<string[]> {
+    return Array.from(new Set(this.favorites));
+  }
+
+  public async addFavorite(itemId: string): Promise<string[]> {
+    const trimmed = itemId.trim();
+    if (!trimmed) throw new Error('Invalid itemId for favorite');
+    this.assertWritable();
+    if (!this.favorites.includes(trimmed)) {
+      this.favorites = [...this.favorites, trimmed];
+    }
+    return this.getFavorites();
+  }
+
+  public async removeFavorite(itemId: string): Promise<string[]> {
+    const trimmed = itemId.trim();
+    this.assertWritable();
+    this.favorites = this.favorites.filter((id) => id !== trimmed);
+    return this.getFavorites();
+  }
+
+  public async listProjects(): Promise<ProjectLibraryItem[]> {
+    return [...this.projects];
+  }
+
+  public async createProject(
+    input: Omit<ProjectLibraryItem, 'id' | 'updatedAt'>
+  ): Promise<ProjectLibraryItem> {
+    this.assertWritable();
+    const record: ProjectLibraryItem = {
+      ...input,
+      id: `proj_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      updatedAt: new Date().toISOString().slice(0, 10),
+    };
+    this.projects = [record, ...this.projects];
+    return record;
+  }
+
+  public async updateProject(
+    id: string,
+    patch: Partial<ProjectLibraryItem>
+  ): Promise<ProjectLibraryItem> {
+    this.assertWritable();
+    const idx = this.projects.findIndex((p) => p.id === id);
+    if (idx === -1) {
+      throw new Error(`Project record "${id}" not found`);
+    }
+    const updated: ProjectLibraryItem = {
+      ...this.projects[idx],
+      ...patch,
+      id: this.projects[idx].id,
+      updatedAt: new Date().toISOString().slice(0, 10),
+    };
+    this.projects[idx] = updated;
+    return updated;
+  }
+
+  public async deleteProject(id: string): Promise<void> {
+    this.assertWritable();
+    this.projects = this.projects.filter((p) => p.id !== id);
+  }
+
+  public async listJobs(): Promise<JobRecord[]> {
+    return [...this.jobs];
+  }
+
+  public async createJob(
+    input: Omit<
+      JobRecord,
+      'id' | 'createdAt' | 'updatedAt' | 'requestId' | 'attemptCount' | 'idempotencyKey'
+    > & { idempotencyKey?: string }
+  ): Promise<JobRecord> {
+    this.assertWritable();
+    const idemKey =
+      input.idempotencyKey ||
+      `${input.type}:${input.moduleId}:${input.operation || 'none'}:${input.title}`;
+
+    const existingActive = this.jobs.find(
+      (j) =>
+        j.idempotencyKey === idemKey &&
+        (j.status === 'queued' || j.status === 'claimed' || j.status === 'running')
+    );
+    if (existingActive) {
+      return existingActive;
+    }
+
+    const now = new Date().toISOString();
+    const record: JobRecord = {
+      ...input,
+      id: `job_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      createdAt: now,
+      updatedAt: now,
+      attemptCount: 1,
+      idempotencyKey: idemKey,
+      requestId: `req_${Math.random().toString(36).slice(2, 9)}`,
+    };
+    this.jobs = [record, ...this.jobs];
+    return record;
+  }
+
+  public async transitionJob(
+    id: string,
+    nextStatus: JobStatus,
+    options?: { redactedMessage?: string; errorCode?: string; deviceId?: string | null }
+  ): Promise<JobRecord> {
+    this.assertWritable();
+    const idx = this.jobs.findIndex((j) => j.id === id);
+    if (idx === -1) {
+      throw new Error(`Job "${id}" not found`);
+    }
+    const updated = transitionJobRecord(this.jobs[idx], nextStatus, options);
+    this.jobs[idx] = updated;
+    return updated;
+  }
+
+  public async clearJobs(): Promise<void> {
+    this.assertWritable();
+    this.jobs = [];
+  }
+
+  public async getPreferences(): Promise<UserPreferences> {
+    return { ...this.preferences };
+  }
+
+  public async savePreferences(
+    patch: Partial<UserPreferences>
+  ): Promise<UserPreferences> {
+    this.assertWritable();
+    this.preferences = { ...this.preferences, ...patch };
+    return { ...this.preferences };
+  }
+}
+
+export { InMemoryTestWorkspaceRepository as LocalPreviewWorkspaceRepository };
+
+export const firestoreWorkspaceRepository = new FirestoreWorkspaceRepository();
+export const workspaceRepository: IWorkspaceRepository = firestoreWorkspaceRepository;
