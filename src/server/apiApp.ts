@@ -116,10 +116,12 @@ import {
   evaluateRoutingReadiness,
   ExtensionPackageRecord,
   ExtensionPermissionScope,
+  getVaultConfigurationDiagnostics,
   HubAuthMode,
   HubProviderProtocol,
   HubTaskType,
   inspectAndSandboxExtensionContent,
+  inspectPersistedConnectionVaultHealth,
   invokeRegisteredTool,
   ModelCapabilityKey,
   overrideConnectionCapabilityState,
@@ -137,6 +139,7 @@ import {
   toPublicProviderConnectionView,
   updateExtensionPackage,
   validateCustomEndpointSsrf,
+  VaultConfigurationError,
 } from '../services/providerHubEngine';
 import {
   AiDirectorSessionRecord,
@@ -764,7 +767,8 @@ export function createApiApp(options: ApiAppOptions = {}) {
       referenceLabSessionsStore.set(sess.id, sess);
     }
     for (const conn of loadedSnapshot.providerConnections || []) {
-      providerConnectionsStore.set(conn.id, conn);
+      const inspected = inspectPersistedConnectionVaultHealth(conn);
+      providerConnectionsStore.set(inspected.id, inspected);
     }
     for (const [uid, profiles] of Object.entries(loadedSnapshot.routingProfiles || {})) {
       routingProfilesStore.set(uid, profiles);
@@ -6184,7 +6188,14 @@ export function createApiApp(options: ApiAppOptions = {}) {
       (c) => c.ownerUid === uid
     );
     if (existing.length > 0) {
-      return existing.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+      const checked = existing.map((c) => {
+        const next = inspectPersistedConnectionVaultHealth(c);
+        if (next !== c) {
+          providerConnectionsStore.set(next.id, next);
+        }
+        return next;
+      });
+      return checked.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
     }
     // Seed 2 starter prepopulated connections (Argon & Flash) with capabilities strictly in 'Not tested' state
     const argonConn = createProviderConnectionRecord({
@@ -6232,6 +6243,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
       taskTypes: ALL_HUB_TASK_TYPES,
       ssrfProtectionEnforced: true,
       encryptionStandard: 'aes-256-gcm-scoped-aad',
+      vaultStatus: getVaultConfigurationDiagnostics(),
     });
   });
 
@@ -6242,6 +6254,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
     return sendOk(res, authReq.requestId, {
       items: connections.map(toPublicProviderConnectionView),
       total: connections.length,
+      vaultStatus: getVaultConfigurationDiagnostics(),
     });
   });
 
@@ -6333,11 +6346,19 @@ export function createApiApp(options: ApiAppOptions = {}) {
         201
       );
     } catch (err: any) {
+      const code = err?.code || 'CONNECTION_CREATE_FAILED';
+      const status =
+        err instanceof VaultConfigurationError &&
+        (code === 'VAULT_MASTER_KEY_NOT_CONFIGURED' ||
+          code === 'VAULT_KEY_CONFIG_CONFLICT' ||
+          code === 'VAULT_COMPROMISED_FALLBACK_FORBIDDEN')
+          ? 503
+          : 400;
       return sendError(
         res,
         authReq.requestId,
-        400,
-        err?.code || 'CONNECTION_CREATE_FAILED',
+        status,
+        code,
         err?.message || 'Failed to create provider connection.'
       );
     }
@@ -6502,24 +6523,42 @@ export function createApiApp(options: ApiAppOptions = {}) {
         );
       }
 
-      const updated = rotateConnectionCredential(existing, newCredential);
-      providerConnectionsStore.set(updated.id, updated);
-      persistState();
+      try {
+        const updated = rotateConnectionCredential(existing, newCredential);
+        providerConnectionsStore.set(updated.id, updated);
+        persistState();
 
-      recordAudit(
-        uid,
-        authReq.authIdentity!.email,
-        'PROVIDER_CREDENTIAL_ROTATED',
-        updated.id,
-        `Rotated credential to version ${updated.keyVersion} (${updated.maskedCredential})`,
-        authReq.requestId,
-        'system',
-        'success'
-      );
+        recordAudit(
+          uid,
+          authReq.authIdentity!.email,
+          'PROVIDER_CREDENTIAL_ROTATED',
+          updated.id,
+          `Rotated credential to version ${updated.keyVersion} (${updated.maskedCredential})`,
+          authReq.requestId,
+          'system',
+          'success'
+        );
 
-      return sendOk(res, authReq.requestId, {
-        connection: toPublicProviderConnectionView(updated),
-      });
+        return sendOk(res, authReq.requestId, {
+          connection: toPublicProviderConnectionView(updated),
+        });
+      } catch (err: any) {
+        const code = err?.code || 'CREDENTIAL_ROTATION_FAILED';
+        const status =
+          err instanceof VaultConfigurationError &&
+          (code === 'VAULT_MASTER_KEY_NOT_CONFIGURED' ||
+            code === 'VAULT_KEY_CONFIG_CONFLICT' ||
+            code === 'VAULT_COMPROMISED_FALLBACK_FORBIDDEN')
+            ? 503
+            : 400;
+        return sendError(
+          res,
+          authReq.requestId,
+          status,
+          code,
+          err?.message || 'Failed to rotate credential.'
+        );
+      }
     }
   );
 

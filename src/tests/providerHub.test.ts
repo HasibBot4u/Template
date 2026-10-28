@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import {
   ALL_MODEL_CAPABILITY_KEYS,
   ALL_HUB_TASK_TYPES,
@@ -9,6 +12,7 @@ import {
   parseProtocolStreamChunk,
   validateCustomEndpointSsrf,
   validateRedirectChainSsrf,
+  encryptCredentialForVault,
   decryptCredentialFromVault,
   redactSecretsFromText,
   buildInitialCapabilityRegistry,
@@ -24,12 +28,22 @@ import {
   updateExtensionPackage,
   rollbackExtensionPackage,
   inspectAndSandboxExtensionContent,
+  inspectPersistedConnectionVaultHealth,
+  migrateVaultRecordWithExplicitPreviousKey,
+  resolveVaultKeyConfiguration,
+  VaultConfigurationError,
   REGISTERED_AI_TOOLS,
   invokeRegisteredTool,
   PREPOPULATED_MODEL_CATALOG,
 } from '../services/providerHubEngine';
+import { executeProviderHubApiRequest } from '../components/ProviderHubWorkspace';
 import { createMinimalCanonicalProject } from '../services/canonicalProjectEngine';
 import { createApiApp } from '../server/apiApp';
+import { saveDurableSnapshot } from '../server/durableStore';
+
+const TEST_MASTER_VAULT_KEY = 'sowveil-test-master-vault-key-32bytes-secure-2026!';
+process.env.SOWVEIL_MASTER_VAULT_KEY = TEST_MASTER_VAULT_KEY;
+delete process.env.SOWVEIL_VAULT_KEY;
 
 test('Phase 9.1 — Distinct Protocol Adapters format requests, tools, structured outputs, media inputs, responses, and SSE streams without conflating protocols', () => {
   const sampleTools = [
@@ -665,3 +679,365 @@ test('Phase 9.7 — REST API Integration & Workspace Isolation (/api/v1/provider
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 });
+
+test('Phase 1A.1 — Vault fails closed when no master secret is configured, rejects the retired public fallback, and rejects conflicting SOWVEIL_MASTER_VAULT_KEY vs SOWVEIL_VAULT_KEY', () => {
+  const prevMaster = process.env.SOWVEIL_MASTER_VAULT_KEY;
+  const prevLegacy = process.env.SOWVEIL_VAULT_KEY;
+
+  const sampleScope = {
+    ownerUid: 'user_vault_1a',
+    workspaceId: 'ws_vault_1a',
+    connectionId: 'conn_vault_1a',
+    protocol: 'openai-chat-completions' as const,
+  };
+
+  try {
+    // 1. Neither SOWVEIL_MASTER_VAULT_KEY nor SOWVEIL_VAULT_KEY configured -> fails closed
+    delete process.env.SOWVEIL_MASTER_VAULT_KEY;
+    delete process.env.SOWVEIL_VAULT_KEY;
+
+    assert.throws(
+      () => encryptCredentialForVault('sk-live-secret-1234567890', sampleScope, 1),
+      (err: any) =>
+        err instanceof VaultConfigurationError &&
+        err.code === 'VAULT_MASTER_KEY_NOT_CONFIGURED'
+    );
+
+    assert.throws(
+      () =>
+        createProviderConnectionRecord({
+          ownerUid: 'user_vault_1a',
+          label: 'Unconfigured Vault Test',
+          providerBrand: 'OpenAI',
+          protocol: 'openai-chat-completions',
+          baseUrl: 'https://api.openai.com',
+          modelId: 'gpt-4o',
+          authMode: 'bearer',
+          credential: 'sk-live-secret-1234567890',
+        }),
+      (err: any) =>
+        err instanceof VaultConfigurationError &&
+        err.code === 'VAULT_MASTER_KEY_NOT_CONFIGURED'
+    );
+
+    // 2. Retired public fallback key is strictly forbidden even if explicitly set in env
+    const retiredFallback = ['sowveil-studio-server-vault-key', '2026-aes256gcm-v1'].join('-');
+    process.env.SOWVEIL_MASTER_VAULT_KEY = retiredFallback;
+    assert.throws(
+      () => resolveVaultKeyConfiguration(process.env),
+      (err: any) =>
+        err instanceof VaultConfigurationError &&
+        err.code === 'VAULT_COMPROMISED_FALLBACK_FORBIDDEN'
+    );
+
+    // 3. Conflicting SOWVEIL_MASTER_VAULT_KEY and SOWVEIL_VAULT_KEY fails closed
+    process.env.SOWVEIL_MASTER_VAULT_KEY = 'master-vault-secret-alpha-2026-strong-key';
+    process.env.SOWVEIL_VAULT_KEY = 'legacy-vault-secret-beta-2026-different-key';
+    assert.throws(
+      () => resolveVaultKeyConfiguration(process.env),
+      (err: any) =>
+        err instanceof VaultConfigurationError && err.code === 'VAULT_KEY_CONFIG_CONFLICT'
+    );
+
+    // 4. Legacy SOWVEIL_VAULT_KEY works when SOWVEIL_MASTER_VAULT_KEY is unset
+    delete process.env.SOWVEIL_MASTER_VAULT_KEY;
+    process.env.SOWVEIL_VAULT_KEY = 'legacy-vault-secret-compatible-2026-key';
+    const legacyResolved = resolveVaultKeyConfiguration(process.env);
+    assert.equal(legacyResolved.sourceEnvVar, 'SOWVEIL_VAULT_KEY');
+
+    // 5. Encryption and decryption work with configured SOWVEIL_MASTER_VAULT_KEY, and wrong secret fails safely
+    process.env.SOWVEIL_MASTER_VAULT_KEY = 'canonical-master-secret-key-2026-verified!';
+    delete process.env.SOWVEIL_VAULT_KEY;
+
+    const ciphertext = encryptCredentialForVault(
+      'sk-ant-canonical-secret-value-556677',
+      sampleScope,
+      1
+    );
+    const decrypted = decryptCredentialFromVault(ciphertext, sampleScope);
+    assert.equal(decrypted, 'sk-ant-canonical-secret-value-556677');
+
+    // Decrypting with wrong secret fails closed with VAULT_DECRYPTION_FAILED
+    assert.throws(
+      () =>
+        decryptCredentialFromVault(
+          ciphertext,
+          sampleScope,
+          'wrong-master-secret-key-that-does-not-match!'
+        ),
+      (err: any) =>
+        err instanceof VaultConfigurationError && err.code === 'VAULT_DECRYPTION_FAILED'
+    );
+  } finally {
+    if (prevMaster !== undefined) {
+      process.env.SOWVEIL_MASTER_VAULT_KEY = prevMaster;
+    } else {
+      delete process.env.SOWVEIL_MASTER_VAULT_KEY;
+    }
+    if (prevLegacy !== undefined) {
+      process.env.SOWVEIL_VAULT_KEY = prevLegacy;
+    } else {
+      delete process.env.SOWVEIL_VAULT_KEY;
+    }
+  }
+});
+
+test('Phase 1A.2 — Browser/Server Boundary: ProviderHubWorkspace.tsx and src/types/providerHub.ts do not import node:crypto, Buffer, or server-only vault modules', () => {
+  const workspacePath = path.resolve(process.cwd(), 'src/components/ProviderHubWorkspace.tsx');
+  const typesPath = path.resolve(process.cwd(), 'src/types/providerHub.ts');
+  const enginePath = path.resolve(process.cwd(), 'src/services/providerHubEngine.ts');
+  const vaultPath = path.resolve(process.cwd(), 'src/server/credentialVault.ts');
+
+  const workspaceSource = fs.readFileSync(workspacePath, 'utf8');
+  const typesSource = fs.readFileSync(typesPath, 'utf8');
+  const engineSource = fs.readFileSync(enginePath, 'utf8');
+  const vaultSource = fs.readFileSync(vaultPath, 'utf8');
+
+  // Verify retired fallback key literal does not exist in providerHubEngine.ts or credentialVault.ts
+  const retiredLiteral = ['sowveil-studio-server-vault-key', '2026-aes256gcm-v1'].join('-');
+  assert.equal(engineSource.includes(retiredLiteral), false);
+  assert.equal(vaultSource.includes(retiredLiteral), false);
+
+  // Verify browser component has zero server-only imports or mock dev headers
+  assert.equal(/from\s+['"]node:crypto['"]/.test(workspaceSource), false);
+  assert.equal(/from\s+['"]crypto['"]/.test(workspaceSource), false);
+  assert.equal(workspaceSource.includes('providerHubEngine'), false);
+  assert.equal(workspaceSource.includes('credentialVault'), false);
+  assert.equal(/\bBuffer\b/.test(workspaceSource), false);
+  assert.equal(workspaceSource.includes('X-Test-Uid'), false);
+  assert.equal(workspaceSource.includes('X-Test-Email'), false);
+  assert.equal(workspaceSource.includes('x-sowveil-dev-uid'), false);
+
+  // Verify browser-safe types module has zero Node crypto or Buffer references
+  assert.equal(/from\s+['"]node:crypto['"]/.test(typesSource), false);
+  assert.equal(/from\s+['"]crypto['"]/.test(typesSource), false);
+  assert.equal(/\bBuffer\b/.test(typesSource), false);
+});
+
+test('Phase 1A.3 — Authenticated Provider Hub API integration, truthful 401/503 failure handling, and non-destructive legacy record protection', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sowveil-phase1a-'));
+  const snapshotPath = path.join(tempDir, 'durable-store.json');
+  const prevMaster = process.env.SOWVEIL_MASTER_VAULT_KEY;
+
+  try {
+    // Step 1: Create an existing connection encrypted under an older key (Key A) and persist it to disk
+    const oldKeyA = 'old-master-vault-key-before-rotation-2026-alpha!';
+    process.env.SOWVEIL_MASTER_VAULT_KEY = oldKeyA;
+
+    const legacyConn = createProviderConnectionRecord({
+      ownerUid: 'uid_alice',
+      workspaceId: 'ws_uid_alice',
+      label: 'Alice Persisted Anthropic Connection',
+      providerBrand: 'Anthropic',
+      protocol: 'anthropic-messages',
+      baseUrl: 'https://api.anthropic.com',
+      modelId: 'claude-3-7-sonnet-20250219',
+      authMode: 'x-api-key',
+      credential: 'sk-ant-legacy-persisted-secret-key-111222',
+    });
+    const legacyRouting = buildDefaultRoutingProfiles([legacyConn]);
+
+    saveDurableSnapshot(snapshotPath, {
+      schemaVersion: '1.0.0',
+      savedAt: new Date().toISOString(),
+      catalogCacheVersion: 1,
+      ownerBootstrappedUid: null,
+      roles: {},
+      userStatuses: {},
+      userPreferences: {},
+      userFavorites: {},
+      userRecentItems: {},
+      catalogItems: [],
+      templateVariants: [],
+      assets: [],
+      projects: [],
+      jobs: [],
+      devices: [],
+      modules: [],
+      editorAdapters: [],
+      referenceLabSessions: [],
+      providerConnections: [legacyConn],
+      routingProfiles: { uid_alice: legacyRouting },
+      extensionPackages: [],
+      aiDirectorSessions: [],
+      templateFactoryDrafts: [],
+      templatePreferenceSignals: [],
+      userPreferenceConsents: {},
+      renderExportJobs: [],
+      toolAuditRecords: [],
+      auditEvents: [],
+      platformSettings: {} as any,
+    });
+
+    // Step 2: Rotate server environment to a new SOWVEIL_MASTER_VAULT_KEY (Key B) and start server
+    const newKeyB = 'new-master-vault-key-after-rotation-2026-bravo!';
+    process.env.SOWVEIL_MASTER_VAULT_KEY = newKeyB;
+
+    const app = createApiApp({
+      persistenceFilePath: snapshotPath,
+      tokenVerifier: async (token) => {
+        if (token === 'valid_alice_token') {
+          return {
+            uid: 'uid_alice',
+            email: 'alice@example.com',
+            emailVerified: true,
+            displayName: 'Alice',
+          };
+        }
+        const err = new Error('Invalid or expired Firebase ID token');
+        (err as { code?: string }).code = 'INVALID_TOKEN';
+        throw err;
+      },
+    });
+
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    const port = (server.address() as { port: number }).port;
+    const baseUrl = `http://127.0.0.1:${port}`;
+
+    try {
+      // A. Verify existing persisted record is NOT discarded or overwritten; it is marked 'requires-reentry'
+      const listRes = await executeProviderHubApiRequest<{
+        items: Array<{
+          id: string;
+          label: string;
+          credentialStatus: string;
+          lastSanitizedError: { code: string; message: string } | null;
+        }>;
+      }>(`${baseUrl}/api/v1/provider-hub/connections`, {
+        method: 'GET',
+        getAuthToken: async () => 'valid_alice_token',
+      });
+      assert.equal(listRes.ok, true);
+      assert.equal(listRes.data?.items.length, 1);
+      assert.equal(listRes.data?.items[0].id, legacyConn.id);
+      assert.equal(listRes.data?.items[0].label, 'Alice Persisted Anthropic Connection');
+      assert.equal(listRes.data?.items[0].credentialStatus, 'requires-reentry');
+      assert.equal(
+        listRes.data?.items[0].lastSanitizedError?.code,
+        'CREDENTIAL_REENTRY_REQUIRED'
+      );
+
+      // B. Probing the legacy connection fails safely with CREDENTIAL_REENTRY_REQUIRED (never uses old fallback)
+      const probeLegacyRes = await executeProviderHubApiRequest<{
+        probePassed: boolean;
+        sanitizedError: { code: string } | null;
+      }>(`${baseUrl}/api/v1/provider-hub/connections/${legacyConn.id}/test`, {
+        method: 'POST',
+        body: { probeTools: true },
+        getAuthToken: async () => 'valid_alice_token',
+      });
+      assert.equal(probeLegacyRes.ok, true);
+      assert.equal(probeLegacyRes.data?.probePassed, false);
+      assert.equal(
+        probeLegacyRes.data?.sanitizedError?.code,
+        'CREDENTIAL_REENTRY_REQUIRED'
+      );
+
+      // C. Rotating the key on the preserved connection re-encrypts under Key B and restores 'active' status
+      const rotatedRes = await executeProviderHubApiRequest<{
+        connection: { id: string; credentialStatus: string; keyVersion: number };
+      }>(`${baseUrl}/api/v1/provider-hub/connections/${legacyConn.id}/rotate-key`, {
+        method: 'POST',
+        body: { credential: 'sk-ant-freshly-rotated-under-key-b-999888' },
+        getAuthToken: async () => 'valid_alice_token',
+      });
+      assert.equal(rotatedRes.ok, true);
+      assert.equal(rotatedRes.data?.connection.credentialStatus, 'active');
+      assert.equal(rotatedRes.data?.connection.keyVersion, 2);
+
+      // Probing now succeeds under Key B
+      const probeAfterRotate = await executeProviderHubApiRequest<{
+        probePassed: boolean;
+      }>(`${baseUrl}/api/v1/provider-hub/connections/${legacyConn.id}/test`, {
+        method: 'POST',
+        body: { probeTools: true },
+        getAuthToken: async () => 'valid_alice_token',
+      });
+      assert.equal(probeAfterRotate.ok, true);
+      assert.equal(probeAfterRotate.data?.probePassed, true);
+
+      // D. Verify controlled explicit migration helper works when previous key is explicitly supplied
+      const migratedRecord = migrateVaultRecordWithExplicitPreviousKey(legacyConn, {
+        previousMasterKey: oldKeyA,
+        newMasterKey: newKeyB,
+      });
+      assert.equal(migratedRecord.credentialStatus, 'active');
+      assert.equal(migratedRecord.keyVersion, 2);
+      const inspectedMigrated = inspectPersistedConnectionVaultHealth(migratedRecord);
+      assert.equal(inspectedMigrated.credentialStatus, 'active');
+
+      // E. Verify authentication failures (missing token or invalid token -> 401) return ok: false and never fake success
+      const unauthCreateRes = await executeProviderHubApiRequest(
+        `${baseUrl}/api/v1/provider-hub/connections`,
+        {
+          method: 'POST',
+          body: {
+            label: 'Should Not Be Created',
+            protocol: 'openai-chat-completions',
+            baseUrl: 'https://api.openai.com',
+            modelId: 'gpt-4o',
+            authMode: 'bearer',
+            credential: 'sk-unauth-attempt',
+          },
+          getAuthToken: async () => 'invalid_token_value',
+        }
+      );
+      assert.equal(unauthCreateRes.ok, false);
+      assert.equal(unauthCreateRes.status, 401);
+
+      const missingTokenRes = await executeProviderHubApiRequest(
+        `${baseUrl}/api/v1/provider-hub/connections`,
+        {
+          method: 'POST',
+          body: { label: 'No Token' },
+          getAuthToken: async () => null,
+        }
+      );
+      assert.equal(missingTokenRes.ok, false);
+      assert.equal(missingTokenRes.status, 401);
+      assert.equal(missingTokenRes.errorCode, 'AUTH_SESSION_REQUIRED');
+
+      // Verify connection count is still 1 (unauthenticated request did not mutate state)
+      const listAfterUnauth = await executeProviderHubApiRequest<{
+        items: Array<{ id: string }>;
+      }>(`${baseUrl}/api/v1/provider-hub/connections`, {
+        method: 'GET',
+        getAuthToken: async () => 'valid_alice_token',
+      });
+      assert.equal(listAfterUnauth.data?.items.length, 1);
+
+      // F. Verify API returns 503 VAULT_MASTER_KEY_NOT_CONFIGURED when master key is removed in production
+      delete process.env.SOWVEIL_MASTER_VAULT_KEY;
+      delete process.env.SOWVEIL_VAULT_KEY;
+      const unconfiguredVaultRes = await executeProviderHubApiRequest(
+        `${baseUrl}/api/v1/provider-hub/connections`,
+        {
+          method: 'POST',
+          body: {
+            label: 'Fail Closed Connection',
+            protocol: 'openai-chat-completions',
+            baseUrl: 'https://api.openai.com',
+            modelId: 'gpt-4o',
+            authMode: 'bearer',
+            credential: 'sk-should-fail-closed-when-vault-unconfigured',
+          },
+          getAuthToken: async () => 'valid_alice_token',
+        }
+      );
+      assert.equal(unconfiguredVaultRes.ok, false);
+      assert.equal(unconfiguredVaultRes.status, 503);
+      assert.equal(unconfiguredVaultRes.errorCode, 'VAULT_MASTER_KEY_NOT_CONFIGURED');
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  } finally {
+    if (prevMaster !== undefined) {
+      process.env.SOWVEIL_MASTER_VAULT_KEY = prevMaster;
+    } else {
+      delete process.env.SOWVEIL_MASTER_VAULT_KEY;
+    }
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+

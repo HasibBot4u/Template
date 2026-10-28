@@ -4,6 +4,10 @@ import http from 'node:http';
 import { createApiApp, VerifiedTokenIdentity } from '../server/apiApp';
 
 function startTestServer() {
+  if (!process.env.SOWVEIL_MASTER_VAULT_KEY) {
+    process.env.SOWVEIL_MASTER_VAULT_KEY =
+      'sowveil-test-suite-master-vault-key-phase14-9988776655';
+  }
   const tokenMap = new Map<string, VerifiedTokenIdentity>([
     [
       'token-alice',

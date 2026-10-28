@@ -1,42 +1,19 @@
-import React, { useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { Link } from 'react-router-dom';
 import {
-  ALL_HUB_TASK_TYPES,
-  ALL_MODEL_CAPABILITY_KEYS,
-  buildDefaultRoutingProfiles,
-  CapabilityVerificationState,
-  createProviderConnectionRecord,
-  evaluateRoutingReadiness,
-  ExtensionPackageKind,
-  ExtensionPackageRecord,
-  ExtensionPermissionScope,
-  HubAuthMode,
-  HubProviderProtocol,
-  HubTaskType,
-  inspectAndSandboxExtensionContent,
-  invokeRegisteredTool,
-  ModelCapabilityKey,
-  overrideConnectionCapabilityState,
-  PREPOPULATED_MODEL_CATALOG,
-  probeProviderConnection,
-  ProviderConnectionRecord,
-  REGISTERED_AI_TOOLS,
-  registerExtensionPackage,
-  revokeConnectionCredential,
-  rollbackExtensionPackage,
-  rotateConnectionCredential,
-  SecretStorageMode,
-  TaskRoutingProfile,
-  ToolExecutionAuditRecord,
-  updateExtensionPackage,
-  validateCustomEndpointSsrf,
-} from '../services/providerHubEngine';
-import {
+  Activity,
   AlertTriangle,
+  ArrowLeft,
+  Boxes,
   CheckCircle2,
-  Code2,
   Cpu,
+  ExternalLink,
+  Eye,
+  EyeOff,
   GitBranch,
   KeyRound,
+  Layers,
+  Loader2,
   Lock,
   Play,
   Plus,
@@ -45,96 +22,198 @@ import {
   Route as RouteIcon,
   ShieldAlert,
   ShieldCheck,
+  Sparkles,
   Terminal,
   Trash2,
+  Unlock,
   Wrench,
   XCircle,
 } from 'lucide-react';
+import { AuthenticatedUser } from '../types/sowveil';
+import { auth } from '../services/firebaseClient';
+import {
+  ALL_HUB_TASK_TYPES,
+  ALL_MODEL_CAPABILITY_KEYS,
+  buildDefaultRoutingProfiles,
+  CapabilityVerificationState,
+  evaluateRoutingReadiness,
+  ExtensionPackageKind,
+  ExtensionPackageRecord,
+  ExtensionPermissionScope,
+  HubAuthMode,
+  HubProviderProtocol,
+  HubTaskType,
+  ModelCapabilityKey,
+  PREPOPULATED_MODEL_CATALOG,
+  PrepopulatedModelCatalogEntry,
+  ProviderConnectionPublicView,
+  REGISTERED_AI_TOOLS,
+  RISKY_EXTENSION_PERMISSIONS,
+  SecretStorageMode,
+  TaskRoutingProfile,
+  ToolExecutionAuditRecord,
+  validateCustomEndpointSsrf,
+} from '../types/providerHub';
 
-interface ProviderHubWorkspaceProps {
+export interface ProviderHubWorkspaceProps {
   userUid?: string;
-  onNotify?: (message: string, tone?: 'info' | 'warning' | 'error' | 'success') => void;
+  currentUser?: AuthenticatedUser | null;
+  onNotify: (message: string, tone?: 'info' | 'warning' | 'error' | 'success') => void;
+  getAuthToken?: () => Promise<string | null>;
+  fetchImpl?: typeof fetch;
 }
 
-type HubWorkspaceTab =
+type HubTabId =
   | 'connections'
   | 'capabilities'
   | 'routing'
   | 'extensions'
   | 'tool-registry';
 
+export interface ProviderHubApiResult<T> {
+  ok: boolean;
+  status: number;
+  data?: T;
+  errorCode?: string;
+  errorMessage?: string;
+  details?: unknown;
+}
+
+/**
+ * Browser-safe authenticated API helper for Provider Hub, Extensions, and Tool Registry.
+ * - Obtains a verified Firebase ID token via `auth.currentUser.getIdToken()` (or injected test token getter).
+ * - Sends `Authorization: Bearer <token>`.
+ * - Never sends unverified development bypass headers.
+ * - Never places credentials in URLs.
+ */
+export async function executeProviderHubApiRequest<T>(
+  path: string,
+  options: {
+    method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+    body?: Record<string, unknown>;
+    getAuthToken?: () => Promise<string | null>;
+    fetchImpl?: typeof fetch;
+  } = {}
+): Promise<ProviderHubApiResult<T>> {
+  const resolveToken =
+    options.getAuthToken ||
+    (async () => {
+      if (auth?.currentUser) {
+        return await auth.currentUser.getIdToken();
+      }
+      return null;
+    });
+
+  let token: string | null = null;
+  try {
+    token = await resolveToken();
+  } catch {
+    token = null;
+  }
+
+  if (!token) {
+    return {
+      ok: false,
+      status: 401,
+      errorCode: 'AUTH_SESSION_REQUIRED',
+      errorMessage:
+        'An active authenticated session is required for Provider Hub operations. Please sign in and retry.',
+    };
+  }
+
+  const effectiveFetch = options.fetchImpl || globalThis.fetch;
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${token}`,
+  };
+  if (options.body !== undefined) {
+    headers['Content-Type'] = 'application/json';
+  }
+
+  try {
+    const response = await effectiveFetch(path, {
+      method: options.method || 'GET',
+      headers,
+      body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
+    });
+
+    const json = await response.json().catch(() => null);
+    if (!response.ok || !json || json.ok === false) {
+      return {
+        ok: false,
+        status: response.status,
+        errorCode: json?.error?.code || `HTTP_${response.status}`,
+        errorMessage:
+          json?.error?.message ||
+          `Request to ${path} failed with HTTP ${response.status}.`,
+        details: json?.error?.details,
+      };
+    }
+
+    return {
+      ok: true,
+      status: response.status,
+      data: json.data as T,
+    };
+  } catch (err: any) {
+    return {
+      ok: false,
+      status: 0,
+      errorCode: 'NETWORK_REQUEST_FAILED',
+      errorMessage:
+        err?.message || `Network error while contacting ${path}. No local fallback was applied.`,
+    };
+  }
+}
+
 export const ProviderHubWorkspace: React.FC<ProviderHubWorkspaceProps> = ({
-  userUid = 'user_studio_creator',
+  userUid,
+  currentUser,
   onNotify,
+  getAuthToken,
+  fetchImpl,
 }) => {
-  const [activeTab, setActiveTab] = useState<HubWorkspaceTab>('connections');
+  const activeUserUid = currentUser?.uid || userUid || auth?.currentUser?.uid || null;
+  const [activeTab, setActiveTab] = useState<HubTabId>('connections');
+  const [isLoadingWorkspace, setIsLoadingWorkspace] = useState<boolean>(false);
+  const [isMutating, setIsMutating] = useState<boolean>(false);
+  const [apiErrorBanner, setApiErrorBanner] = useState<{
+    code: string;
+    message: string;
+  } | null>(null);
+  const [vaultDiagnostics, setVaultDiagnostics] = useState<{
+    configured: boolean;
+    sourceEnvVar: string | null;
+    errorCode: string | null;
+    message: string;
+  } | null>(null);
 
-  // Seed initial connections (Argon & Flash) in 'Not tested' capability state
-  const [connections, setConnections] = useState<ProviderConnectionRecord[]>(() => {
-    const argon = createProviderConnectionRecord({
-      ownerUid: userUid,
-      label: 'Gemini 4 Argon (High-Complexity Architecture & Director)',
-      providerBrand: 'Google Gemini',
-      protocol: 'google-gemini',
-      baseUrl: 'https://generativelanguage.googleapis.com',
-      endpointSettings: {
-        apiPath: '/v1beta/models/gemini-4-argon:generateContent',
-        thinkingLevel: 'HIGH',
-      },
-      modelId: 'gemini-4-argon',
-      authMode: 'server-env',
-      storageMode: 'server-encrypted-vault',
-      allowedTaskTypes: ['script-analysis', 'planning', 'code', 'vision', 'evaluation'],
-    });
-    const flash = createProviderConnectionRecord({
-      ownerUid: userUid,
-      label: 'Gemini 3.8 Flash (Low-Latency Routine & Tagging)',
-      providerBrand: 'Google Gemini',
-      protocol: 'google-gemini',
-      baseUrl: 'https://generativelanguage.googleapis.com',
-      endpointSettings: {
-        apiPath: '/v1beta/models/gemini-3.8-flash:generateContent',
-        thinkingLevel: 'LOW',
-      },
-      modelId: 'gemini-3.8-flash',
-      authMode: 'server-env',
-      storageMode: 'server-encrypted-vault',
-      allowedTaskTypes: ['routine-tasks', 'asset-research', 'script-analysis'],
-      fallbackConnectionId: argon.id,
-    });
-    return [argon, flash];
-  });
+  // Server-backed connections state (public views only — never holds encryptedCredential or raw key)
+  const [connections, setConnections] = useState<ProviderConnectionPublicView[]>([]);
+  const [selectedConnectionId, setSelectedConnectionId] = useState<string>('');
 
-  const [selectedConnectionId, setSelectedConnectionId] = useState<string>(
-    () => connections[0]?.id || ''
-  );
-
-  // Connection Wizard Form State
-  const [wizardLabel, setWizardLabel] = useState('OpenAI GPT-4o Production Gateway');
-  const [wizardBrand, setWizardBrand] = useState('OpenAI');
-  const [wizardProtocol, setWizardProtocol] = useState<HubProviderProtocol>(
-    'openai-chat-completions'
-  );
-  const [wizardBaseUrl, setWizardBaseUrl] = useState('https://api.openai.com');
-  const [wizardApiPath, setWizardApiPath] = useState('/v1/chat/completions');
-  const [wizardModelId, setWizardModelId] = useState('gpt-4o');
-  const [wizardAuthMode, setWizardAuthMode] = useState<HubAuthMode>('bearer');
-  const [wizardCredentialInput, setWizardCredentialInput] = useState('');
-  const [wizardStorageMode, setWizardStorageMode] = useState<SecretStorageMode>(
-    'server-encrypted-vault'
-  );
-  const [wizardTimeoutMs, setWizardTimeoutMs] = useState(15000);
-  const [wizardBudgetLimitUsd, setWizardBudgetLimitUsd] = useState(25);
-  const [wizardBudgetMode, setWizardBudgetMode] = useState<
+  // New Connection Wizard Form State
+  const [selectedPresetId, setSelectedPresetId] = useState<string>('preset-openai-chat-gpt4o');
+  const [newLabel, setNewLabel] = useState<string>('OpenAI GPT-4o Production');
+  const [newBrand, setNewBrand] = useState<string>('OpenAI');
+  const [newProtocol, setNewProtocol] = useState<HubProviderProtocol>('openai-chat-completions');
+  const [newBaseUrl, setNewBaseUrl] = useState<string>('https://api.openai.com');
+  const [newApiPath, setNewApiPath] = useState<string>('/v1/chat/completions');
+  const [newModelId, setNewModelId] = useState<string>('gpt-4o');
+  const [newAuthMode, setNewAuthMode] = useState<HubAuthMode>('bearer');
+  const [newStorageMode, setNewStorageMode] = useState<SecretStorageMode>('server-encrypted-vault');
+  const [newCredential, setNewCredential] = useState<string>('');
+  const [showCredentialInput, setShowCredentialInput] = useState<boolean>(false);
+  const [newMonthlyBudgetUsd, setNewMonthlyBudgetUsd] = useState<number>(25);
+  const [newBudgetMode, setNewBudgetMode] = useState<
     'hard-stop' | 'fallback-to-secondary' | 'warn-only'
   >('fallback-to-secondary');
-  const [wizardError, setWizardError] = useState<string | null>(null);
+  const [rotateKeyInput, setRotateKeyInput] = useState<string>('');
 
   // Probe options
-  const [probeTools, setProbeTools] = useState(true);
-  const [probeStructuredOutput, setProbeStructuredOutput] = useState(true);
-  const [probeVision, setProbeVision] = useState(false);
-  const [probeStreaming, setProbeStreaming] = useState(true);
+  const [probeTools, setProbeTools] = useState<boolean>(true);
+  const [probeStructuredOutput, setProbeStructuredOutput] = useState<boolean>(true);
+  const [probeVision, setProbeVision] = useState<boolean>(false);
+  const [probeStreaming, setProbeStreaming] = useState<boolean>(true);
   const [lastProbePreview, setLastProbePreview] = useState<{
     url: string;
     method: string;
@@ -142,1459 +221,2203 @@ export const ProviderHubWorkspace: React.FC<ProviderHubWorkspaceProps> = ({
     bodySummary: Record<string, unknown>;
   } | null>(null);
 
-  // Rotate key input
-  const [rotateKeyValue, setRotateKeyValue] = useState('');
-
-  // Task Routing Profiles State
-  const [routingProfiles, setRoutingProfiles] = useState<
-    Record<HubTaskType, TaskRoutingProfile>
-  >(() => buildDefaultRoutingProfiles(connections));
+  // Task Routing Profiles (8 task profiles)
+  const [routingProfiles, setRoutingProfiles] = useState<Record<HubTaskType, TaskRoutingProfile>>(
+    () => buildDefaultRoutingProfiles([])
+  );
 
   // Extensions Workspace State
-  const [extensions, setExtensions] = useState<ExtensionPackageRecord[]>(() => [
-    registerExtensionPackage({
-      ownerUid: userUid,
-      name: 'Sowveil Kinetic Typography Skill Pack',
-      kind: 'skill-folder',
-      sourceUrl: 'https://github.com/sowveil/kinetic-typography-skill',
-      commitOrReleasePin: 'a8f41c9e2026',
-      version: '1.2.0',
-      license: 'MIT',
-      dependencies: ['bezier-easing@2.1.0'],
-      declaredCapabilities: ['spring-stiffness-presets', 'caption-word-highlight'],
-      requestedPermissions: ['read-project', 'read-catalog', 'propose-commands'],
-      rawInstructionOrManifestContent:
-        'Provides deterministic spring easing presets and word-by-word highlight timing rules for vertical 9:16 reels.',
-      explicitApprovalGranted: true,
-    }),
-    registerExtensionPackage({
-      ownerUid: userUid,
-      name: 'External Motion LUT & Shader Repo',
-      kind: 'github-repo',
-      sourceUrl: 'https://github.com/sowveil-community/mobile-lut-pack',
-      commitOrReleasePin: 'v2.0.1-release',
-      version: '2.0.1',
-      license: 'Apache-2.0',
-      dependencies: ['gl-matrix@3.4.3'],
-      declaredCapabilities: ['color-grade-lut', 'shader-pass'],
-      requestedPermissions: ['read-project', 'propose-commands', 'write-project'],
-      rawInstructionOrManifestContent:
-        'Applies LUT color grading curves to canonical adjustment tracks.',
-      explicitApprovalGranted: false,
-    }),
-  ]);
-
-  const [extName, setExtName] = useState('');
+  const [extensions, setExtensions] = useState<ExtensionPackageRecord[]>([]);
+  const [extName, setExtName] = useState<string>('');
   const [extKind, setExtKind] = useState<ExtensionPackageKind>('github-repo');
-  const [extSourceUrl, setExtSourceUrl] = useState('https://github.com/example/motion-skill');
-  const [extCommitPin, setExtCommitPin] = useState('main-9f8e7d6c');
-  const [extLicense, setExtLicense] = useState('MIT');
-  const [extContent, setExtContent] = useState(
-    'Skill manifest: suggests pacing markers for 9:16 product reels.'
-  );
-  const [extReqWrite, setExtReqWrite] = useState(false);
-  const [extReqNetwork, setExtReqNetwork] = useState(false);
-  const [extExplicitApprove, setExtExplicitApprove] = useState(false);
-  const [extError, setExtError] = useState<string | null>(null);
+  const [extSourceUrl, setExtSourceUrl] = useState<string>('https://github.com/');
+  const [extCommitPin, setExtCommitPin] = useState<string>('v1.0.0-pinned');
+  const [extLicense, setExtLicense] = useState<string>('MIT');
+  const [extPermissions, setExtPermissions] = useState<ExtensionPermissionScope[]>([
+    'read-project',
+    'read-catalog',
+  ]);
+  const [extManifestContent, setExtManifestContent] = useState<string>('');
+  const [extExplicitApproval, setExtExplicitApproval] = useState<boolean>(false);
 
-  // Tool Registry Interactive Simulator State
-  const [selectedToolId, setSelectedToolId] = useState<string>(
-    REGISTERED_AI_TOOLS[0].id
-  );
+  // Tool Registry Interactive Runner State
+  const [selectedToolId, setSelectedToolId] = useState<string>(REGISTERED_AI_TOOLS[0].id);
   const [toolDryRun, setToolDryRun] = useState<boolean>(true);
-  const [toolInputJson, setToolInputJson] = useState<string>(
-    JSON.stringify({ projectId: 'proj_canonical_01' }, null, 2)
+  const [toolProjectId, setToolProjectId] = useState<string>('proj_canonical_demo');
+  const [toolCommandType, setToolCommandType] = useState<string>('update-text');
+  const [toolTextValue, setToolTextValue] = useState<string>('SOWVEIL 2026 LAUNCH');
+  const [toolScriptText, setToolScriptText] = useState<string>(
+    'Scene 1: Hook viewers with high-contrast kinetic typography.\nScene 2: Reveal the SaaS dashboard mockup with spring easing.\nScene 3: Close with logo reveal and audio riser.'
   );
-  const [toolAuditLog, setToolAuditLog] = useState<ToolExecutionAuditRecord[]>([]);
-  const [lastToolResponse, setLastToolResponse] = useState<Record<string, unknown> | null>(
-    null
+  const [toolCatalogQuery, setToolCatalogQuery] = useState<string>('kinetic');
+  const [toolApprovalToken, setToolApprovalToken] = useState<string>('');
+  const [toolGrantedPerms, setToolGrantedPerms] = useState<ExtensionPermissionScope[]>([
+    'read-project',
+    'read-catalog',
+    'propose-commands',
+    'write-project',
+  ]);
+  const [toolAudits, setToolAudits] = useState<ToolExecutionAuditRecord[]>([]);
+  const [lastToolResult, setLastToolResult] = useState<Record<string, unknown> | null>(null);
+
+  const apiCall = useCallback(
+    async <T,>(
+      path: string,
+      options: {
+        method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+        body?: Record<string, unknown>;
+      } = {}
+    ): Promise<ProviderHubApiResult<T>> => {
+      return executeProviderHubApiRequest<T>(path, {
+        ...options,
+        getAuthToken,
+        fetchImpl,
+      });
+    },
+    [getAuthToken, fetchImpl]
   );
+
+  const loadProviderHubData = useCallback(async () => {
+    if (!activeUserUid) {
+      setConnections([]);
+      setExtensions([]);
+      setToolAudits([]);
+      return;
+    }
+
+    setIsLoadingWorkspace(true);
+    setApiErrorBanner(null);
+
+    try {
+      const [connRes, routingRes, extRes, toolsRes] = await Promise.all([
+        apiCall<{
+          items: ProviderConnectionPublicView[];
+          total: number;
+          vaultStatus?: {
+            configured: boolean;
+            sourceEnvVar: string | null;
+            errorCode: string | null;
+            message: string;
+          };
+        }>('/api/v1/provider-hub/connections'),
+        apiCall<{
+          profiles: Record<HubTaskType, TaskRoutingProfile>;
+        }>('/api/v1/provider-hub/routing'),
+        apiCall<{
+          items: ExtensionPackageRecord[];
+        }>('/api/v1/extensions'),
+        apiCall<{
+          auditRecords: ToolExecutionAuditRecord[];
+        }>('/api/v1/tools/registry'),
+      ]);
+
+      if (!connRes.ok) {
+        setApiErrorBanner({
+          code: connRes.errorCode || 'LOAD_CONNECTIONS_FAILED',
+          message: connRes.errorMessage || 'Failed to load Provider Hub connections.',
+        });
+        return;
+      }
+
+      const loadedConnections = connRes.data?.items || [];
+      setConnections(loadedConnections);
+      if (connRes.data?.vaultStatus) {
+        setVaultDiagnostics(connRes.data.vaultStatus);
+      }
+      setSelectedConnectionId((prev) =>
+        prev && loadedConnections.some((c) => c.id === prev)
+          ? prev
+          : loadedConnections[0]?.id || ''
+      );
+
+      if (routingRes.ok && routingRes.data?.profiles) {
+        setRoutingProfiles(routingRes.data.profiles);
+      }
+      if (extRes.ok && extRes.data?.items) {
+        setExtensions(extRes.data.items);
+      }
+      if (toolsRes.ok && toolsRes.data?.auditRecords) {
+        setToolAudits(toolsRes.data.auditRecords);
+      }
+    } finally {
+      setIsLoadingWorkspace(false);
+    }
+  }, [activeUserUid, apiCall]);
+
+  useEffect(() => {
+    void loadProviderHubData();
+  }, [loadProviderHubData]);
 
   const selectedConnection = useMemo(
     () => connections.find((c) => c.id === selectedConnectionId) || connections[0] || null,
     [connections, selectedConnectionId]
   );
 
-  const connectionsById = useMemo(
+  const connectionsMap = useMemo(
     () => new Map(connections.map((c) => [c.id, c])),
     [connections]
   );
 
-  const liveSsrfCheck = useMemo(
-    () => validateCustomEndpointSsrf(wizardBaseUrl),
-    [wizardBaseUrl]
+  const ssrfLiveCheck = useMemo(
+    () => validateCustomEndpointSsrf(newBaseUrl),
+    [newBaseUrl]
   );
 
-  const applyCatalogPresetToWizard = (presetId: string) => {
-    const preset = PREPOPULATED_MODEL_CATALOG.find((p) => p.presetId === presetId);
-    if (!preset) return;
-    setWizardLabel(preset.label);
-    setWizardBrand(preset.providerBrand);
-    setWizardProtocol(preset.protocol);
-    setWizardBaseUrl(preset.defaultBaseUrl);
-    setWizardApiPath(preset.defaultApiPath);
-    setWizardModelId(preset.modelId);
-    setWizardAuthMode(preset.recommendedAuthMode);
-    setWizardError(null);
+  const handleApplyCatalogPreset = (preset: PrepopulatedModelCatalogEntry) => {
+    setSelectedPresetId(preset.presetId);
+    setNewLabel(preset.label);
+    setNewBrand(preset.providerBrand);
+    setNewProtocol(preset.protocol);
+    setNewBaseUrl(preset.defaultBaseUrl);
+    setNewApiPath(preset.defaultApiPath);
+    setNewModelId(preset.modelId);
+    setNewAuthMode(preset.recommendedAuthMode);
   };
 
-  const handleCreateConnection = (e: React.FormEvent) => {
+  const handleCreateConnection = async (e: React.FormEvent) => {
     e.preventDefault();
-    setWizardError(null);
+    if (!ssrfLiveCheck.allowed) {
+      onNotify(`SSRF Guard blocked URL: ${ssrfLiveCheck.reason}`, 'error');
+      return;
+    }
 
+    setIsMutating(true);
+    setApiErrorBanner(null);
     try {
-      const created = createProviderConnectionRecord({
-        ownerUid: userUid,
-        label: wizardLabel,
-        providerBrand: wizardBrand,
-        protocol: wizardProtocol,
-        baseUrl: wizardBaseUrl,
-        endpointSettings: { apiPath: wizardApiPath },
-        modelId: wizardModelId,
-        authMode: wizardProtocol === 'google-gemini' ? 'server-env' : wizardAuthMode,
-        credential: wizardProtocol === 'google-gemini' ? undefined : wizardCredentialInput,
-        storageMode: wizardStorageMode,
-        timeoutMs: wizardTimeoutMs,
-        budgetPolicy: {
-          mode: wizardBudgetMode,
-          monthlyLimitUsd: wizardBudgetLimitUsd,
-          spentCurrentMonthUsd: 0,
-          maxPerRequestUsd: 0.5,
-          rateLimitRpm: 60,
-        },
-      });
+      const res = await apiCall<{ connection: ProviderConnectionPublicView }>(
+        '/api/v1/provider-hub/connections',
+        {
+          method: 'POST',
+          body: {
+            label: newLabel,
+            providerBrand: newBrand,
+            protocol: newProtocol,
+            baseUrl: newBaseUrl,
+            endpointSettings: {
+              apiPath: newApiPath,
+            },
+            modelId: newModelId,
+            authMode: newAuthMode,
+            credential: newCredential,
+            storageMode: newStorageMode,
+            budgetPolicy: {
+              mode: newBudgetMode,
+              monthlyLimitUsd: newMonthlyBudgetUsd,
+              spentCurrentMonthUsd: 0,
+              maxPerRequestUsd: 0.5,
+              rateLimitRpm: 60,
+            },
+          },
+        }
+      );
+
+      if (!res.ok || !res.data?.connection) {
+        const msg =
+          res.errorMessage ||
+          'Failed to save provider connection. Unsaved form input was preserved.';
+        setApiErrorBanner({
+          code: res.errorCode || 'CONNECTION_CREATE_FAILED',
+          message: msg,
+        });
+        onNotify(msg, 'error');
+        return;
+      }
+
+      const created = res.data.connection;
       setConnections((prev) => [created, ...prev]);
       setSelectedConnectionId(created.id);
-      setWizardCredentialInput('');
-      onNotify?.(
-        `Saved provider connection "${created.label}" (${created.maskedCredential}). Capabilities set to Not tested until probed.`,
+      setNewCredential('');
+      onNotify(
+        `Saved provider connection "${created.label}" (${created.protocol}). Capabilities initialized as Not tested until probed.`,
         'success'
       );
-    } catch (err: any) {
-      const msg = err?.message || 'Failed to create provider connection.';
-      setWizardError(msg);
-      onNotify?.(msg, 'error');
+    } finally {
+      setIsMutating(false);
     }
   };
 
-  const handleRunProbe = (conn: ProviderConnectionRecord) => {
-    const result = probeProviderConnection(conn, {
-      probeTools,
-      probeStructuredOutput,
-      probeVision,
-      probeStreaming,
-    });
-    setConnections((prev) =>
-      prev.map((c) => (c.id === conn.id ? result.updatedConnection : c))
-    );
-    setLastProbePreview(result.formattedProbeRequestPreview);
-    if (result.probePassed) {
-      onNotify?.(
-        `Connection "${conn.label}" verified (${result.verifiedCapabilities.join(', ')}).`,
-        'success'
+  const handleRunProbe = async (
+    simulateFailureCode?: '401_UNAUTHORIZED' | '429_QUOTA_EXCEEDED'
+  ) => {
+    if (!selectedConnection) return;
+
+    setIsMutating(true);
+    setApiErrorBanner(null);
+    try {
+      const res = await apiCall<{
+        connection: ProviderConnectionPublicView;
+        probePassed: boolean;
+        verifiedCapabilities: ModelCapabilityKey[];
+        formattedProbeRequestPreview: {
+          url: string;
+          method: string;
+          redactedHeaders: Record<string, string>;
+          bodySummary: Record<string, unknown>;
+        } | null;
+        sanitizedError: ProviderConnectionPublicView['lastSanitizedError'];
+      }>(`/api/v1/provider-hub/connections/${encodeURIComponent(selectedConnection.id)}/test`, {
+        method: 'POST',
+        body: {
+          probeTools,
+          probeStructuredOutput,
+          probeVision,
+          probeStreaming,
+          simulateFailureCode,
+        },
+      });
+
+      if (!res.ok || !res.data?.connection) {
+        const msg = res.errorMessage || 'Connection probe request failed.';
+        setApiErrorBanner({
+          code: res.errorCode || 'PROBE_REQUEST_FAILED',
+          message: msg,
+        });
+        onNotify(msg, 'error');
+        return;
+      }
+
+      const { connection: updatedConn, probePassed, verifiedCapabilities, formattedProbeRequestPreview, sanitizedError } =
+        res.data;
+      setConnections((prev) =>
+        prev.map((c) => (c.id === updatedConn.id ? updatedConn : c))
       );
-    } else {
-      onNotify?.(
-        `Probe failed for "${conn.label}": ${result.sanitizedError?.code} — ${result.sanitizedError?.message}`,
-        'error'
-      );
+      setLastProbePreview(formattedProbeRequestPreview || null);
+
+      if (probePassed) {
+        onNotify(
+          `Verified ${verifiedCapabilities.length} capability(s) on "${updatedConn.label}": ${verifiedCapabilities.join(', ')}`,
+          'success'
+        );
+      } else {
+        onNotify(
+          `Probe failed (${sanitizedError?.code}): ${sanitizedError?.message}`,
+          'error'
+        );
+      }
+    } finally {
+      setIsMutating(false);
     }
   };
 
-  const handleCapabilityOverride = (
-    conn: ProviderConnectionRecord,
+  const handleCapabilityOverride = async (
     cap: ModelCapabilityKey,
     nextState: 'User-asserted' | 'Unsupported' | 'Not tested'
   ) => {
-    const updated = overrideConnectionCapabilityState(
-      conn,
-      cap,
-      nextState,
-      'Manual operator override in Capability Registry'
-    );
-    setConnections((prev) => prev.map((c) => (c.id === conn.id ? updated : c)));
-    onNotify?.(
-      `Set capability "${cap}" on "${conn.label}" to ${nextState}.`,
-      nextState === 'User-asserted' ? 'warning' : 'info'
-    );
+    if (!selectedConnection) return;
+
+    setIsMutating(true);
+    setApiErrorBanner(null);
+    try {
+      const res = await apiCall<{ connection: ProviderConnectionPublicView }>(
+        `/api/v1/provider-hub/connections/${encodeURIComponent(selectedConnection.id)}/capabilities`,
+        {
+          method: 'PATCH',
+          body: {
+            capability: cap,
+            state: nextState,
+            reason: 'Manual capability matrix adjustment in Provider Hub',
+          },
+        }
+      );
+
+      if (!res.ok || !res.data?.connection) {
+        const msg = res.errorMessage || `Failed to update capability "${cap}".`;
+        setApiErrorBanner({
+          code: res.errorCode || 'CAPABILITY_UPDATE_FAILED',
+          message: msg,
+        });
+        onNotify(msg, 'error');
+        return;
+      }
+
+      const updated = res.data.connection;
+      setConnections((prev) =>
+        prev.map((c) => (c.id === updated.id ? updated : c))
+      );
+      onNotify(
+        nextState === 'User-asserted'
+          ? `Marked "${cap}" as User-asserted (unverified override warning active).`
+          : `Set "${cap}" to ${nextState}.`,
+        nextState === 'User-asserted' ? 'warning' : 'info'
+      );
+    } finally {
+      setIsMutating(false);
+    }
   };
 
-  const handleRotateCredential = (conn: ProviderConnectionRecord) => {
-    if (!rotateKeyValue.trim()) {
-      onNotify?.('Enter a new credential value before rotating.', 'warning');
+  const handleRotateCredential = async () => {
+    if (!selectedConnection) return;
+    if (!rotateKeyInput.trim()) {
+      onNotify('Enter a new API credential before rotating.', 'warning');
       return;
     }
+
+    setIsMutating(true);
+    setApiErrorBanner(null);
     try {
-      const updated = rotateConnectionCredential(conn, rotateKeyValue);
-      setConnections((prev) => prev.map((c) => (c.id === conn.id ? updated : c)));
-      setRotateKeyValue('');
-      onNotify?.(
-        `Rotated credential for "${conn.label}" to key version v${updated.keyVersion} (${updated.maskedCredential}).`,
+      const res = await apiCall<{ connection: ProviderConnectionPublicView }>(
+        `/api/v1/provider-hub/connections/${encodeURIComponent(selectedConnection.id)}/rotate-key`,
+        {
+          method: 'POST',
+          body: {
+            credential: rotateKeyInput,
+          },
+        }
+      );
+
+      if (!res.ok || !res.data?.connection) {
+        const msg =
+          res.errorMessage || 'Failed to rotate API credential. Input was preserved.';
+        setApiErrorBanner({
+          code: res.errorCode || 'CREDENTIAL_ROTATION_FAILED',
+          message: msg,
+        });
+        onNotify(msg, 'error');
+        return;
+      }
+
+      const updated = res.data.connection;
+      setConnections((prev) =>
+        prev.map((c) => (c.id === updated.id ? updated : c))
+      );
+      setRotateKeyInput('');
+      onNotify(
+        `Rotated credential for "${updated.label}" to key version v${updated.keyVersion} (${updated.maskedCredential}).`,
         'success'
       );
-    } catch (err: any) {
-      onNotify?.(err?.message || 'Rotation failed.', 'error');
+    } finally {
+      setIsMutating(false);
     }
   };
 
-  const handleRevokeCredential = (conn: ProviderConnectionRecord) => {
-    const updated = revokeConnectionCredential(conn);
-    setConnections((prev) => prev.map((c) => (c.id === conn.id ? updated : c)));
-    onNotify?.(`Revoked credential for "${conn.label}".`, 'warning');
-  };
+  const handleRevokeCredential = async () => {
+    if (!selectedConnection) return;
 
-  const handleDeleteConnection = (connId: string) => {
-    setConnections((prev) => prev.filter((c) => c.id !== connId));
-    onNotify?.('Deleted provider connection from vault.', 'info');
-  };
-
-  const handleRegisterExtension = (e: React.FormEvent) => {
-    e.preventDefault();
-    setExtError(null);
-    const reqPerms: ExtensionPermissionScope[] = [
-      'read-project',
-      'read-catalog',
-      'propose-commands',
-    ];
-    if (extReqWrite) reqPerms.push('write-project');
-    if (extReqNetwork) reqPerms.push('network-egress');
-
+    setIsMutating(true);
+    setApiErrorBanner(null);
     try {
-      const created = registerExtensionPackage({
-        ownerUid: userUid,
-        name: extName || 'Custom Studio Skill Package',
-        kind: extKind,
-        sourceUrl: extSourceUrl,
-        commitOrReleasePin: extCommitPin,
-        version: '1.0.0',
-        license: extLicense,
-        dependencies: ['sowveil-canonical-sdk@2.0.0'],
-        declaredCapabilities: ['custom-skill-extension'],
-        requestedPermissions: reqPerms,
-        rawInstructionOrManifestContent: extContent,
-        explicitApprovalGranted: extExplicitApprove,
-      });
-      setExtensions((prev) => [created, ...prev]);
-      setExtName('');
-      onNotify?.(
-        `Registered extension "${created.name}" (state: ${created.installState}, checksum: ${created.checksumSha256.slice(0, 10)}…).`,
-        created.installState === 'quarantined' ? 'error' : 'success'
+      const res = await apiCall<{ connection: ProviderConnectionPublicView }>(
+        `/api/v1/provider-hub/connections/${encodeURIComponent(selectedConnection.id)}/revoke-key`,
+        {
+          method: 'POST',
+        }
       );
-    } catch (err: any) {
-      setExtError(err?.message || 'Extension registration failed.');
-      onNotify?.(err?.message || 'Extension registration failed.', 'error');
+
+      if (!res.ok || !res.data?.connection) {
+        const msg = res.errorMessage || 'Failed to revoke credential.';
+        setApiErrorBanner({
+          code: res.errorCode || 'CREDENTIAL_REVOKE_FAILED',
+          message: msg,
+        });
+        onNotify(msg, 'error');
+        return;
+      }
+
+      const updated = res.data.connection;
+      setConnections((prev) =>
+        prev.map((c) => (c.id === updated.id ? updated : c))
+      );
+      onNotify(
+        `Revoked credential for "${updated.label}". Vault ciphertext wiped.`,
+        'warning'
+      );
+    } finally {
+      setIsMutating(false);
     }
   };
 
-  const handleInvokeTool = (overrideToolId?: string) => {
-    let parsedInput: Record<string, unknown> = {};
+  const handleDeleteConnection = async (id: string) => {
+    setIsMutating(true);
+    setApiErrorBanner(null);
     try {
-      parsedInput = JSON.parse(toolInputJson);
-    } catch {
-      onNotify?.('Invalid JSON in tool input payload.', 'error');
+      const res = await apiCall<{ deletedId: string }>(
+        `/api/v1/provider-hub/connections/${encodeURIComponent(id)}`,
+        {
+          method: 'DELETE',
+        }
+      );
+
+      if (!res.ok) {
+        const msg = res.errorMessage || 'Failed to delete provider connection.';
+        setApiErrorBanner({
+          code: res.errorCode || 'CONNECTION_DELETE_FAILED',
+          message: msg,
+        });
+        onNotify(msg, 'error');
+        return;
+      }
+
+      setConnections((prev) => {
+        const remaining = prev.filter((c) => c.id !== id);
+        if (selectedConnectionId === id) {
+          setSelectedConnectionId(remaining[0]?.id || '');
+        }
+        return remaining;
+      });
+      onNotify('Deleted provider connection and purged vault record.', 'info');
+    } finally {
+      setIsMutating(false);
+    }
+  };
+
+  const handleUpdateRoutingProfile = async (
+    taskType: HubTaskType,
+    patch: Partial<
+      Pick<
+        TaskRoutingProfile,
+        'primaryConnectionId' | 'fallbackConnectionId' | 'maxBudgetPerRunUsd' | 'temperature'
+      >
+    >
+  ) => {
+    setIsMutating(true);
+    setApiErrorBanner(null);
+    try {
+      const res = await apiCall<{
+        profile: TaskRoutingProfile;
+      }>(`/api/v1/provider-hub/routing/${encodeURIComponent(taskType)}`, {
+        method: 'PUT',
+        body: patch as Record<string, unknown>,
+      });
+
+      if (!res.ok || !res.data?.profile) {
+        const msg = res.errorMessage || `Failed to update routing profile for ${taskType}.`;
+        setApiErrorBanner({
+          code: res.errorCode || 'ROUTING_UPDATE_FAILED',
+          message: msg,
+        });
+        onNotify(msg, 'error');
+        return;
+      }
+
+      const updatedProfile = res.data.profile;
+      setRoutingProfiles((prev) => ({
+        ...prev,
+        [taskType]: updatedProfile,
+      }));
+      onNotify(`Updated task routing profile for "${updatedProfile.label}".`, 'success');
+    } finally {
+      setIsMutating(false);
+    }
+  };
+
+  const handleRegisterExtension = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!extName.trim() || !extSourceUrl.trim()) {
+      onNotify('Extension name and source URL are required.', 'warning');
       return;
     }
 
-    const targetId = overrideToolId || selectedToolId;
-    const res = invokeRegisteredTool({
-      ownerUid: userUid,
-      toolId: targetId,
-      input: parsedInput,
-      dryRun: toolDryRun,
-    });
-    setToolAuditLog((prev) => [res.auditRecord, ...prev]);
-    setLastToolResponse({
-      allowed: res.allowed,
-      status: res.status,
-      output: res.output,
-      error: res.error,
-      auditRecord: res.auditRecord,
-    });
-    onNotify?.(
-      res.allowed
-        ? `Tool "${targetId}" executed (${toolDryRun ? 'Dry-Run' : 'Live'}).`
-        : `Tool "${targetId}" blocked by policy: ${res.error?.code}`,
-      res.allowed ? 'success' : 'error'
-    );
+    setIsMutating(true);
+    setApiErrorBanner(null);
+    try {
+      const res = await apiCall<{
+        extension: ExtensionPackageRecord;
+      }>('/api/v1/extensions', {
+        method: 'POST',
+        body: {
+          name: extName,
+          kind: extKind,
+          sourceUrl: extSourceUrl,
+          commitOrReleasePin: extCommitPin,
+          version: '1.0.0',
+          license: extLicense,
+          requestedPermissions: extPermissions,
+          rawInstructionOrManifestContent: extManifestContent,
+          explicitApprovalGranted: extExplicitApproval,
+        },
+      });
+
+      if (!res.ok || !res.data?.extension) {
+        const msg =
+          res.errorMessage ||
+          'Extension registration failed. Unsaved manifest input was preserved.';
+        setApiErrorBanner({
+          code: res.errorCode || 'EXTENSION_REGISTER_FAILED',
+          message: msg,
+        });
+        onNotify(msg, 'error');
+        return;
+      }
+
+      const registered = res.data.extension;
+      setExtensions((prev) => [registered, ...prev]);
+      setExtName('');
+      setExtManifestContent('');
+      onNotify(
+        registered.installState === 'quarantined'
+          ? `Extension "${registered.name}" was quarantined by the security sandbox.`
+          : `Registered extension "${registered.name}" (${registered.installState}).`,
+        registered.installState === 'quarantined' ? 'error' : 'success'
+      );
+    } finally {
+      setIsMutating(false);
+    }
   };
 
-  return (
-    <div className="max-w-[1440px] mx-auto px-4 sm:px-6 py-6 space-y-6">
-      {/* Workspace Header */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-[#2A231E] pb-4">
-        <div>
-          <div className="flex items-center gap-2 text-xs font-mono tabular-nums text-[#B8AAA0]">
-            <span>AI Provider Hub</span>
-            <span aria-hidden="true">·</span>
-            <span>AES-256-GCM Scoped Vault</span>
-            <span aria-hidden="true">·</span>
-            <span>SSRF & Sandbox Policy Enforced</span>
-          </div>
-          <h1 className="text-xl sm:text-2xl font-bold text-[#F3EEE8] mt-1">
-            Model Providers, Capability Registry, Extensions & Tool Governance
-          </h1>
-        </div>
+  const handleToggleExtensionState = async (ext: ExtensionPackageRecord) => {
+    const nextState =
+      ext.installState === 'installed-enabled'
+        ? 'installed-disabled'
+        : 'installed-enabled';
 
-        {/* Segmented Workspace Navigation */}
-        <div
-          role="tablist"
-          aria-label="Provider Hub Sections"
-          className="flex flex-wrap items-center gap-1 p-1 rounded-xl bg-[#141210] border border-[#2A231E]"
-        >
-          {(
-            [
-              { id: 'connections', label: 'Connections & Vault', icon: KeyRound },
-              { id: 'capabilities', label: 'Capability Registry (14)', icon: Cpu },
-              { id: 'routing', label: 'Task Routing (8)', icon: RouteIcon },
-              { id: 'extensions', label: `Extensions (${extensions.length})`, icon: GitBranch },
-              { id: 'tool-registry', label: `Tool Registry (${REGISTERED_AI_TOOLS.length})`, icon: Wrench },
-            ] as const
-          ).map((tab) => {
+    setIsMutating(true);
+    setApiErrorBanner(null);
+    try {
+      const res = await apiCall<{ extension: ExtensionPackageRecord }>(
+        `/api/v1/extensions/${encodeURIComponent(ext.id)}`,
+        {
+          method: 'PATCH',
+          body: {
+            installState: nextState,
+          },
+        }
+      );
+
+      if (!res.ok || !res.data?.extension) {
+        const msg = res.errorMessage || `Failed to update extension "${ext.name}".`;
+        setApiErrorBanner({
+          code: res.errorCode || 'EXTENSION_UPDATE_FAILED',
+          message: msg,
+        });
+        onNotify(msg, 'error');
+        return;
+      }
+
+      const updated = res.data.extension;
+      setExtensions((prev) => prev.map((item) => (item.id === updated.id ? updated : item)));
+      onNotify(`Extension "${updated.name}" is now ${updated.installState}.`, 'info');
+    } finally {
+      setIsMutating(false);
+    }
+  };
+
+  const handleApproveExtensionPermissions = async (ext: ExtensionPackageRecord) => {
+    setIsMutating(true);
+    setApiErrorBanner(null);
+    try {
+      const res = await apiCall<{ extension: ExtensionPackageRecord }>(
+        `/api/v1/extensions/${encodeURIComponent(ext.id)}`,
+        {
+          method: 'PATCH',
+          body: {
+            explicitApprovalGranted: true,
+            installState: 'installed-enabled',
+          },
+        }
+      );
+
+      if (!res.ok || !res.data?.extension) {
+        const msg = res.errorMessage || `Failed to approve permissions for "${ext.name}".`;
+        setApiErrorBanner({
+          code: res.errorCode || 'EXTENSION_APPROVAL_FAILED',
+          message: msg,
+        });
+        onNotify(msg, 'error');
+        return;
+      }
+
+      const updated = res.data.extension;
+      setExtensions((prev) => prev.map((item) => (item.id === updated.id ? updated : item)));
+      onNotify(
+        `Approved permissions for "${updated.name}" (state: ${updated.installState}).`,
+        'success'
+      );
+    } finally {
+      setIsMutating(false);
+    }
+  };
+
+  const handleSimulateExtensionUpdate = async (ext: ExtensionPackageRecord) => {
+    const nextPatchVersion = `${ext.version}.1`;
+    const nextPin = `commit-${Date.now().toString(16).slice(-6)}`;
+    const nextPerms: ExtensionPermissionScope[] = ext.requestedPermissions.includes(
+      'write-project'
+    )
+      ? ext.requestedPermissions
+      : [...ext.requestedPermissions, 'write-project'];
+
+    setIsMutating(true);
+    setApiErrorBanner(null);
+    try {
+      const res = await apiCall<{ extension: ExtensionPackageRecord }>(
+        `/api/v1/extensions/${encodeURIComponent(ext.id)}`,
+        {
+          method: 'PATCH',
+          body: {
+            version: nextPatchVersion,
+            commitOrReleasePin: nextPin,
+            requestedPermissions: nextPerms,
+            explicitApprovalGranted: false,
+          },
+        }
+      );
+
+      if (!res.ok || !res.data?.extension) {
+        const msg = res.errorMessage || `Failed to update "${ext.name}".`;
+        setApiErrorBanner({
+          code: res.errorCode || 'EXTENSION_UPDATE_FAILED',
+          message: msg,
+        });
+        onNotify(msg, 'error');
+        return;
+      }
+
+      const updated = res.data.extension;
+      setExtensions((prev) => prev.map((item) => (item.id === updated.id ? updated : item)));
+      onNotify(
+        `Updated "${updated.name}" to v${updated.version}. Permission diff requires explicit approval before re-enabling.`,
+        'warning'
+      );
+    } finally {
+      setIsMutating(false);
+    }
+  };
+
+  const handleRollbackExtension = async (ext: ExtensionPackageRecord) => {
+    setIsMutating(true);
+    setApiErrorBanner(null);
+    try {
+      const res = await apiCall<{ extension: ExtensionPackageRecord }>(
+        `/api/v1/extensions/${encodeURIComponent(ext.id)}/rollback`,
+        {
+          method: 'POST',
+          body: {},
+        }
+      );
+
+      if (!res.ok || !res.data?.extension) {
+        const msg = res.errorMessage || `Rollback failed for "${ext.name}".`;
+        setApiErrorBanner({
+          code: res.errorCode || 'EXTENSION_ROLLBACK_FAILED',
+          message: msg,
+        });
+        onNotify(msg, 'error');
+        return;
+      }
+
+      const rolledBack = res.data.extension;
+      setExtensions((prev) =>
+        prev.map((item) => (item.id === rolledBack.id ? rolledBack : item))
+      );
+      onNotify(
+        `Rolled back "${rolledBack.name}" to v${rolledBack.version} (${rolledBack.commitOrReleasePin}).`,
+        'success'
+      );
+    } finally {
+      setIsMutating(false);
+    }
+  };
+
+  const handleUninstallExtension = async (extId: string) => {
+    setIsMutating(true);
+    setApiErrorBanner(null);
+    try {
+      const res = await apiCall<{ uninstalledId: string }>(
+        `/api/v1/extensions/${encodeURIComponent(extId)}`,
+        {
+          method: 'DELETE',
+        }
+      );
+
+      if (!res.ok) {
+        const msg = res.errorMessage || 'Failed to uninstall extension.';
+        setApiErrorBanner({
+          code: res.errorCode || 'EXTENSION_DELETE_FAILED',
+          message: msg,
+        });
+        onNotify(msg, 'error');
+        return;
+      }
+
+      setExtensions((prev) => prev.filter((item) => item.id !== extId));
+      onNotify('Uninstalled extension package.', 'info');
+    } finally {
+      setIsMutating(false);
+    }
+  };
+
+  const handleInvokeTool = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const inputObj: Record<string, unknown> = {};
+    if (selectedToolId === 'project.inspect_state') {
+      inputObj.projectId = toolProjectId;
+    } else if (selectedToolId === 'script.analyze_coverage') {
+      inputObj.scriptText = toolScriptText;
+    } else if (selectedToolId === 'catalog.search_templates') {
+      inputObj.query = toolCatalogQuery;
+    } else if (selectedToolId === 'timeline.execute_command') {
+      inputObj.projectId = toolProjectId;
+      inputObj.commandType = toolCommandType;
+      inputObj.textValue = toolTextValue;
+    } else if (selectedToolId === 'timeline.create_checkpoint') {
+      inputObj.projectId = toolProjectId;
+      inputObj.label = toolTextValue || 'Pre-AI Checkpoint';
+    } else if (selectedToolId === 'project.delete_track_or_clip') {
+      inputObj.projectId = toolProjectId;
+      inputObj.targetClipId = 'clip_title_main';
+      inputObj.userApprovalToken = toolApprovalToken;
+    }
+
+    setIsMutating(true);
+    setApiErrorBanner(null);
+    try {
+      const res = await apiCall<{
+        output: Record<string, unknown>;
+        auditRecord: ToolExecutionAuditRecord;
+      }>('/api/v1/tools/invoke', {
+        method: 'POST',
+        body: {
+          toolId: selectedToolId,
+          input: inputObj,
+          dryRun: toolDryRun,
+          grantedPermissions: toolGrantedPerms,
+        },
+      });
+
+      if (!res.ok) {
+        const auditDetail = (res.details as { auditRecord?: ToolExecutionAuditRecord } | undefined)
+          ?.auditRecord;
+        if (auditDetail) {
+          setToolAudits((prev) => [auditDetail, ...prev]);
+        }
+        setLastToolResult({
+          error: {
+            code: res.errorCode || 'TOOL_EXECUTION_REJECTED',
+            message: res.errorMessage || 'Tool execution rejected by server policy.',
+          },
+        });
+        onNotify(`Tool blocked (${res.errorCode}): ${res.errorMessage}`, 'error');
+        return;
+      }
+
+      if (res.data?.auditRecord) {
+        setToolAudits((prev) => [res.data!.auditRecord, ...prev]);
+      }
+      setLastToolResult(res.data?.output || {});
+      onNotify(
+        `Tool "${selectedToolId}" executed (${toolDryRun ? 'Dry-Run' : 'Live'}).`,
+        'success'
+      );
+    } finally {
+      setIsMutating(false);
+    }
+  };
+
+  const renderCapabilityBadge = (state: CapabilityVerificationState) => {
+    switch (state) {
+      case 'Verified':
+        return (
+          <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 rounded">
+            <CheckCircle2 className="w-3 h-3" /> Verified
+          </span>
+        );
+      case 'User-asserted':
+        return (
+          <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider bg-amber-500/15 text-amber-300 border border-amber-500/30 rounded">
+            <AlertTriangle className="w-3 h-3" /> User-asserted
+          </span>
+        );
+      case 'Unsupported':
+        return (
+          <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider bg-rose-500/15 text-rose-300 border border-rose-500/30 rounded">
+            <XCircle className="w-3 h-3" /> Unsupported
+          </span>
+        );
+      default:
+        return (
+          <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider bg-zinc-800 text-zinc-400 border border-zinc-700 rounded">
+            Not tested
+          </span>
+        );
+    }
+  };
+
+  if (!activeUserUid) {
+    return (
+      <div className="min-h-screen bg-[#111214] text-zinc-100 flex flex-col items-center justify-center p-6">
+        <div className="max-w-md w-full bg-[#18191C] border border-zinc-800 rounded-xl p-6 text-center space-y-4">
+          <Lock className="w-10 h-10 text-[#F06424] mx-auto" />
+          <h1 className="text-lg font-bold text-white">
+            Sign In Required for Provider Hub & Vault
+          </h1>
+          <p className="text-xs text-zinc-400 leading-relaxed">
+            Provider connections, encrypted server vault credentials, routing profiles, and
+            sandboxed extensions are strictly isolated per authenticated user workspace.
+          </p>
+          <div className="flex items-center justify-center gap-3 pt-2">
+            <Link
+              to="/signin"
+              className="px-4 py-2 rounded-lg bg-[#F06424] hover:bg-[#ff7638] text-xs font-bold text-black transition-colors"
+            >
+              Sign In to Continue
+            </Link>
+            <Link
+              to="/app"
+              className="px-4 py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-xs font-semibold text-zinc-200 transition-colors"
+            >
+              Back to Studio
+            </Link>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-[#111214] text-zinc-100 flex flex-col">
+      {/* Top Header */}
+      <header className="border-b border-zinc-800/80 bg-[#16171A] px-4 py-3">
+        <div className="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <Link
+              to="/app"
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded bg-zinc-800/80 hover:bg-zinc-700 text-xs text-zinc-200 border border-zinc-700 transition-colors"
+            >
+              <ArrowLeft className="w-3.5 h-3.5" />
+              Studio
+            </Link>
+            <div>
+              <div className="flex items-center gap-2">
+                <Cpu className="w-4 h-4 text-[#F06424]" />
+                <h1 className="text-sm sm:text-base font-bold tracking-tight text-white">
+                  Provider Hub, Secret Vault & Extensions Sandbox
+                </h1>
+                <span className="px-2 py-0.5 text-[10px] font-mono uppercase bg-[#F06424]/15 text-[#F06424] border border-[#F06424]/30 rounded">
+                  AES-256-GCM AAD Vault
+                </span>
+              </div>
+              <p className="text-[11px] text-zinc-400">
+                Distinct protocol adapters · Live capability probing · SSRF & redirect guard ·
+                Untrusted skill sandbox · Typed tool registry
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2 text-xs">
+            <button
+              type="button"
+              onClick={() => void loadProviderHubData()}
+              disabled={isLoadingWorkspace || isMutating}
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200 border border-zinc-700 disabled:opacity-50"
+            >
+              {isLoadingWorkspace ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-[#F06424]" />
+              ) : (
+                <RefreshCw className="w-3.5 h-3.5 text-zinc-400" />
+              )}
+              Sync Server State
+            </button>
+            <span className="px-2.5 py-1 rounded bg-zinc-900 border border-zinc-800 text-zinc-300 font-mono text-[11px]">
+              Workspace: ws_{activeUserUid.slice(0, 10)}
+            </span>
+          </div>
+        </div>
+      </header>
+
+      {/* Vault Status & Truthful Error Banners */}
+      <div className="max-w-7xl w-full mx-auto px-4 pt-3 space-y-2">
+        {vaultDiagnostics && !vaultDiagnostics.configured && (
+          <div
+            role="alert"
+            className="p-3 rounded-lg bg-amber-950/40 border border-amber-500/40 text-xs text-amber-200 flex items-start gap-2.5"
+          >
+            <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+            <div>
+              <span className="font-semibold">
+                Server Vault Master Key Not Configured ({vaultDiagnostics.errorCode}):
+              </span>{' '}
+              {vaultDiagnostics.message} Server-env connections remain usable, but storing or
+              decrypting custom encrypted credentials will fail closed until{' '}
+              <code className="font-mono text-amber-100">SOWVEIL_MASTER_VAULT_KEY</code> is set.
+            </div>
+          </div>
+        )}
+
+        {apiErrorBanner && (
+          <div
+            role="alert"
+            data-testid="provider-hub-api-error"
+            className="p-3 rounded-lg bg-rose-950/40 border border-rose-500/40 text-xs text-rose-200 flex items-start justify-between gap-3"
+          >
+            <div className="flex items-start gap-2">
+              <ShieldAlert className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+              <div>
+                <span className="font-mono font-bold">[{apiErrorBanner.code}]</span>{' '}
+                {apiErrorBanner.message}
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => setApiErrorBanner(null)}
+              className="text-[11px] text-rose-300 hover:text-white underline shrink-0"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* Sub-navigation Tabs */}
+      <div className="border-b border-zinc-800 bg-[#141518] px-4 mt-2">
+        <div className="max-w-7xl mx-auto flex items-center gap-1 overflow-x-auto py-2 no-scrollbar">
+          {[
+            { id: 'connections', label: '1. Provider Connections & Vault', icon: KeyRound },
+            {
+              id: 'capabilities',
+              label: '2. Capability Registry (14 Scopes)',
+              icon: CheckCircle2,
+            },
+            { id: 'routing', label: '3. Task Routing Profiles (8 Tasks)', icon: RouteIcon },
+            { id: 'extensions', label: '4. Extensions & Skill Sandbox', icon: Boxes },
+            { id: 'tool-registry', label: '5. Typed AI Tool Registry', icon: Wrench },
+          ].map((tab) => {
             const Icon = tab.icon;
             const active = activeTab === tab.id;
             return (
               <button
                 key={tab.id}
-                role="tab"
-                aria-selected={active}
                 type="button"
-                onClick={() => setActiveTab(tab.id)}
-                className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
+                onClick={() => setActiveTab(tab.id as HubTabId)}
+                className={`inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-medium whitespace-nowrap transition-colors ${
                   active
-                    ? 'bg-[#F06424] text-[#080707]'
-                    : 'text-[#B8AAA0] hover:text-[#F3EEE8]'
+                    ? 'bg-[#F06424] text-white shadow-sm'
+                    : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/60'
                 }`}
               >
                 <Icon className="w-3.5 h-3.5" />
-                <span>{tab.label}</span>
+                {tab.label}
               </button>
             );
           })}
         </div>
       </div>
 
-      {/* TAB 1: CONNECTIONS & WIZARD */}
-      {activeTab === 'connections' && (
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-          {/* Left: Connection Wizard */}
-          <div className="lg:col-span-5 rounded-xl border border-[#2A231E] bg-[#11100F] p-5 space-y-4">
-            <div className="flex items-center justify-between">
-              <h2 className="text-sm font-bold text-[#F3EEE8]">
-                01. Multi-Protocol Connection Wizard
-              </h2>
-              <span className="text-xs font-mono tabular-nums text-[#83766D]">
-                HTTPS + SSRF Guard
-              </span>
-            </div>
+      {/* Main Content Area */}
+      <main className="flex-1 max-w-7xl w-full mx-auto p-4 space-y-6">
+        {/* TAB 1: PROVIDER CONNECTIONS & VAULT */}
+        {activeTab === 'connections' && (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+            {/* Left Column: Prepopulated Model Catalog + Connection Wizard */}
+            <div className="lg:col-span-5 space-y-5">
+              <section className="bg-[#18191C] border border-zinc-800 rounded-xl p-4 space-y-3">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-xs font-bold uppercase tracking-wider text-zinc-300 flex items-center gap-1.5">
+                    <Sparkles className="w-3.5 h-3.5 text-[#F06424]" />
+                    Prepopulated Model Presets
+                  </h2>
+                  <span className="text-[11px] text-zinc-500">
+                    Click to populate adapter
+                  </span>
+                </div>
+                <p className="text-[11px] text-zinc-400 leading-relaxed">
+                  Gemini 4 Argon (<code className="text-zinc-200">gemini-4-argon</code>) and
+                  Gemini 3.8 Flash (<code className="text-zinc-200">gemini-3.8-flash</code>) are
+                  prepopulated when the endpoint account has quota. Capabilities start as{' '}
+                  <strong className="text-zinc-200">Not tested</strong> until verified by a live
+                  probe.
+                </p>
+                <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
+                  {PREPOPULATED_MODEL_CATALOG.map((preset) => {
+                    const isSelected = selectedPresetId === preset.presetId;
+                    return (
+                      <button
+                        key={preset.presetId}
+                        type="button"
+                        onClick={() => handleApplyCatalogPreset(preset)}
+                        className={`w-full text-left p-2.5 rounded-lg border transition-colors ${
+                          isSelected
+                            ? 'bg-[#F06424]/10 border-[#F06424] text-zinc-100'
+                            : 'bg-zinc-900/70 border-zinc-800 hover:border-zinc-700 text-zinc-300'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-xs font-semibold">{preset.label}</span>
+                          <span className="px-1.5 py-0.5 text-[10px] font-mono bg-zinc-800 text-zinc-300 rounded">
+                            {preset.protocol}
+                          </span>
+                        </div>
+                        <div className="mt-1 flex items-center gap-2 text-[11px] text-zinc-400 font-mono">
+                          <span>model: {preset.modelId}</span>
+                          <span>·</span>
+                          <span>auth: {preset.recommendedAuthMode}</span>
+                        </div>
+                        <p className="mt-1 text-[10px] text-zinc-500">
+                          {preset.quotaDisclaimer}
+                        </p>
+                      </button>
+                    );
+                  })}
+                </div>
+              </section>
 
-            <div className="space-y-1.5">
-              <label className="block text-xs font-medium text-[#B8AAA0]">
-                Load Prepopulated Protocol Preset
-              </label>
-              <select
-                aria-label="Load Prepopulated Protocol Preset"
-                onChange={(e) => applyCatalogPresetToWizard(e.target.value)}
-                defaultValue=""
-                className="w-full rounded-lg border border-[#342A24] bg-[#191614] px-3 py-2 text-xs text-[#F3EEE8]"
+              {/* Connection Wizard Form */}
+              <form
+                onSubmit={handleCreateConnection}
+                className="bg-[#18191C] border border-zinc-800 rounded-xl p-4 space-y-3.5"
               >
-                <option value="" disabled>
-                  Select a model preset…
-                </option>
-                {PREPOPULATED_MODEL_CATALOG.map((p) => (
-                  <option key={p.presetId} value={p.presetId}>
-                    {p.label} [{p.protocol}]
-                  </option>
-                ))}
-              </select>
-              <p className="text-[11px] text-[#83766D]">
-                Note: Prepopulated models (including Gemini 4 Argon and Gemini 3.8 Flash) do not
-                assume account quota or permission. All capabilities start as Not tested.
-              </p>
-            </div>
+                <h2 className="text-xs font-bold uppercase tracking-wider text-zinc-300 flex items-center gap-1.5">
+                  <Plus className="w-3.5 h-3.5 text-[#F06424]" />
+                  Add Provider Connection
+                </h2>
 
-            <form onSubmit={handleCreateConnection} className="space-y-3">
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs text-[#B8AAA0] mb-1">Connection Label</label>
-                  <input
-                    type="text"
-                    required
-                    value={wizardLabel}
-                    onChange={(e) => setWizardLabel(e.target.value)}
-                    className="w-full rounded-lg border border-[#342A24] bg-[#191614] px-3 py-1.5 text-xs text-[#F3EEE8]"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs text-[#B8AAA0] mb-1">Protocol Adapter</label>
-                  <select
-                    aria-label="Protocol Adapter"
-                    value={wizardProtocol}
-                    onChange={(e) =>
-                      setWizardProtocol(e.target.value as HubProviderProtocol)
-                    }
-                    className="w-full rounded-lg border border-[#342A24] bg-[#191614] px-3 py-1.5 text-xs text-[#F3EEE8]"
-                  >
-                    <option value="google-gemini">google-gemini (Google GenAI REST/SDK)</option>
-                    <option value="openai-chat-completions">
-                      openai-chat-completions (/v1/chat/completions)
-                    </option>
-                    <option value="openai-responses">
-                      openai-responses (/v1/responses Stateful)
-                    </option>
-                    <option value="anthropic-messages">
-                      anthropic-messages (/v1/messages)
-                    </option>
-                    <option value="openai-compatible-variant">
-                      openai-compatible-variant (OpenRouter/vLLM/Groq)
-                    </option>
-                    <option value="azure-openai">azure-openai (Azure Deployments)</option>
-                    <option value="custom-rest-adapter">
-                      custom-rest-adapter (Custom JSON Contract)
-                    </option>
-                  </select>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                <div className="sm:col-span-2">
-                  <label className="block text-xs text-[#B8AAA0] mb-1">
-                    Base URL (HTTPS Required)
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    value={wizardBaseUrl}
-                    onChange={(e) => setWizardBaseUrl(e.target.value)}
-                    className="w-full rounded-lg border border-[#342A24] bg-[#191614] px-3 py-1.5 text-xs font-mono text-[#F3EEE8]"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs text-[#B8AAA0] mb-1">Endpoint Path</label>
-                  <input
-                    type="text"
-                    value={wizardApiPath}
-                    onChange={(e) => setWizardApiPath(e.target.value)}
-                    className="w-full rounded-lg border border-[#342A24] bg-[#191614] px-3 py-1.5 text-xs font-mono text-[#F3EEE8]"
-                  />
-                </div>
-              </div>
-
-              {/* Live SSRF Validation Indicator */}
-              <div
-                className={`rounded-lg border px-3 py-2 text-xs flex items-center gap-2 ${
-                  liveSsrfCheck.allowed
-                    ? 'border-[#55B98B]/40 bg-[#55B98B]/10 text-[#55B98B]'
-                    : 'border-[#F06464]/40 bg-[#F06464]/10 text-[#F06464]'
-                }`}
-              >
-                {liveSsrfCheck.allowed ? (
-                  <ShieldCheck className="w-4 h-4 shrink-0" />
-                ) : (
-                  <ShieldAlert className="w-4 h-4 shrink-0" />
-                )}
-                <span>
-                  {liveSsrfCheck.allowed
-                    ? `SSRF Check Passed: ${liveSsrfCheck.hostname}:${liveSsrfCheck.port}`
-                    : `SSRF Blocked (${liveSsrfCheck.errorCode}): ${liveSsrfCheck.reason}`}
-                </span>
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs text-[#B8AAA0] mb-1">Model ID</label>
-                  <input
-                    type="text"
-                    required
-                    value={wizardModelId}
-                    onChange={(e) => setWizardModelId(e.target.value)}
-                    className="w-full rounded-lg border border-[#342A24] bg-[#191614] px-3 py-1.5 text-xs font-mono text-[#F3EEE8]"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs text-[#B8AAA0] mb-1">Storage Policy</label>
-                  <select
-                    aria-label="Storage Policy"
-                    value={wizardStorageMode}
-                    onChange={(e) =>
-                      setWizardStorageMode(e.target.value as SecretStorageMode)
-                    }
-                    className="w-full rounded-lg border border-[#342A24] bg-[#191614] px-3 py-1.5 text-xs text-[#F3EEE8]"
-                  >
-                    <option value="server-encrypted-vault">
-                      Server Encrypted Vault (AES-256-GCM)
-                    </option>
-                    <option value="device-only-ephemeral">
-                      Device-Only Ephemeral (Never Synced/Exported)
-                    </option>
-                  </select>
-                </div>
-              </div>
-
-              {wizardStorageMode === 'device-only-ephemeral' && (
-                <div className="rounded-lg border border-[#E4B45A]/40 bg-[#E4B45A]/10 p-2.5 text-xs text-[#E4B45A]">
-                  Security Limitation: Device-only ephemeral credentials remain in volatile
-                  memory for the current session only, are never backed up or exported in
-                  project archives, and are wiped on reload/sign-out.
-                </div>
-              )}
-
-              {wizardProtocol === 'google-gemini' ? (
-                <div className="rounded-lg border border-[#342A24] bg-[#191614] p-3 text-xs text-[#B8AAA0]">
-                  Google Gemini connections use server-side environment authentication (
-                  <code className="text-[#F3EEE8]">GEMINI_API_KEY</code> in{' '}
-                  <strong className="text-[#F3EEE8]">Settings &gt; Secrets</strong>) and never
-                  request or expose keys in the browser.
-                </div>
-              ) : (
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   <div>
-                    <label className="block text-xs text-[#B8AAA0] mb-1">Auth Header Mode</label>
+                    <label className="block text-[11px] text-zinc-400 mb-1">
+                      Connection Label
+                    </label>
+                    <input
+                      type="text"
+                      value={newLabel}
+                      onChange={(e) => setNewLabel(e.target.value)}
+                      className="w-full px-2.5 py-1.5 text-xs bg-zinc-900 border border-zinc-700 rounded text-zinc-100"
+                      required
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] text-zinc-400 mb-1">
+                      Protocol Adapter (Distinct)
+                    </label>
                     <select
-                      aria-label="Auth Header Mode"
-                      value={wizardAuthMode}
-                      onChange={(e) => setWizardAuthMode(e.target.value as HubAuthMode)}
-                      className="w-full rounded-lg border border-[#342A24] bg-[#191614] px-3 py-1.5 text-xs text-[#F3EEE8]"
+                      value={newProtocol}
+                      onChange={(e) => setNewProtocol(e.target.value as HubProviderProtocol)}
+                      className="w-full px-2.5 py-1.5 text-xs bg-zinc-900 border border-zinc-700 rounded text-zinc-100"
                     >
-                      <option value="bearer">Authorization: Bearer</option>
+                      <option value="google-gemini">google-gemini (GenerateContent)</option>
+                      <option value="openai-chat-completions">
+                        openai-chat-completions (/v1/chat/completions)
+                      </option>
+                      <option value="openai-responses">
+                        openai-responses (/v1/responses Stateful)
+                      </option>
+                      <option value="anthropic-messages">
+                        anthropic-messages (/v1/messages)
+                      </option>
+                      <option value="openai-compatible-variant">
+                        openai-compatible-variant (OpenRouter/vLLM)
+                      </option>
+                      <option value="azure-openai">azure-openai (Deployments API)</option>
+                      <option value="custom-rest-adapter">custom-rest-adapter</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <div className="sm:col-span-2">
+                    <label className="block text-[11px] text-zinc-400 mb-1">
+                      HTTPS Base URL (SSRF Guard Active)
+                    </label>
+                    <input
+                      type="text"
+                      value={newBaseUrl}
+                      onChange={(e) => setNewBaseUrl(e.target.value)}
+                      placeholder="https://api.openai.com"
+                      className="w-full px-2.5 py-1.5 text-xs font-mono bg-zinc-900 border border-zinc-700 rounded text-zinc-100"
+                      required
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] text-zinc-400 mb-1">Model ID</label>
+                    <input
+                      type="text"
+                      value={newModelId}
+                      onChange={(e) => setNewModelId(e.target.value)}
+                      className="w-full px-2.5 py-1.5 text-xs font-mono bg-zinc-900 border border-zinc-700 rounded text-zinc-100"
+                      required
+                    />
+                  </div>
+                </div>
+
+                {/* Live SSRF Validation Indicator */}
+                <div
+                  className={`p-2 rounded text-[11px] flex items-center gap-2 border ${
+                    ssrfLiveCheck.allowed
+                      ? 'bg-emerald-950/30 border-emerald-500/30 text-emerald-300'
+                      : 'bg-rose-950/40 border-rose-500/40 text-rose-300'
+                  }`}
+                >
+                  {ssrfLiveCheck.allowed ? (
+                    <ShieldCheck className="w-4 h-4 shrink-0 text-emerald-400" />
+                  ) : (
+                    <ShieldAlert className="w-4 h-4 shrink-0 text-rose-400" />
+                  )}
+                  <span>
+                    {ssrfLiveCheck.allowed
+                      ? `SSRF Check Passed: ${ssrfLiveCheck.normalizedBaseUrl} (Port ${ssrfLiveCheck.port})`
+                      : `SSRF Blocked [${ssrfLiveCheck.errorCode}]: ${ssrfLiveCheck.reason}`}
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-[11px] text-zinc-400 mb-1">
+                      Authentication Header Mode
+                    </label>
+                    <select
+                      value={newAuthMode}
+                      onChange={(e) => setNewAuthMode(e.target.value as HubAuthMode)}
+                      className="w-full px-2.5 py-1.5 text-xs bg-zinc-900 border border-zinc-700 rounded text-zinc-100"
+                    >
+                      <option value="bearer">Authorization: Bearer &lt;token&gt;</option>
                       <option value="x-api-key">x-api-key (Anthropic)</option>
                       <option value="api-key">api-key (Azure)</option>
                       <option value="custom-header">Custom Header</option>
+                      <option value="server-env">Server Environment (GEMINI_API_KEY)</option>
                     </select>
                   </div>
                   <div>
-                    <label className="block text-xs text-[#B8AAA0] mb-1">
-                      Provider Credential (Write-Only)
+                    <label className="block text-[11px] text-zinc-400 mb-1">
+                      Secret Storage Mode
                     </label>
-                    <input
-                      type="password"
-                      value={wizardCredentialInput}
-                      onChange={(e) => setWizardCredentialInput(e.target.value)}
-                      placeholder="Encrypted on save; never shown again"
-                      className="w-full rounded-lg border border-[#342A24] bg-[#191614] px-3 py-1.5 text-xs font-mono text-[#F3EEE8]"
-                    />
+                    <select
+                      value={newStorageMode}
+                      onChange={(e) => setNewStorageMode(e.target.value as SecretStorageMode)}
+                      className="w-full px-2.5 py-1.5 text-xs bg-zinc-900 border border-zinc-700 rounded text-zinc-100"
+                    >
+                      <option value="server-encrypted-vault">
+                        Server-Side Encrypted Vault (Recommended)
+                      </option>
+                      <option value="device-only-ephemeral">
+                        Device-Only Ephemeral Session
+                      </option>
+                    </select>
                   </div>
                 </div>
-              )}
 
-              <div className="grid grid-cols-3 gap-3">
-                <div>
-                  <label className="block text-xs text-[#B8AAA0] mb-1">Timeout (ms)</label>
-                  <input
-                    type="number"
-                    min={1000}
-                    max={30000}
-                    value={wizardTimeoutMs}
-                    onChange={(e) => setWizardTimeoutMs(Number(e.target.value))}
-                    className="w-full rounded-lg border border-[#342A24] bg-[#191614] px-2.5 py-1.5 text-xs font-mono tabular-nums text-[#F3EEE8]"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs text-[#B8AAA0] mb-1">Monthly Cap ($)</label>
-                  <input
-                    type="number"
-                    min={1}
-                    max={1000}
-                    value={wizardBudgetLimitUsd}
-                    onChange={(e) => setWizardBudgetLimitUsd(Number(e.target.value))}
-                    className="w-full rounded-lg border border-[#342A24] bg-[#191614] px-2.5 py-1.5 text-xs font-mono tabular-nums text-[#F3EEE8]"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs text-[#B8AAA0] mb-1">Budget Policy</label>
-                  <select
-                    aria-label="Budget Policy"
-                    value={wizardBudgetMode}
-                    onChange={(e) => setWizardBudgetMode(e.target.value as any)}
-                    className="w-full rounded-lg border border-[#342A24] bg-[#191614] px-2 py-1.5 text-xs text-[#F3EEE8]"
-                  >
-                    <option value="fallback-to-secondary">Fallback</option>
-                    <option value="hard-stop">Hard Stop</option>
-                    <option value="warn-only">Warn Only</option>
-                  </select>
-                </div>
-              </div>
+                {newStorageMode === 'device-only-ephemeral' && (
+                  <div className="p-2.5 rounded bg-amber-950/40 border border-amber-500/40 text-[11px] text-amber-200 flex items-start gap-2">
+                    <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                    <span>
+                      <strong>Device-Only Security Warning:</strong> Ephemeral mode keeps this key
+                      in volatile session memory only. It is never exported in project JSON/ZIP
+                      bundles and is wiped on sign-out.
+                    </span>
+                  </div>
+                )}
 
-              {wizardError && (
-                <div className="text-xs text-[#F06464] bg-[#F06464]/10 border border-[#F06464]/40 rounded-lg p-2.5">
-                  {wizardError}
-                </div>
-              )}
-
-              <button
-                type="submit"
-                disabled={!liveSsrfCheck.allowed}
-                className="w-full inline-flex items-center justify-center gap-2 px-4 py-2 rounded-lg bg-[#F06424] hover:bg-[#E05514] disabled:opacity-40 text-[#080707] font-semibold text-xs transition-colors"
-              >
-                <Plus className="w-4 h-4" />
-                <span>Save Connection to Encrypted Vault</span>
-              </button>
-            </form>
-          </div>
-
-          {/* Right: Active Connections & Diagnostic Probes */}
-          <div className="lg:col-span-7 space-y-4">
-            <div className="rounded-xl border border-[#2A231E] bg-[#11100F] p-5 space-y-4">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <h2 className="text-sm font-bold text-[#F3EEE8]">
-                  02. Configured Connections & Live Protocol Prober
-                </h2>
-                <div className="flex flex-wrap items-center gap-3 text-xs text-[#B8AAA0]">
-                  <label className="inline-flex items-center gap-1.5">
-                    <input
-                      type="checkbox"
-                      checked={probeTools}
-                      onChange={(e) => setProbeTools(e.target.checked)}
-                    />
-                    <span>Probe Tools</span>
-                  </label>
-                  <label className="inline-flex items-center gap-1.5">
-                    <input
-                      type="checkbox"
-                      checked={probeStructuredOutput}
-                      onChange={(e) => setProbeStructuredOutput(e.target.checked)}
-                    />
-                    <span>Probe JSON Schema</span>
-                  </label>
-                  <label className="inline-flex items-center gap-1.5">
-                    <input
-                      type="checkbox"
-                      checked={probeVision}
-                      onChange={(e) => setProbeVision(e.target.checked)}
-                    />
-                    <span>Probe Vision</span>
-                  </label>
-                  <label className="inline-flex items-center gap-1.5">
-                    <input
-                      type="checkbox"
-                      checked={probeStreaming}
-                      onChange={(e) => setProbeStreaming(e.target.checked)}
-                    />
-                    <span>Probe Streaming</span>
-                  </label>
-                </div>
-              </div>
-
-              <div className="space-y-3">
-                {connections.map((conn) => {
-                  const isSelected = conn.id === selectedConnection?.id;
-                  const verifiedCount = Object.values(conn.capabilities).filter(
-                    (c) => c.state === 'Verified'
-                  ).length;
-
-                  return (
-                    <div
-                      key={conn.id}
-                      onClick={() => setSelectedConnectionId(conn.id)}
-                      className={`rounded-xl border p-4 cursor-pointer transition-colors space-y-3 ${
-                        isSelected
-                          ? 'border-[#F06424] bg-[#191614]'
-                          : 'border-[#2A231E] bg-[#141210] hover:border-[#83766D]'
-                      }`}
-                    >
-                      <div className="flex flex-wrap items-start justify-between gap-2">
-                        <div>
-                          <div className="flex items-center gap-2">
-                            <span className="text-sm font-bold text-[#F3EEE8]">
-                              {conn.label}
-                            </span>
-                            <span className="text-xs font-mono text-[#83766D]">
-                              · {conn.protocol}
-                            </span>
-                          </div>
-                          <div className="text-xs font-mono tabular-nums text-[#B8AAA0] mt-0.5">
-                            Model: <span className="text-[#F3EEE8]">{conn.modelId}</span> ·
-                            Endpoint: {conn.baseUrl} · Key:{' '}
-                            <span className="text-[#E4B45A]">{conn.maskedCredential}</span> (v
-                            {conn.keyVersion})
-                          </div>
-                        </div>
-
-                        <div className="flex items-center gap-2">
-                          <span
-                            className={`text-xs font-mono tabular-nums ${
-                              conn.lastTestStatus === 'Verified'
-                                ? 'text-[#55B98B]'
-                                : conn.lastTestStatus === 'Failed'
-                                ? 'text-[#F06464]'
-                                : 'text-[#E4B45A]'
-                            }`}
-                          >
-                            {conn.lastTestStatus} ({verifiedCount}/14 Verified)
-                          </span>
-                          <button
-                            type="button"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              handleRunProbe(conn);
-                            }}
-                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-[#F06424] text-[#080707] text-xs font-semibold hover:bg-[#E05514]"
-                          >
-                            <Play className="w-3 h-3" />
-                            <span>Test Connection</span>
-                          </button>
-                        </div>
-                      </div>
-
-                      {conn.lastSanitizedError && (
-                        <div className="rounded-lg border border-[#F06464]/40 bg-[#F06464]/10 p-2.5 text-xs font-mono text-[#F06464]">
-                          [{conn.lastSanitizedError.code}] {conn.lastSanitizedError.message}
-                        </div>
-                      )}
-
-                      {/* Key Lifecycle Actions (Rotate / Revoke / Delete) */}
-                      <div
-                        className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-[#2A231E]"
-                        onClick={(e) => e.stopPropagation()}
+                {newAuthMode !== 'server-env' && (
+                  <div>
+                    <label className="block text-[11px] text-zinc-400 mb-1">
+                      API Key / Token (Encrypted with AES-256-GCM + User/Workspace AAD)
+                    </label>
+                    <div className="relative flex items-center">
+                      <input
+                        type={showCredentialInput ? 'text' : 'password'}
+                        value={newCredential}
+                        onChange={(e) => setNewCredential(e.target.value)}
+                        placeholder="sk-proj-..."
+                        autoComplete="off"
+                        className="w-full pl-2.5 pr-9 py-1.5 text-xs font-mono bg-zinc-900 border border-zinc-700 rounded text-zinc-100"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowCredentialInput((v) => !v)}
+                        className="absolute right-2 text-zinc-400 hover:text-zinc-200"
+                        title="Toggle visibility"
                       >
-                        <div className="flex items-center gap-2">
-                          {conn.authMode !== 'server-env' && (
-                            <>
-                              <input
-                                type="password"
-                                placeholder="New key for rotation…"
-                                value={isSelected ? rotateKeyValue : ''}
-                                onChange={(e) => {
-                                  setSelectedConnectionId(conn.id);
-                                  setRotateKeyValue(e.target.value);
-                                }}
-                                className="rounded border border-[#342A24] bg-[#0B0A09] px-2 py-1 text-xs font-mono text-[#F3EEE8]"
-                              />
-                              <button
-                                type="button"
-                                onClick={() => handleRotateCredential(conn)}
-                                className="inline-flex items-center gap-1 px-2.5 py-1 rounded border border-[#342A24] bg-[#11100F] hover:border-[#83766D] text-xs text-[#F3EEE8]"
-                              >
-                                <RefreshCw className="w-3 h-3" />
-                                <span>Rotate</span>
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => handleRevokeCredential(conn)}
-                                className="inline-flex items-center gap-1 px-2.5 py-1 rounded border border-[#E4B45A]/50 bg-[#E4B45A]/10 text-xs text-[#E4B45A]"
-                              >
-                                <Lock className="w-3 h-3" />
-                                <span>Revoke</span>
-                              </button>
-                            </>
-                          )}
+                        {showCredentialInput ? (
+                          <EyeOff className="w-3.5 h-3.5" />
+                        ) : (
+                          <Eye className="w-3.5 h-3.5" />
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-[11px] text-zinc-400 mb-1">
+                      Monthly Budget Cap (USD)
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={5000}
+                      value={newMonthlyBudgetUsd}
+                      onChange={(e) => setNewMonthlyBudgetUsd(Number(e.target.value))}
+                      className="w-full px-2.5 py-1.5 text-xs bg-zinc-900 border border-zinc-700 rounded text-zinc-100"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] text-zinc-400 mb-1">
+                      Budget Exhaustion Policy
+                    </label>
+                    <select
+                      value={newBudgetMode}
+                      onChange={(e) => setNewBudgetMode(e.target.value as any)}
+                      className="w-full px-2.5 py-1.5 text-xs bg-zinc-900 border border-zinc-700 rounded text-zinc-100"
+                    >
+                      <option value="fallback-to-secondary">Fallback to Secondary</option>
+                      <option value="hard-stop">Hard Stop Requests</option>
+                      <option value="warn-only">Warn Only</option>
+                    </select>
+                  </div>
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={!ssrfLiveCheck.allowed || isMutating}
+                  className="w-full py-2 px-4 rounded-lg bg-[#F06424] hover:bg-[#e05617] disabled:opacity-40 text-xs font-bold text-white transition-colors"
+                >
+                  Save Connection to Encrypted Vault
+                </button>
+              </form>
+            </div>
+
+            {/* Right Column: Active Connections, Vault Lifecycle & Connection Probe */}
+            <div className="lg:col-span-7 space-y-5">
+              <section className="bg-[#18191C] border border-zinc-800 rounded-xl p-4 space-y-3">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-xs font-bold uppercase tracking-wider text-zinc-300">
+                    Workspace Connections ({connections.length})
+                  </h2>
+                  <span className="text-[11px] text-zinc-400">
+                    Raw keys are never returned after save
+                  </span>
+                </div>
+
+                <div className="space-y-2.5">
+                  {connections.map((conn) => {
+                    const isSelected = selectedConnection?.id === conn.id;
+                    return (
+                      <div
+                        key={conn.id}
+                        onClick={() => setSelectedConnectionId(conn.id)}
+                        className={`p-3 rounded-lg border cursor-pointer transition-colors ${
+                          isSelected
+                            ? 'bg-zinc-900 border-[#F06424]'
+                            : 'bg-zinc-900/50 border-zinc-800 hover:border-zinc-700'
+                        }`}
+                      >
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs font-bold text-white">{conn.label}</span>
+                            <span className="px-2 py-0.5 text-[10px] font-mono bg-zinc-800 text-zinc-300 rounded">
+                              {conn.protocol}
+                            </span>
+                            <span className="px-2 py-0.5 text-[10px] font-mono bg-zinc-800 text-[#F06424] rounded">
+                              {conn.modelId}
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            {conn.credentialStatus === 'requires-reentry' && (
+                              <span className="px-2 py-0.5 text-[10px] font-semibold bg-amber-500/15 text-amber-300 border border-amber-500/30 rounded">
+                                Re-entry Required
+                              </span>
+                            )}
+                            {conn.lastTestStatus === 'Verified' ? (
+                              <span className="px-2 py-0.5 text-[10px] font-semibold bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 rounded">
+                                Probe Verified
+                              </span>
+                            ) : conn.lastTestStatus === 'Failed' ? (
+                              <span className="px-2 py-0.5 text-[10px] font-semibold bg-rose-500/15 text-rose-300 border border-rose-500/30 rounded">
+                                Probe Failed
+                              </span>
+                            ) : (
+                              <span className="px-2 py-0.5 text-[10px] font-semibold bg-zinc-800 text-zinc-400 border border-zinc-700 rounded">
+                                Not tested
+                              </span>
+                            )}
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void handleDeleteConnection(conn.id);
+                              }}
+                              className="p-1 text-zinc-500 hover:text-rose-400"
+                              title="Delete connection"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
                         </div>
+
+                        <div className="mt-2 grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px] text-zinc-400 font-mono">
+                          <div>
+                            <span className="text-zinc-500">Endpoint:</span>{' '}
+                            <span className="text-zinc-300">{conn.baseUrl}</span>
+                          </div>
+                          <div>
+                            <span className="text-zinc-500">Key:</span>{' '}
+                            <span className="text-zinc-200">{conn.maskedCredential}</span>
+                          </div>
+                          <div>
+                            <span className="text-zinc-500">Vault Status:</span>{' '}
+                            <span
+                              className={
+                                conn.credentialStatus === 'revoked'
+                                  ? 'text-rose-400'
+                                  : conn.credentialStatus === 'requires-reentry'
+                                  ? 'text-amber-300'
+                                  : 'text-emerald-400'
+                              }
+                            >
+                              {conn.credentialStatus} (v{conn.keyVersion})
+                            </span>
+                          </div>
+                          <div>
+                            <span className="text-zinc-500">Budget:</span>{' '}
+                            <span className="text-zinc-300">
+                              ${conn.budgetPolicy.spentCurrentMonthUsd.toFixed(2)} / $
+                              {conn.budgetPolicy.monthlyLimitUsd}
+                            </span>
+                          </div>
+                        </div>
+
+                        {conn.lastSanitizedError && (
+                          <div className="mt-2 p-2 rounded bg-rose-950/40 border border-rose-500/30 text-[11px] text-rose-300 font-mono">
+                            [{conn.lastSanitizedError.code}] {conn.lastSanitizedError.message}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </section>
+
+              {/* Selected Connection Vault & Probe Inspector */}
+              {selectedConnection && (
+                <section className="bg-[#18191C] border border-zinc-800 rounded-xl p-4 space-y-4">
+                  <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800 pb-3">
+                    <div>
+                      <h3 className="text-xs font-bold uppercase tracking-wider text-white">
+                        Connection Diagnostics & Secret Lifecycle: {selectedConnection.label}
+                      </h3>
+                      <p className="text-[11px] text-zinc-400">
+                        AAD Scope:{' '}
+                        <code className="text-zinc-300">
+                          {selectedConnection.ownerUid}:{selectedConnection.workspaceId}:
+                          {selectedConnection.id}:{selectedConnection.protocol}
+                        </code>
+                      </p>
+                    </div>
+                  </div>
+
+                  {selectedConnection.credentialStatus === 'requires-reentry' && (
+                    <div className="p-3 rounded-lg bg-amber-950/40 border border-amber-500/40 text-xs text-amber-200 flex items-start gap-2">
+                      <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                      <div>
+                        <strong>Credential Re-entry Required:</strong> This connection record and
+                        its routing assignments were preserved, but its stored ciphertext cannot be
+                        decrypted under the active <code className="font-mono">SOWVEIL_MASTER_VAULT_KEY</code>.
+                        Enter a fresh API key below and click <strong>Rotate Key</strong> to restore
+                        live requests.
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Secret Rotation & Revocation Controls */}
+                  <div className="grid grid-cols-1 sm:grid-cols-12 gap-2 items-center bg-zinc-900/70 p-3 rounded-lg border border-zinc-800">
+                    <div className="sm:col-span-6">
+                      <input
+                        type="password"
+                        value={rotateKeyInput}
+                        onChange={(e) => setRotateKeyInput(e.target.value)}
+                        placeholder="Enter new API key to rotate vault version..."
+                        autoComplete="off"
+                        className="w-full px-2.5 py-1.5 text-xs font-mono bg-zinc-950 border border-zinc-700 rounded text-zinc-100"
+                      />
+                    </div>
+                    <div className="sm:col-span-3">
+                      <button
+                        type="button"
+                        disabled={isMutating}
+                        onClick={() => void handleRotateCredential()}
+                        className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-xs font-semibold text-zinc-100 border border-zinc-700 disabled:opacity-50"
+                      >
+                        <RefreshCw className="w-3.5 h-3.5" /> Rotate Key
+                      </button>
+                    </div>
+                    <div className="sm:col-span-3">
+                      <button
+                        type="button"
+                        disabled={isMutating}
+                        onClick={() => void handleRevokeCredential()}
+                        className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded bg-rose-950/60 hover:bg-rose-900/70 text-xs font-semibold text-rose-200 border border-rose-500/30 disabled:opacity-50"
+                      >
+                        <Lock className="w-3.5 h-3.5" /> Revoke Key
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Live Capability Probe Controls */}
+                  <div className="space-y-3">
+                    <div className="flex flex-wrap items-center gap-4 text-xs text-zinc-300">
+                      <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={probeStructuredOutput}
+                          onChange={(e) => setProbeStructuredOutput(e.target.checked)}
+                        />
+                        Probe Structured JSON
+                      </label>
+                      <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={probeTools}
+                          onChange={(e) => setProbeTools(e.target.checked)}
+                        />
+                        Probe Tool Calling
+                      </label>
+                      <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={probeVision}
+                          onChange={(e) => setProbeVision(e.target.checked)}
+                        />
+                        Probe Vision (1x1 PNG)
+                      </label>
+                      <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={probeStreaming}
+                          onChange={(e) => setProbeStreaming(e.target.checked)}
+                        />
+                        Probe SSE Streaming
+                      </label>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        disabled={isMutating}
+                        onClick={() => void handleRunProbe()}
+                        className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-xs font-bold text-white disabled:opacity-50"
+                      >
+                        <Play className="w-3.5 h-3.5" />
+                        Test Connection & Verify Capabilities
+                      </button>
+                      <button
+                        type="button"
+                        disabled={isMutating}
+                        onClick={() => void handleRunProbe('401_UNAUTHORIZED')}
+                        className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-xs text-zinc-300 border border-zinc-700 disabled:opacity-50"
+                      >
+                        Simulate 401 Auth Failure
+                      </button>
+                      <button
+                        type="button"
+                        disabled={isMutating}
+                        onClick={() => void handleRunProbe('429_QUOTA_EXCEEDED')}
+                        className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-xs text-zinc-300 border border-zinc-700 disabled:opacity-50"
+                      >
+                        Simulate 429 Quota Error
+                      </button>
+                    </div>
+                  </div>
+
+                  {lastProbePreview && (
+                    <div className="bg-zinc-950 border border-zinc-800 rounded-lg p-3 space-y-2">
+                      <div className="flex items-center justify-between text-[11px] text-zinc-400">
+                        <span className="font-semibold text-zinc-300">
+                          Redacted Protocol Wire Preview ({selectedConnection.protocol})
+                        </span>
+                        <span className="font-mono text-emerald-400">
+                          {lastProbePreview.method} {lastProbePreview.url}
+                        </span>
+                      </div>
+                      <pre className="text-[10px] font-mono text-zinc-300 overflow-x-auto max-h-40">
+                        {JSON.stringify(
+                          {
+                            headers: lastProbePreview.redactedHeaders,
+                            body: lastProbePreview.bodySummary,
+                          },
+                          null,
+                          2
+                        )}
+                      </pre>
+                    </div>
+                  )}
+                </section>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* TAB 2: CAPABILITY REGISTRY (14 SCOPES) */}
+        {activeTab === 'capabilities' && selectedConnection && (
+          <section className="bg-[#18191C] border border-zinc-800 rounded-xl p-4 space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-zinc-800 pb-3">
+              <div>
+                <h2 className="text-sm font-bold text-white">
+                  Capability Registry Matrix — {selectedConnection.label}
+                </h2>
+                <p className="text-xs text-zinc-400">
+                  Capabilities are never inferred as Verified from brand name alone. Manual
+                  User-asserted overrides carry an explicit runtime warning.
+                </p>
+              </div>
+              <select
+                value={selectedConnection.id}
+                onChange={(e) => setSelectedConnectionId(e.target.value)}
+                className="px-3 py-1.5 text-xs bg-zinc-900 border border-zinc-700 rounded text-zinc-100"
+              >
+                {connections.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.label} ({c.modelId})
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              {ALL_MODEL_CAPABILITY_KEYS.map((capKey) => {
+                const entry = selectedConnection.capabilities[capKey];
+                return (
+                  <div
+                    key={capKey}
+                    className="p-3 rounded-lg bg-zinc-900/70 border border-zinc-800 flex flex-col justify-between gap-2"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs font-mono font-bold text-zinc-100">
+                        {capKey}
+                      </span>
+                      {renderCapabilityBadge(entry.state)}
+                    </div>
+                    <p className="text-[11px] text-zinc-400">{entry.probeEvidence}</p>
+                    {entry.userOverrideWarning && (
+                      <div className="p-2 rounded bg-amber-950/40 border border-amber-500/30 text-[10px] text-amber-300">
+                        {entry.userOverrideWarning}
+                      </div>
+                    )}
+                    <div className="flex items-center justify-between pt-1 border-t border-zinc-800/80 text-[10px] text-zinc-500">
+                      <span>
+                        {entry.lastTestedAt
+                          ? `Tested: ${new Date(entry.lastTestedAt).toLocaleTimeString()}`
+                          : 'Never probed'}
+                      </span>
+                      <div className="flex items-center gap-1">
                         <button
                           type="button"
-                          onClick={() => handleDeleteConnection(conn.id)}
-                          className="inline-flex items-center gap-1 px-2 py-1 rounded text-xs text-[#F06464] hover:underline"
+                          disabled={isMutating}
+                          onClick={() => void handleCapabilityOverride(capKey, 'User-asserted')}
+                          className="px-2 py-0.5 rounded bg-zinc-800 hover:bg-zinc-700 text-amber-300 disabled:opacity-50"
                         >
-                          <Trash2 className="w-3.5 h-3.5" />
-                          <span>Delete</span>
+                          Assert Override
+                        </button>
+                        <button
+                          type="button"
+                          disabled={isMutating}
+                          onClick={() => void handleCapabilityOverride(capKey, 'Unsupported')}
+                          className="px-2 py-0.5 rounded bg-zinc-800 hover:bg-zinc-700 text-rose-300 disabled:opacity-50"
+                        >
+                          Mark Unsupported
+                        </button>
+                        <button
+                          type="button"
+                          disabled={isMutating}
+                          onClick={() => void handleCapabilityOverride(capKey, 'Not tested')}
+                          className="px-2 py-0.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 disabled:opacity-50"
+                        >
+                          Reset
                         </button>
                       </div>
                     </div>
-                  );
-                })}
-              </div>
-
-              {lastProbePreview && (
-                <div className="rounded-lg border border-[#342A24] bg-[#0B0A09] p-3 space-y-1.5">
-                  <div className="text-xs font-semibold text-[#B8AAA0]">
-                    Last Protocol Probe Request Preview (Credentials Redacted)
                   </div>
-                  <pre className="text-[11px] font-mono text-[#F3EEE8] overflow-x-auto">
-                    {JSON.stringify(lastProbePreview, null, 2)}
-                  </pre>
-                </div>
-              )}
+                );
+              })}
             </div>
-          </div>
-        </div>
-      )}
+          </section>
+        )}
 
-      {/* TAB 2: 14-CAPABILITY REGISTRY */}
-      {activeTab === 'capabilities' && selectedConnection && (
-        <div className="rounded-xl border border-[#2A231E] bg-[#11100F] p-5 space-y-4">
-          <div className="flex flex-wrap items-center justify-between gap-3">
+        {/* TAB 3: TASK ROUTING PROFILES (8 TASKS) */}
+        {activeTab === 'routing' && (
+          <section className="bg-[#18191C] border border-zinc-800 rounded-xl p-4 space-y-4">
             <div>
-              <h2 className="text-sm font-bold text-[#F3EEE8]">
-                Model Capability Registry — {selectedConnection.label}
+              <h2 className="text-sm font-bold text-white">
+                Multi-Model Task Routing Profiles (8 Specialized Tasks)
               </h2>
-              <p className="text-xs text-[#B8AAA0]">
-                Capabilities are never inferred solely from provider brand. Each capability is
-                tracked as Verified, User-asserted, Unsupported, or Not tested.
+              <p className="text-xs text-zinc-400">
+                Route high-complexity architecture and shot planning to flagship reasoning models
+                (e.g., Gemini 4 Argon / Claude Sonnet / o3-mini) and routine tagging to low-latency
+                models (e.g., Gemini 3.8 Flash).
               </p>
             </div>
-            <select
-              aria-label="Select Connection for Capability Registry"
-              value={selectedConnection.id}
-              onChange={(e) => setSelectedConnectionId(e.target.value)}
-              className="rounded-lg border border-[#342A24] bg-[#191614] px-3 py-1.5 text-xs text-[#F3EEE8]"
-            >
-              {connections.map((c) => (
-                <option key={c.id} value={c.id}>
-                  {c.label} ({c.modelId})
-                </option>
-              ))}
-            </select>
-          </div>
 
-          <div className="overflow-x-auto">
-            <table className="w-full text-left border-collapse text-xs">
-              <thead>
-                <tr className="border-b border-[#2A231E] text-[#83766D]">
-                  <th className="py-2 pr-3 font-medium">Capability</th>
-                  <th className="py-2 px-3 font-medium">Verification State</th>
-                  <th className="py-2 px-3 font-medium">Evidence & Override Warning</th>
-                  <th className="py-2 px-3 font-medium">Retest / Expiry</th>
-                  <th className="py-2 pl-3 font-medium text-right">Manual Override</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-[#2A231E]">
-                {ALL_MODEL_CAPABILITY_KEYS.map((capKey) => {
-                  const entry = selectedConnection.capabilities[capKey];
-                  const stateColor =
-                    entry.state === 'Verified'
-                      ? 'text-[#55B98B]'
-                      : entry.state === 'User-asserted'
-                      ? 'text-[#E4B45A]'
-                      : entry.state === 'Unsupported'
-                      ? 'text-[#F06464]'
-                      : 'text-[#B8AAA0]';
-
-                  return (
-                    <tr key={capKey} className="hover:bg-[#191614]/60">
-                      <td className="py-2.5 pr-3 font-mono text-[#F3EEE8]">{capKey}</td>
-                      <td className={`py-2.5 px-3 font-semibold ${stateColor}`}>
-                        {entry.state}
-                      </td>
-                      <td className="py-2.5 px-3 text-[#B8AAA0]">
-                        <div>{entry.probeEvidence}</div>
-                        {entry.userOverrideWarning && (
-                          <div className="text-[11px] text-[#E4B45A] mt-0.5">
-                            {entry.userOverrideWarning}
-                          </div>
-                        )}
-                      </td>
-                      <td className="py-2.5 px-3 font-mono tabular-nums text-[#83766D]">
-                        {entry.expiresAt ? entry.expiresAt.slice(0, 10) : '—'}
-                      </td>
-                      <td className="py-2.5 pl-3 text-right">
-                        <div className="inline-flex items-center gap-1">
-                          {(
-                            ['User-asserted', 'Not tested', 'Unsupported'] as Array<
-                              'User-asserted' | 'Not tested' | 'Unsupported'
-                            >
-                          ).map((st) => (
-                            <button
-                              key={st}
-                              type="button"
-                              onClick={() =>
-                                handleCapabilityOverride(selectedConnection, capKey, st)
-                              }
-                              className={`px-2 py-1 rounded border text-[11px] ${
-                                entry.state === st
-                                  ? 'border-[#F06424] text-[#F06424] bg-[#F06424]/10'
-                                  : 'border-[#342A24] text-[#B8AAA0] hover:text-[#F3EEE8]'
-                              }`}
-                            >
-                              {st}
-                            </button>
-                          ))}
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
-
-      {/* TAB 3: TASK ROUTING PROFILES */}
-      {activeTab === 'routing' && (
-        <div className="rounded-xl border border-[#2A231E] bg-[#11100F] p-5 space-y-4">
-          <div>
-            <h2 className="text-sm font-bold text-[#F3EEE8]">
-              Task Routing Profiles (8 Specialized Production Stages)
-            </h2>
-            <p className="text-xs text-[#B8AAA0]">
-              Route high-complexity architecture/planning to Argon or reasoning models, and
-              routine tagging/asset matching to fast models with automatic fallback.
-            </p>
-          </div>
-
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {ALL_HUB_TASK_TYPES.map((taskKey) => {
-              const profile = routingProfiles[taskKey];
-              const readiness = evaluateRoutingReadiness(profile, connectionsById);
-
-              return (
-                <div
-                  key={taskKey}
-                  className="rounded-xl border border-[#2A231E] bg-[#141210] p-4 space-y-3"
-                >
-                  <div className="flex items-start justify-between gap-2">
-                    <div>
-                      <div className="text-sm font-bold text-[#F3EEE8]">{profile.label}</div>
-                      <div className="text-xs text-[#B8AAA0]">{profile.description}</div>
-                    </div>
-                    <span
-                      className={`text-xs font-mono ${
-                        readiness.ready ? 'text-[#55B98B]' : 'text-[#F06464]'
-                      }`}
-                    >
-                      {readiness.ready ? 'Route Ready' : 'Incompatible'}
-                    </span>
-                  </div>
-
-                  <div className="text-[11px] font-mono text-[#83766D]">
-                    Required Capabilities: {profile.requiredCapabilities.join(' · ')}
-                  </div>
-
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                    <div>
-                      <label className="block text-[11px] text-[#B8AAA0] mb-1">
-                        Primary Model Connection
-                      </label>
-                      <select
-                        aria-label={`${profile.label} Primary Connection`}
-                        value={profile.primaryConnectionId || ''}
-                        onChange={(e) =>
-                          setRoutingProfiles((prev) => ({
-                            ...prev,
-                            [taskKey]: {
-                              ...prev[taskKey],
-                              primaryConnectionId: e.target.value || null,
-                            },
-                          }))
-                        }
-                        className="w-full rounded border border-[#342A24] bg-[#191614] px-2.5 py-1.5 text-xs text-[#F3EEE8]"
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {ALL_HUB_TASK_TYPES.map((taskKey) => {
+                const profile = routingProfiles[taskKey];
+                const readiness = evaluateRoutingReadiness(profile, connectionsMap);
+                return (
+                  <div
+                    key={taskKey}
+                    className="p-3.5 rounded-lg bg-zinc-900/70 border border-zinc-800 space-y-2.5"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <div>
+                        <span className="text-xs font-bold text-white">{profile.label}</span>
+                        <p className="text-[11px] text-zinc-400">{profile.description}</p>
+                      </div>
+                      <span
+                        className={`px-2 py-0.5 text-[10px] font-semibold rounded border ${
+                          readiness.ready
+                            ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                            : 'bg-rose-500/15 text-rose-300 border-rose-500/30'
+                        }`}
                       >
-                        {connections.map((c) => (
-                          <option key={c.id} value={c.id}>
-                            {c.label}
-                          </option>
-                        ))}
-                      </select>
+                        {readiness.ready ? 'Ready' : 'Blocked'}
+                      </span>
                     </div>
-                    <div>
-                      <label className="block text-[11px] text-[#B8AAA0] mb-1">
-                        Fallback Connection
-                      </label>
-                      <select
-                        aria-label={`${profile.label} Fallback Connection`}
-                        value={profile.fallbackConnectionId || ''}
-                        onChange={(e) =>
-                          setRoutingProfiles((prev) => ({
-                            ...prev,
-                            [taskKey]: {
-                              ...prev[taskKey],
-                              fallbackConnectionId: e.target.value || null,
-                            },
-                          }))
-                        }
-                        className="w-full rounded border border-[#342A24] bg-[#191614] px-2.5 py-1.5 text-xs text-[#F3EEE8]"
-                      >
-                        <option value="">None</option>
-                        {connections.map((c) => (
-                          <option key={c.id} value={c.id}>
-                            {c.label}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                  </div>
 
-                  {readiness.warnings.length > 0 && (
-                    <div className="space-y-1 text-[11px] text-[#E4B45A]">
-                      {readiness.warnings.map((w, i) => (
-                        <div key={i}>• {w}</div>
+                    <div className="flex flex-wrap gap-1">
+                      {profile.requiredCapabilities.map((reqCap) => (
+                        <span
+                          key={reqCap}
+                          className="px-1.5 py-0.5 text-[10px] font-mono bg-zinc-800 text-zinc-300 rounded"
+                        >
+                          req: {reqCap}
+                        </span>
                       ))}
                     </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
 
-      {/* TAB 4: EXTENSIONS WORKSPACE */}
-      {activeTab === 'extensions' && (
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-          {/* Register Extension Form */}
-          <div className="lg:col-span-5 rounded-xl border border-[#2A231E] bg-[#11100F] p-5 space-y-4">
-            <h2 className="text-sm font-bold text-[#F3EEE8]">
-              Register Untrusted Skill, Repository, Docs Website or API
-            </h2>
-            <p className="text-xs text-[#B8AAA0]">
-              Imported packages are treated as untrusted inputs, pinned to a commit/release,
-              scanned for secret leaks or policy overrides, and isolated in a zero-secret
-              sandbox.
-            </p>
+                    <div className="grid grid-cols-2 gap-2 pt-1">
+                      <div>
+                        <label className="block text-[10px] text-zinc-400 mb-1">
+                          Primary Connection
+                        </label>
+                        <select
+                          value={profile.primaryConnectionId || ''}
+                          disabled={isMutating}
+                          onChange={(e) =>
+                            void handleUpdateRoutingProfile(taskKey, {
+                              primaryConnectionId: e.target.value || null,
+                            })
+                          }
+                          className="w-full px-2 py-1 text-xs bg-zinc-950 border border-zinc-700 rounded text-zinc-100"
+                        >
+                          <option value="">None</option>
+                          {connections.map((c) => (
+                            <option key={c.id} value={c.id}>
+                              {c.label}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                      <div>
+                        <label className="block text-[10px] text-zinc-400 mb-1">
+                          Fallback Connection
+                        </label>
+                        <select
+                          value={profile.fallbackConnectionId || ''}
+                          disabled={isMutating}
+                          onChange={(e) =>
+                            void handleUpdateRoutingProfile(taskKey, {
+                              fallbackConnectionId: e.target.value || null,
+                            })
+                          }
+                          className="w-full px-2 py-1 text-xs bg-zinc-950 border border-zinc-700 rounded text-zinc-100"
+                        >
+                          <option value="">None</option>
+                          {connections.map((c) => (
+                            <option key={c.id} value={c.id}>
+                              {c.label}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    </div>
 
-            <form onSubmit={handleRegisterExtension} className="space-y-3">
+                    {readiness.warnings.length > 0 && (
+                      <div className="p-2 rounded bg-amber-950/30 border border-amber-500/30 text-[10px] text-amber-200 space-y-0.5">
+                        {readiness.warnings.map((w, idx) => (
+                          <div key={idx}>• {w}</div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+        )}
+
+        {/* TAB 4: EXTENSIONS & SKILL SANDBOX */}
+        {activeTab === 'extensions' && (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+            <form
+              onSubmit={handleRegisterExtension}
+              className="lg:col-span-5 bg-[#18191C] border border-zinc-800 rounded-xl p-4 space-y-3.5"
+            >
+              <h2 className="text-xs font-bold uppercase tracking-wider text-zinc-300 flex items-center gap-1.5">
+                <Boxes className="w-3.5 h-3.5 text-[#F06424]" />
+                Register Sandboxed Extension / Custom Skill
+              </h2>
+              <p className="text-[11px] text-zinc-400 leading-relaxed">
+                Imported repositories, skills, markdown instructions, and docs websites are wrapped
+                in an <code className="text-zinc-200">&lt;untrusted_extension_data&gt;</code>{' '}
+                envelope and validated in an isolated sandbox with zero secret access.
+              </p>
+
               <div>
-                <label className="block text-xs text-[#B8AAA0] mb-1">Extension Name</label>
+                <label className="block text-[11px] text-zinc-400 mb-1">Extension Name</label>
                 <input
                   type="text"
-                  required
                   value={extName}
                   onChange={(e) => setExtName(e.target.value)}
-                  placeholder="e.g. Custom Beat-Sync Transition Pack"
-                  className="w-full rounded-lg border border-[#342A24] bg-[#191614] px-3 py-1.5 text-xs text-[#F3EEE8]"
+                  placeholder="e.g., Custom Alight Curve Skill"
+                  className="w-full px-2.5 py-1.5 text-xs bg-zinc-900 border border-zinc-700 rounded text-zinc-100"
+                  required
                 />
               </div>
 
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid grid-cols-2 gap-2">
                 <div>
-                  <label className="block text-xs text-[#B8AAA0] mb-1">Source Kind</label>
+                  <label className="block text-[11px] text-zinc-400 mb-1">Source Kind</label>
                   <select
-                    aria-label="Extension Source Kind"
                     value={extKind}
                     onChange={(e) => setExtKind(e.target.value as ExtensionPackageKind)}
-                    className="w-full rounded-lg border border-[#342A24] bg-[#191614] px-3 py-1.5 text-xs text-[#F3EEE8]"
+                    className="w-full px-2.5 py-1.5 text-xs bg-zinc-900 border border-zinc-700 rounded text-zinc-100"
                   >
-                    <option value="github-repo">GitHub Repository</option>
+                    <option value="github-repo">GitHub Repository (Pinned)</option>
                     <option value="skill-folder">Skill Folder</option>
-                    <option value="zip-package">ZIP Package</option>
-                    <option value="instruction-file">Instruction File</option>
-                    <option value="docs-website">Docs Website</option>
-                    <option value="api-tool">External API / Tool</option>
+                    <option value="instruction-file">Instruction Markdown</option>
+                    <option value="docs-website">Documentation Website</option>
+                    <option value="zip-package">Uploaded ZIP Package</option>
+                    <option value="api-tool">External API Connector</option>
                   </select>
                 </div>
                 <div>
-                  <label className="block text-xs text-[#B8AAA0] mb-1">
-                    Commit SHA / Release Pin
+                  <label className="block text-[11px] text-zinc-400 mb-1">
+                    Commit / Release Pin
                   </label>
                   <input
                     type="text"
-                    required
                     value={extCommitPin}
                     onChange={(e) => setExtCommitPin(e.target.value)}
-                    className="w-full rounded-lg border border-[#342A24] bg-[#191614] px-3 py-1.5 text-xs font-mono text-[#F3EEE8]"
+                    className="w-full px-2.5 py-1.5 text-xs font-mono bg-zinc-900 border border-zinc-700 rounded text-zinc-100"
+                    required
                   />
                 </div>
               </div>
 
-              <div className="grid grid-cols-3 gap-3">
+              <div className="grid grid-cols-3 gap-2">
                 <div className="col-span-2">
-                  <label className="block text-xs text-[#B8AAA0] mb-1">
-                    Approved HTTPS Source URL
+                  <label className="block text-[11px] text-zinc-400 mb-1">
+                    HTTPS Source URL
                   </label>
                   <input
                     type="text"
-                    required
                     value={extSourceUrl}
                     onChange={(e) => setExtSourceUrl(e.target.value)}
-                    className="w-full rounded-lg border border-[#342A24] bg-[#191614] px-3 py-1.5 text-xs font-mono text-[#F3EEE8]"
+                    className="w-full px-2.5 py-1.5 text-xs font-mono bg-zinc-900 border border-zinc-700 rounded text-zinc-100"
+                    required
                   />
                 </div>
                 <div>
-                  <label className="block text-xs text-[#B8AAA0] mb-1">License</label>
+                  <label className="block text-[11px] text-zinc-400 mb-1">License</label>
                   <input
                     type="text"
                     value={extLicense}
                     onChange={(e) => setExtLicense(e.target.value)}
-                    className="w-full rounded-lg border border-[#342A24] bg-[#191614] px-3 py-1.5 text-xs text-[#F3EEE8]"
+                    className="w-full px-2.5 py-1.5 text-xs bg-zinc-900 border border-zinc-700 rounded text-zinc-100"
                   />
                 </div>
               </div>
 
               <div>
-                <label className="block text-xs text-[#B8AAA0] mb-1">
-                  Manifest / Skill Instructions (Inspected by Sandbox)
+                <label className="block text-[11px] text-zinc-400 mb-1">
+                  Requested Permissions (Risky scopes require explicit approval)
+                </label>
+                <div className="grid grid-cols-2 gap-1.5 text-[11px]">
+                  {(
+                    [
+                      'read-project',
+                      'read-catalog',
+                      'propose-commands',
+                      'write-project',
+                      'network-egress',
+                      'destructive-ops',
+                    ] as ExtensionPermissionScope[]
+                  ).map((perm) => {
+                    const checked = extPermissions.includes(perm);
+                    const isRisky = RISKY_EXTENSION_PERMISSIONS.has(perm);
+                    return (
+                      <label
+                        key={perm}
+                        className="flex items-center gap-1.5 p-1.5 rounded bg-zinc-900 border border-zinc-800 cursor-pointer"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={(e) => {
+                            if (e.target.checked) {
+                              setExtPermissions((prev) => [...prev, perm]);
+                            } else {
+                              setExtPermissions((prev) => prev.filter((p) => p !== perm));
+                            }
+                          }}
+                        />
+                        <span className={isRisky ? 'text-amber-300 font-mono' : 'text-zinc-300 font-mono'}>
+                          {perm}
+                        </span>
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-[11px] text-zinc-400 mb-1">
+                  Skill Instructions / Manifest Content (Scanned for prompt injection)
                 </label>
                 <textarea
                   rows={3}
-                  value={extContent}
-                  onChange={(e) => setExtContent(e.target.value)}
-                  className="w-full rounded-lg border border-[#342A24] bg-[#191614] p-2.5 text-xs font-mono text-[#F3EEE8]"
+                  value={extManifestContent}
+                  onChange={(e) => setExtManifestContent(e.target.value)}
+                  placeholder="Paste SKILL.md or package manifest..."
+                  className="w-full p-2 text-xs font-mono bg-zinc-900 border border-zinc-700 rounded text-zinc-100"
                 />
               </div>
 
-              <div className="space-y-1.5 rounded-lg border border-[#342A24] bg-[#191614] p-3 text-xs">
-                <div className="font-semibold text-[#F3EEE8]">
-                  Permission Scope & Risky Operation Gate
-                </div>
-                <label className="flex items-center gap-2 text-[#B8AAA0]">
-                  <input
-                    type="checkbox"
-                    checked={extReqWrite}
-                    onChange={(e) => setExtReqWrite(e.target.checked)}
-                  />
-                  <span>Request write-project permission (Risky — requires approval)</span>
-                </label>
-                <label className="flex items-center gap-2 text-[#B8AAA0]">
-                  <input
-                    type="checkbox"
-                    checked={extReqNetwork}
-                    onChange={(e) => setExtReqNetwork(e.target.checked)}
-                  />
-                  <span>Request network-egress permission (Risky — requires approval)</span>
-                </label>
-                <label className="flex items-center gap-2 text-[#E4B45A] pt-1">
-                  <input
-                    type="checkbox"
-                    checked={extExplicitApprove}
-                    onChange={(e) => setExtExplicitApprove(e.target.checked)}
-                  />
-                  <span>Grant explicit user approval for requested write/network permissions</span>
-                </label>
-              </div>
-
-              {extError && (
-                <div className="text-xs text-[#F06464] bg-[#F06464]/10 border border-[#F06464]/40 rounded-lg p-2.5">
-                  {extError}
-                </div>
-              )}
+              <label className="flex items-center gap-2 text-xs text-zinc-300 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={extExplicitApproval}
+                  onChange={(e) => setExtExplicitApproval(e.target.checked)}
+                />
+                Grant explicit user approval for requested write/network permissions
+              </label>
 
               <button
                 type="submit"
-                className="w-full inline-flex items-center justify-center gap-2 px-4 py-2 rounded-lg bg-[#F06424] text-[#080707] font-semibold text-xs hover:bg-[#E05514]"
+                disabled={isMutating}
+                className="w-full py-2 px-4 rounded-lg bg-[#F06424] hover:bg-[#e05617] disabled:opacity-50 text-xs font-bold text-white"
               >
-                <GitBranch className="w-4 h-4" />
-                <span>Inspect in Sandbox & Register Extension</span>
+                Inspect in Sandbox & Register Extension
               </button>
             </form>
-          </div>
 
-          {/* Registered Extensions List */}
-          <div className="lg:col-span-7 space-y-4">
-            {extensions.map((ext) => {
-              const latestRun = ext.validationRuns[0];
-              return (
-                <div
-                  key={ext.id}
-                  className="rounded-xl border border-[#2A231E] bg-[#11100F] p-5 space-y-3"
-                >
-                  <div className="flex flex-wrap items-start justify-between gap-2">
-                    <div>
-                      <div className="flex items-center gap-2">
-                        <span className="text-sm font-bold text-[#F3EEE8]">{ext.name}</span>
-                        <span className="text-xs font-mono text-[#83766D]">
-                          · {ext.kind} · v{ext.version}
-                        </span>
-                      </div>
-                      <div className="text-xs font-mono tabular-nums text-[#B8AAA0] mt-0.5">
-                        Pin: <span className="text-[#F3EEE8]">{ext.commitOrReleasePin}</span> ·
-                        SHA-256: {ext.checksumSha256.slice(0, 12)}… · License: {ext.license}
-                      </div>
-                    </div>
-
-                    <span
-                      className={`text-xs font-mono font-semibold ${
-                        ext.installState === 'installed-enabled'
-                          ? 'text-[#55B98B]'
-                          : ext.installState === 'quarantined'
-                          ? 'text-[#F06464]'
-                          : 'text-[#E4B45A]'
-                      }`}
-                    >
-                      {ext.installState}
-                    </span>
-                  </div>
-
-                  {/* Permission Diff & Sandbox Telemetry */}
-                  <div className="rounded-lg border border-[#2A231E] bg-[#141210] p-3 text-xs space-y-1.5">
+            <div className="lg:col-span-7 space-y-3">
+              {extensions.map((ext) => {
+                const latestRun = ext.validationRuns[0];
+                return (
+                  <div
+                    key={ext.id}
+                    className="bg-[#18191C] border border-zinc-800 rounded-xl p-4 space-y-3"
+                  >
                     <div className="flex flex-wrap items-center justify-between gap-2">
-                      <span className="text-[#B8AAA0]">
-                        Requested Permissions:{' '}
-                        <span className="font-mono text-[#F3EEE8]">
-                          {ext.requestedPermissions.join(', ')}
-                        </span>
-                      </span>
-                      <span className="text-[#B8AAA0]">
-                        Approved:{' '}
-                        <span className="font-mono text-[#55B98B]">
-                          {ext.approvedPermissions.join(', ') || 'none'}
-                        </span>
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs font-bold text-white">{ext.name}</span>
+                          <span className="px-2 py-0.5 text-[10px] font-mono bg-zinc-800 text-zinc-300 rounded">
+                            {ext.kind} · v{ext.version}
+                          </span>
+                          <span className="px-2 py-0.5 text-[10px] font-mono bg-zinc-900 text-zinc-400 border border-zinc-800 rounded">
+                            pin: {ext.commitOrReleasePin}
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-zinc-400 font-mono mt-0.5">
+                          sha256: {ext.checksumSha256.slice(0, 24)}… · License: {ext.license}
+                        </p>
+                      </div>
+
+                      <span
+                        className={`px-2 py-0.5 text-[10px] font-bold uppercase rounded border ${
+                          ext.installState === 'installed-enabled'
+                            ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                            : ext.installState === 'quarantined'
+                            ? 'bg-rose-500/15 text-rose-300 border-rose-500/30'
+                            : 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                        }`}
+                      >
+                        {ext.installState}
                       </span>
                     </div>
-                    {ext.permissionDiff.riskyPermissionsRequested.length > 0 && (
-                      <div className="text-[#E4B45A] font-mono text-[11px]">
-                        Risky Operations Flagged:{' '}
-                        {ext.permissionDiff.riskyPermissionsRequested.join(', ')} (Explicit
-                        Approval: {ext.explicitApprovalGranted ? 'Granted' : 'Pending'})
-                      </div>
-                    )}
-                    {latestRun && (
-                      <div className="text-[11px] font-mono tabular-nums text-[#83766D]">
-                        Sandbox: scope={latestRun.isolatedFilesystemScope} · CPU=
-                        {latestRun.cpuTimeMs}ms · MemLimit={latestRun.memoryLimitMb}MB ·
-                        SecretsExposed={latestRun.secretsExposedCount} · {latestRun.summary}
-                      </div>
-                    )}
-                  </div>
 
-                  {/* Lifecycle Controls: Approve / Disable / Update / Rollback / Uninstall */}
-                  <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-[#2A231E]">
-                    <div className="flex flex-wrap items-center gap-2">
-                      {!ext.explicitApprovalGranted &&
-                        ext.permissionDiff.riskyPermissionsRequested.length > 0 && (
-                          <button
-                            type="button"
-                            onClick={() => {
-                              const updated = updateExtensionPackage(ext, {
-                                explicitApprovalGranted: true,
-                                installState: 'installed-enabled',
-                              });
-                              setExtensions((prev) =>
-                                prev.map((item) => (item.id === ext.id ? updated : item))
-                              );
-                              onNotify?.(
-                                `Approved permissions and enabled "${ext.name}".`,
-                                'success'
-                              );
-                            }}
-                            className="px-2.5 py-1 rounded bg-[#55B98B] text-[#080707] font-semibold text-xs"
-                          >
-                            Approve & Enable
-                          </button>
+                    {latestRun && (
+                      <div className="p-2.5 rounded bg-zinc-900/80 border border-zinc-800 text-[11px] space-y-1">
+                        <div className="flex items-center justify-between text-zinc-300">
+                          <span className="font-semibold">
+                            Sandbox Run ({latestRun.isolatedFilesystemScope})
+                          </span>
+                          <span className="font-mono text-[10px] text-zinc-400">
+                            CPU {latestRun.cpuTimeMs}ms · Mem {latestRun.memoryLimitMb}MB ·
+                            Secrets Exposed: {latestRun.secretsExposedCount}
+                          </span>
+                        </div>
+                        <p className="text-zinc-400">{latestRun.summary}</p>
+                        {latestRun.flaggedRisks.length > 0 && (
+                          <div className="text-rose-300 font-mono text-[10px] space-y-0.5 pt-1">
+                            {latestRun.flaggedRisks.map((risk, i) => (
+                              <div key={i}>• {risk}</div>
+                            ))}
+                          </div>
                         )}
-                      <button
-                        type="button"
-                        onClick={() => {
-                          const nextState =
-                            ext.installState === 'installed-enabled'
-                              ? 'installed-disabled'
-                              : 'installed-enabled';
-                          const updated = updateExtensionPackage(ext, {
-                            installState: nextState,
-                          });
-                          setExtensions((prev) =>
-                            prev.map((item) => (item.id === ext.id ? updated : item))
-                          );
-                          onNotify?.(`Set "${ext.name}" to ${nextState}.`, 'info');
-                        }}
-                        className="px-2.5 py-1 rounded border border-[#342A24] bg-[#191614] text-xs text-[#F3EEE8]"
-                      >
-                        {ext.installState === 'installed-enabled' ? 'Disable' : 'Enable'}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          const nextVer = `1.${ext.versionHistory.length + 1}.0`;
-                          const updated = updateExtensionPackage(ext, {
-                            version: nextVer,
-                            commitOrReleasePin: `pin-${Date.now().toString(16).slice(-6)}`,
-                          });
-                          setExtensions((prev) =>
-                            prev.map((item) => (item.id === ext.id ? updated : item))
-                          );
-                          onNotify?.(`Updated "${ext.name}" to v${nextVer}.`, 'info');
-                        }}
-                        className="px-2.5 py-1 rounded border border-[#342A24] bg-[#191614] text-xs text-[#F3EEE8]"
-                      >
-                        Simulate Version Update
-                      </button>
-                      {ext.versionHistory.length > 1 && (
+                      </div>
+                    )}
+
+                    <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+                      <div className="flex flex-wrap gap-1">
+                        {ext.requestedPermissions.map((p) => (
+                          <span
+                            key={p}
+                            className={`px-2 py-0.5 text-[10px] font-mono rounded ${
+                              ext.approvedPermissions.includes(p)
+                                ? 'bg-emerald-950/50 text-emerald-300 border border-emerald-500/30'
+                                : 'bg-amber-950/50 text-amber-300 border border-amber-500/30'
+                            }`}
+                          >
+                            {p} ({ext.approvedPermissions.includes(p) ? 'approved' : 'pending'})
+                          </span>
+                        ))}
+                      </div>
+
+                      <div className="flex items-center gap-1.5">
+                        {ext.permissionDiff.requiresExplicitApproval &&
+                          !ext.explicitApprovalGranted && (
+                            <button
+                              type="button"
+                              disabled={isMutating}
+                              onClick={() => void handleApproveExtensionPermissions(ext)}
+                              className="px-2.5 py-1 rounded bg-amber-600 hover:bg-amber-500 text-[11px] font-semibold text-white disabled:opacity-50"
+                            >
+                              Approve Risky Scope
+                            </button>
+                          )}
                         <button
                           type="button"
-                          onClick={() => {
-                            const rolled = rollbackExtensionPackage(ext);
-                            setExtensions((prev) =>
-                              prev.map((item) => (item.id === ext.id ? rolled : item))
-                            );
-                            onNotify?.(
-                              `Rolled back "${ext.name}" to v${rolled.version} (${rolled.commitOrReleasePin}).`,
-                              'warning'
-                            );
-                          }}
-                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded border border-[#E4B45A]/50 bg-[#E4B45A]/10 text-xs text-[#E4B45A]"
+                          disabled={isMutating}
+                          onClick={() => void handleToggleExtensionState(ext)}
+                          className="px-2.5 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-[11px] text-zinc-200 disabled:opacity-50"
                         >
-                          <RotateCcw className="w-3 h-3" />
-                          <span>Rollback</span>
+                          {ext.installState === 'installed-enabled' ? 'Disable' : 'Enable'}
                         </button>
-                      )}
+                        <button
+                          type="button"
+                          disabled={isMutating}
+                          onClick={() => void handleSimulateExtensionUpdate(ext)}
+                          className="px-2.5 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-[11px] text-zinc-200 disabled:opacity-50"
+                        >
+                          Update Pin
+                        </button>
+                        {ext.versionHistory.length > 1 && (
+                          <button
+                            type="button"
+                            disabled={isMutating}
+                            onClick={() => void handleRollbackExtension(ext)}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-[11px] text-amber-300 disabled:opacity-50"
+                          >
+                            <RotateCcw className="w-3 h-3" /> Rollback
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          disabled={isMutating}
+                          onClick={() => void handleUninstallExtension(ext.id)}
+                          className="px-2.5 py-1 rounded bg-rose-950/60 hover:bg-rose-900 text-[11px] text-rose-200 disabled:opacity-50"
+                        >
+                          Uninstall
+                        </button>
+                      </div>
                     </div>
-
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setExtensions((prev) => prev.filter((item) => item.id !== ext.id));
-                        onNotify?.(`Uninstalled extension "${ext.name}".`, 'info');
-                      }}
-                      className="inline-flex items-center gap-1 text-xs text-[#F06464] hover:underline"
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                      <span>Uninstall</span>
-                    </button>
                   </div>
-                </div>
-              );
-            })}
+                );
+              })}
+            </div>
           </div>
-        </div>
-      )}
+        )}
 
-      {/* TAB 5: TYPED TOOL REGISTRY */}
-      {activeTab === 'tool-registry' && (
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-          {/* Tool List & Schemas */}
-          <div className="lg:col-span-7 space-y-3">
-            {REGISTERED_AI_TOOLS.map((tool) => {
-              const isSelected = tool.id === selectedToolId;
-              return (
-                <div
-                  key={tool.id}
-                  onClick={() => {
-                    setSelectedToolId(tool.id);
-                    if (tool.id === 'project.inspect_state') {
-                      setToolInputJson(
-                        JSON.stringify({ projectId: 'proj_canonical_01' }, null, 2)
-                      );
-                    } else if (tool.id === 'script.analyze_coverage') {
-                      setToolInputJson(
-                        JSON.stringify(
-                          {
-                            scriptText:
-                              'Scene 1: Hook opener. Scene 2: Live mobile canvas demo.',
-                          },
-                          null,
-                          2
-                        )
-                      );
-                    } else if (tool.id === 'catalog.search_templates') {
-                      setToolInputJson(
-                        JSON.stringify({ query: 'kinetic', moduleId: 'text-animation' }, null, 2)
-                      );
-                    } else if (tool.id === 'timeline.execute_command') {
-                      setToolInputJson(
-                        JSON.stringify(
-                          {
-                            projectId: 'proj_canonical_01',
-                            commandType: 'update-text',
-                            textValue: 'SOWVEIL VERIFIED TITLE',
-                          },
-                          null,
-                          2
-                        )
-                      );
-                    } else if (tool.id === 'project.delete_track_or_clip') {
-                      setToolInputJson(
-                        JSON.stringify(
-                          {
-                            projectId: 'proj_canonical_01',
-                            targetClipId: 'clip_01',
-                            userApprovalToken: 'MISSING_TOKEN',
-                          },
-                          null,
-                          2
-                        )
-                      );
-                    }
-                  }}
-                  className={`rounded-xl border p-4 cursor-pointer transition-colors space-y-2 ${
-                    isSelected
-                      ? 'border-[#F06424] bg-[#191614]'
-                      : 'border-[#2A231E] bg-[#11100F] hover:border-[#83766D]'
-                  }`}
-                >
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div className="flex items-center gap-2">
-                      <Code2 className="w-4 h-4 text-[#F06424]" />
-                      <span className="text-sm font-mono font-bold text-[#F3EEE8]">
-                        {tool.id}
-                      </span>
-                    </div>
-                    <span className="text-xs font-mono text-[#B8AAA0]">
-                      {tool.sideEffectClassification} · timeout {tool.timeoutMs}ms · dryRun:{' '}
-                      {tool.supportsDryRun ? 'Yes' : 'No'}
-                    </span>
-                  </div>
-                  <p className="text-xs text-[#B8AAA0]">{tool.description}</p>
-                  <div className="text-[11px] font-mono text-[#83766D]">
-                    Permissions: {tool.requiredPermissionScope.join(', ')} · Required Inputs:{' '}
-                    {tool.inputSchema.required.join(', ')}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-
-          {/* Policy Enforcement & Dry-Run Console */}
-          <div className="lg:col-span-5 rounded-xl border border-[#2A231E] bg-[#11100F] p-5 space-y-4">
-            <div className="flex items-center justify-between">
-              <h2 className="text-sm font-bold text-[#F3EEE8]">
-                Server-Side Tool Policy Enforcement Console
+        {/* TAB 5: TYPED AI TOOL REGISTRY */}
+        {activeTab === 'tool-registry' && (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+            <div className="lg:col-span-6 space-y-3">
+              <h2 className="text-xs font-bold uppercase tracking-wider text-zinc-300">
+                Registered Server-Enforced AI Tools ({REGISTERED_AI_TOOLS.length})
               </h2>
-              <Terminal className="w-4 h-4 text-[#F06424]" />
-            </div>
+              <p className="text-xs text-zinc-400">
+                Models never receive direct database or filesystem access. Every tool invocation
+                validates input schema, project ownership, permission scope, and destructive
+                approval tokens on the server.
+              </p>
 
-            <div className="space-y-2">
-              <div className="flex items-center justify-between text-xs">
-                <span className="font-mono text-[#F3EEE8]">{selectedToolId}</span>
-                <label className="inline-flex items-center gap-1.5 text-[#B8AAA0]">
-                  <input
-                    type="checkbox"
-                    checked={toolDryRun}
-                    onChange={(e) => setToolDryRun(e.target.checked)}
-                  />
-                  <span>Dry-Run Mode</span>
-                </label>
-              </div>
-              <textarea
-                rows={5}
-                value={toolInputJson}
-                onChange={(e) => setToolInputJson(e.target.value)}
-                className="w-full rounded-lg border border-[#342A24] bg-[#0B0A09] p-3 text-xs font-mono text-[#F3EEE8]"
-              />
-            </div>
-
-            <div className="flex flex-wrap items-center gap-2">
-              <button
-                type="button"
-                onClick={() => handleInvokeTool()}
-                className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg bg-[#F06424] text-[#080707] font-semibold text-xs hover:bg-[#E05514]"
-              >
-                <Play className="w-3.5 h-3.5" />
-                <span>Invoke Selected Tool</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => handleInvokeTool('db.rawSqlQuery_UNREGISTERED')}
-                className="px-3 py-2 rounded-lg border border-[#F06464]/50 bg-[#F06464]/10 text-xs font-semibold text-[#F06464]"
-              >
-                Test Unregistered DB Tool Block
-              </button>
-            </div>
-
-            {lastToolResponse && (
-              <div className="rounded-lg border border-[#342A24] bg-[#0B0A09] p-3 space-y-1.5">
-                <div className="text-xs font-semibold text-[#B8AAA0]">
-                  Policy Enforcement Output
-                </div>
-                <pre className="text-[11px] font-mono text-[#F3EEE8] overflow-x-auto">
-                  {JSON.stringify(lastToolResponse, null, 2)}
-                </pre>
-              </div>
-            )}
-
-            {toolAuditLog.length > 0 && (
-              <div className="space-y-2 pt-2 border-t border-[#2A231E]">
-                <div className="text-xs font-semibold text-[#B8AAA0]">
-                  Append-Only Tool Execution Audit Trail ({toolAuditLog.length})
-                </div>
-                <div className="space-y-1.5 max-h-48 overflow-y-auto">
-                  {toolAuditLog.map((rec) => (
+              <div className="space-y-2.5">
+                {REGISTERED_AI_TOOLS.map((tool) => {
+                  const selected = selectedToolId === tool.id;
+                  return (
                     <div
-                      key={rec.id}
-                      className="rounded border border-[#2A231E] bg-[#141210] p-2 text-[11px] font-mono flex items-center justify-between gap-2"
+                      key={tool.id}
+                      onClick={() => setSelectedToolId(tool.id)}
+                      className={`p-3 rounded-lg border cursor-pointer transition-colors ${
+                        selected
+                          ? 'bg-zinc-900 border-[#F06424]'
+                          : 'bg-[#18191C] border-zinc-800 hover:border-zinc-700'
+                      }`}
                     >
-                      <span className="text-[#F3EEE8]">{rec.toolId}</span>
-                      <span
-                        className={
-                          rec.status === 'allowed' ? 'text-[#55B98B]' : 'text-[#F06464]'
-                        }
-                      >
-                        {rec.status.toUpperCase()} ({rec.durationMs}ms)
-                      </span>
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs font-mono font-bold text-white">
+                          {tool.id}
+                        </span>
+                        <span
+                          className={`px-2 py-0.5 text-[10px] font-mono rounded ${
+                            tool.sideEffectClassification === 'destructive-gated'
+                              ? 'bg-rose-500/15 text-rose-300 border border-rose-500/30'
+                              : tool.sideEffectClassification === 'reversible-mutation'
+                              ? 'bg-amber-500/15 text-amber-300 border border-amber-500/30'
+                              : 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30'
+                          }`}
+                        >
+                          {tool.sideEffectClassification}
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-zinc-400 mt-1">{tool.description}</p>
+                      <div className="mt-2 flex flex-wrap gap-1.5 text-[10px] font-mono text-zinc-400">
+                        <span>perms: [{tool.requiredPermissionScope.join(', ')}]</span>
+                        <span>·</span>
+                        <span>timeout: {tool.timeoutMs}ms</span>
+                      </div>
                     </div>
-                  ))}
-                </div>
+                  );
+                })}
               </div>
-            )}
+            </div>
+
+            <div className="lg:col-span-6 space-y-4">
+              <form
+                onSubmit={handleInvokeTool}
+                className="bg-[#18191C] border border-zinc-800 rounded-xl p-4 space-y-3"
+              >
+                <div className="flex items-center justify-between">
+                  <h3 className="text-xs font-bold uppercase tracking-wider text-white flex items-center gap-1.5">
+                    <Terminal className="w-3.5 h-3.5 text-[#F06424]" />
+                    Policy-Enforced Tool Sandbox Runner
+                  </h3>
+                  <label className="inline-flex items-center gap-1.5 text-xs text-emerald-300 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={toolDryRun}
+                      onChange={(e) => setToolDryRun(e.target.checked)}
+                    />
+                    Dry-Run Mode
+                  </label>
+                </div>
+
+                <div className="text-xs font-mono text-[#F06424]">
+                  Selected Tool: {selectedToolId}
+                </div>
+
+                {selectedToolId === 'script.analyze_coverage' ? (
+                  <div>
+                    <label className="block text-[11px] text-zinc-400 mb-1">
+                      Script Text Input
+                    </label>
+                    <textarea
+                      rows={3}
+                      value={toolScriptText}
+                      onChange={(e) => setToolScriptText(e.target.value)}
+                      className="w-full p-2 text-xs bg-zinc-900 border border-zinc-700 rounded text-zinc-100"
+                    />
+                  </div>
+                ) : selectedToolId === 'catalog.search_templates' ? (
+                  <div>
+                    <label className="block text-[11px] text-zinc-400 mb-1">
+                      Catalog Search Query
+                    </label>
+                    <input
+                      type="text"
+                      value={toolCatalogQuery}
+                      onChange={(e) => setToolCatalogQuery(e.target.value)}
+                      className="w-full px-2.5 py-1.5 text-xs bg-zinc-900 border border-zinc-700 rounded text-zinc-100"
+                    />
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <label className="block text-[11px] text-zinc-400 mb-1">Project ID</label>
+                      <input
+                        type="text"
+                        value={toolProjectId}
+                        onChange={(e) => setToolProjectId(e.target.value)}
+                        className="w-full px-2.5 py-1.5 text-xs font-mono bg-zinc-900 border border-zinc-700 rounded text-zinc-100"
+                      />
+                    </div>
+                    {selectedToolId === 'timeline.execute_command' && (
+                      <div>
+                        <label className="block text-[11px] text-zinc-400 mb-1">
+                          Text Layer Value
+                        </label>
+                        <input
+                          type="text"
+                          value={toolTextValue}
+                          onChange={(e) => setToolTextValue(e.target.value)}
+                          className="w-full px-2.5 py-1.5 text-xs bg-zinc-900 border border-zinc-700 rounded text-zinc-100"
+                        />
+                      </div>
+                    )}
+                    {selectedToolId === 'project.delete_track_or_clip' && (
+                      <div>
+                        <label className="block text-[11px] text-zinc-400 mb-1">
+                          Destructive Approval Token
+                        </label>
+                        <input
+                          type="text"
+                          value={toolApprovalToken}
+                          onChange={(e) => setToolApprovalToken(e.target.value)}
+                          placeholder="CONFIRM_DESTRUCTIVE_DELETE"
+                          className="w-full px-2.5 py-1.5 text-xs font-mono bg-zinc-900 border border-zinc-700 rounded text-zinc-100"
+                        />
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                <button
+                  type="submit"
+                  disabled={isMutating}
+                  className="w-full py-2 px-4 rounded-lg bg-[#F06424] hover:bg-[#e05617] disabled:opacity-50 text-xs font-bold text-white"
+                >
+                  Invoke Tool via Server Policy Gate
+                </button>
+              </form>
+
+              {lastToolResult && (
+                <div className="bg-zinc-950 border border-zinc-800 rounded-xl p-3 space-y-1.5">
+                  <div className="text-[11px] font-semibold text-zinc-300">
+                    Structured Tool Output / Policy Decision
+                  </div>
+                  <pre className="text-[10px] font-mono text-zinc-300 overflow-x-auto">
+                    {JSON.stringify(lastToolResult, null, 2)}
+                  </pre>
+                </div>
+              )}
+
+              {toolAudits.length > 0 && (
+                <div className="bg-[#18191C] border border-zinc-800 rounded-xl p-3 space-y-2">
+                  <div className="text-xs font-bold text-zinc-300">
+                    Tool Execution Audit Trail ({toolAudits.length})
+                  </div>
+                  <div className="space-y-1.5 max-h-48 overflow-y-auto">
+                    {toolAudits.map((aud) => (
+                      <div
+                        key={aud.id}
+                        className="p-2 rounded bg-zinc-900 border border-zinc-800 text-[10px] font-mono flex items-center justify-between gap-2"
+                      >
+                        <div>
+                          <span className="text-zinc-200 font-bold">{aud.toolId}</span>{' '}
+                          <span className="text-zinc-500">
+                            ({aud.dryRun ? 'dry-run' : 'live'})
+                          </span>
+                          <div className="text-zinc-400 truncate max-w-xs">
+                            {aud.redactedOutputSummary}
+                          </div>
+                        </div>
+                        <span
+                          className={`px-1.5 py-0.5 rounded ${
+                            aud.status === 'allowed'
+                              ? 'bg-emerald-500/15 text-emerald-300'
+                              : 'bg-rose-500/15 text-rose-300'
+                          }`}
+                        >
+                          {aud.status}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
-        </div>
-      )}
+        )}
+      </main>
     </div>
   );
 };
