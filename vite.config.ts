@@ -52,6 +52,7 @@ export default defineConfig(() => {
           ],
         },
         workbox: {
+          maximumFileSizeToCacheInBytes: 5 * 1024 * 1024,
           globPatterns: ['**/*.{js,css,html,ico,png,svg,woff2}'],
           navigateFallback: '/index.html',
           navigateFallbackDenylist: [/^\/api\//, /^\/admin/, /^\/technical/],
@@ -85,14 +86,24 @@ export default defineConfig(() => {
               },
             },
             {
-              // Cache safe public catalog entries; exclude private projects, exports, tokens, and admin endpoints
-              urlPattern: ({ url, request }) =>
-                request.method === 'GET' &&
-                url.pathname === '/api/v1/catalog' &&
-                !url.searchParams.has('includeDrafts'),
+              // Cache ONLY explicitly unauthenticated, public published-catalog GET requests.
+              // Strictly reject any request with an Authorization header.
+              // Strictly require visibility to be absent or explicitly 'published'.
+              // Reject all visibility=all, draft, archived, and admin requests.
+              urlPattern: ({ url, request }) => {
+                if (request.method !== 'GET') return false;
+                if (url.pathname !== '/api/v1/catalog') return false;
+                // Exclude any authenticated requests
+                if (request.headers && request.headers.has('authorization')) return false;
+                // Exclude any draft, archived, or all requests
+                const visibility = url.searchParams.get('visibility');
+                if (visibility && visibility !== 'published') return false;
+                if (url.searchParams.has('includeDrafts')) return false;
+                return true;
+              },
               handler: 'StaleWhileRevalidate',
               options: {
-                cacheName: 'sowveil-public-catalog-cache',
+                cacheName: 'sowveil-public-catalog-v2',
                 expiration: {
                   maxEntries: 50,
                   maxAgeSeconds: 60 * 10, // 10 minutes
@@ -103,6 +114,7 @@ export default defineConfig(() => {
               },
             },
           ],
+          cleanupOutdatedCaches: true,
         },
         devOptions: {
           enabled: true,

@@ -71,6 +71,10 @@ export const ModuleStrip: React.FC<ModuleStripProps> = ({
     const IconComp = ICON_MAP[mod.icon] || LayoutGrid;
     const isActive = mod.id === activeModuleId;
     const actualCount = itemCountsByModule[mod.id];
+    const displayCount =
+      isActive && mod.referenceReportedCount !== undefined
+        ? mod.referenceReportedCount
+        : actualCount;
 
     return (
       <button
@@ -78,23 +82,46 @@ export const ModuleStrip: React.FC<ModuleStripProps> = ({
         type="button"
         onClick={() => onSelectModule(mod.id)}
         aria-pressed={isActive}
-        className={`flex items-center justify-between gap-2 px-3 py-2 rounded-lg text-xs font-medium transition-colors whitespace-nowrap shrink-0 border ${
+        title={
+          mod.referenceReportedCount !== undefined
+            ? `${mod.label} — Stored: ${actualCount ?? 0} records (Reference video badge: ${mod.referenceReportedCount})`
+            : `${mod.label} — ${actualCount ?? 0} records`
+        }
+        className={`flex items-center justify-between gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all whitespace-nowrap shrink-0 border ${
           isActive
-            ? 'bg-[#F06424] text-[#080707] border-[#F06424] font-semibold'
-            : 'bg-[#191614] text-[#B8AAA0] border-[#342A24] hover:text-[#F3EEE8] hover:border-[#83766D]'
+            ? 'bg-[#F06424] text-[#080707] border-[#F06424] font-bold shadow-[0_0_14px_rgba(240,100,36,0.3)]'
+            : 'bg-[#141210] text-[#B8AAA0] border-[#26201C] hover:text-[#F3EEE8] hover:border-[#83766D] hover:bg-[#191614]'
         }`}
       >
         <span className="flex items-center gap-1.5 min-w-0">
-          <IconComp className="w-3.5 h-3.5 shrink-0" />
+          {mod.id === 'text-animation' ? (
+            <span
+              className={`font-serif font-bold text-xs leading-none shrink-0 ${
+                isActive ? 'text-[#080707]' : 'text-[#B8AAA0]'
+              }`}
+            >
+              T
+            </span>
+          ) : mod.id === 'expressions' ? (
+            <span
+              className={`font-mono-tabular font-bold text-[11px] leading-none shrink-0 ${
+                isActive ? 'text-[#080707]' : 'text-[#B8AAA0]'
+              }`}
+            >
+              fx
+            </span>
+          ) : (
+            <IconComp className="w-3.5 h-3.5 shrink-0" />
+          )}
           <span className="truncate">{mod.label}</span>
         </span>
-        {actualCount !== undefined && (
+        {displayCount !== undefined && (
           <span
             className={`font-mono-tabular text-[11px] ${
-              isActive ? 'text-[#080707]/80' : 'text-[#83766D]'
+              isActive ? 'text-[#080707]/85 font-semibold' : 'text-[#83766D]'
             }`}
           >
-            {actualCount}
+            {displayCount}
           </span>
         )}
       </button>
@@ -105,7 +132,7 @@ export const ModuleStrip: React.FC<ModuleStripProps> = ({
     <>
       <nav
         aria-label="Sowveil 20-Module Selector"
-        className="w-full border-b border-[#342A24] bg-[#11100F] px-3 sm:px-4 py-2 sm:py-2.5"
+        className="w-full border-b border-[#2A231E] bg-[#0E0D0C] px-3 sm:px-4 py-2"
       >
         {/* Mobile Portrait Strip (< lg): Horizontal touch carousel + All 20 Modules Sheet Trigger */}
         <div className="flex lg:hidden items-center gap-2">

@@ -434,17 +434,95 @@ export function generateSanitizedVectorSvg(params: {
 }
 
 /**
- * 3. Valid PNG Still Graphic (.png) with IHDR, IDAT (zlib stored block), and IEND chunks
+ * Encodes arbitrary binary raw scanline data into an RFC 1950/1951 compliant zlib stored stream
+ * supporting any dimension (from 64x64 up to 1080x1920) across multi-block DEFLATE chunks.
  */
-export function generateValidPngStillBytes(params: {
-  aspectRatio: MobileAspectRatio;
+export function encodeZlibStoredStream(data: Uint8Array): Uint8Array {
+  const BLOCK_SIZE = 32768;
+  const numBlocks = Math.ceil(data.length / BLOCK_SIZE) || 1;
+  const totalLength = 2 + numBlocks * 5 + data.length + 4;
+  const zlibData = new Uint8Array(totalLength);
+
+  zlibData[0] = 0x78; // CMF
+  zlibData[1] = 0x01; // FLG
+  let outPtr = 2;
+  let inPtr = 0;
+
+  for (let b = 0; b < numBlocks; b++) {
+    const isLast = b === numBlocks - 1;
+    const remaining = data.length - inPtr;
+    const blockSize = Math.min(BLOCK_SIZE, remaining);
+    const nlen = ~blockSize & 0xffff;
+
+    zlibData[outPtr++] = isLast ? 0x01 : 0x00; // BFINAL, BTYPE=00 (stored)
+    zlibData[outPtr++] = blockSize & 0xff;
+    zlibData[outPtr++] = (blockSize >>> 8) & 0xff;
+    zlibData[outPtr++] = nlen & 0xff;
+    zlibData[outPtr++] = (nlen >>> 8) & 0xff;
+
+    zlibData.set(data.subarray(inPtr, inPtr + blockSize), outPtr);
+    outPtr += blockSize;
+    inPtr += blockSize;
+  }
+
+  // Adler-32 checksum
+  let s1 = 1;
+  let s2 = 0;
+  for (let i = 0; i < data.length; i++) {
+    s1 = (s1 + data[i]) % 65521;
+    s2 = (s2 + s1) % 65521;
+  }
+  const adler32 = ((s2 << 16) | s1) >>> 0;
+  const dv = new DataView(zlibData.buffer, outPtr, 4);
+  dv.setUint32(0, adler32, false);
+
+  return zlibData;
+}
+
+function makePngChunk(typeAscii: string, data: Uint8Array): Uint8Array {
+  const chunk = new Uint8Array(4 + 4 + data.length + 4);
+  const dv = new DataView(chunk.buffer);
+  dv.setUint32(0, data.length, false);
+  for (let i = 0; i < 4; i++) {
+    chunk[4 + i] = typeAscii.charCodeAt(i);
+  }
+  chunk.set(data, 8);
+  const crc = computeCrc32(chunk.subarray(4, 8 + data.length));
+  dv.setUint32(8 + data.length, crc, false);
+  return chunk;
+}
+
+/**
+ * Generates a compact, 100% standards-compliant 64x64 RGBA PNG preview thumbnail.
+ */
+export function generatePngPreviewThumbnail(params: {
   backgroundMode?: BackgroundAlphaMode;
   accentHex?: string;
 }): Uint8Array {
-  // Generate a compact, 100% standards-compliant 64x64 RGBA PNG preview/still plate
-  // so mobile editors and unit tests receive genuine PNG bytes with verified CRC32 & Adler32.
-  const width = 64;
-  const height = 64;
+  return renderPngStillPlate({
+    aspectRatio: '1:1',
+    width: 64,
+    height: 64,
+    backgroundMode: params.backgroundMode,
+    accentHex: params.accentHex,
+  });
+}
+
+/**
+ * 3. Valid Full-Size PNG Still Graphic (.png) with IHDR, IDAT, and IEND chunks.
+ * Accurately honors the selected composition aspect ratio (9:16, 1:1, 16:9).
+ */
+export function renderPngStillPlate(params: {
+  aspectRatio: MobileAspectRatio;
+  backgroundMode?: BackgroundAlphaMode;
+  accentHex?: string;
+  width?: number;
+  height?: number;
+  customValues?: Record<string, string | number | boolean>;
+}): Uint8Array {
+  const dims = getDimensionsForAspectRatio(params.aspectRatio);
+  const width = params.width ?? dims.width;
+  const height = params.height ?? dims.height;
   const mode = params.backgroundMode ?? 'solid';
   const hex = (params.accentHex || '#F06424').replace('#', '');
   const ar = parseInt(hex.slice(0, 2) || 'f0', 16) || 240;
@@ -454,15 +532,22 @@ export function generateValidPngStillBytes(params: {
   // Each scanline has 1 filter byte (0) + width * 4 RGBA bytes
   const rawScanlines = new Uint8Array(height * (1 + width * 4));
   let ptr = 0;
+
+  const borderWidth = Math.max(2, Math.round(width * 0.02));
+  const borderYMin = Math.round(height * 0.08);
+  const borderYMax = Math.round(height * 0.92);
+  const borderXMin = Math.round(width * 0.08);
+  const borderXMax = Math.round(width * 0.92);
+
   for (let y = 0; y < height; y++) {
     rawScanlines[ptr++] = 0; // Filter type 0 (None)
-    for (let x = 0; x < width; x++) {
-      const isBorder =
-        (x >= 8 && x <= 55 && (y === 8 || y === 55)) ||
-        (y >= 8 && y <= 55 && (x === 8 || x === 55));
-      const isCenterBadge = x >= 20 && x <= 43 && y >= 24 && y <= 39;
+    const isYBorder = (y >= borderYMin && y <= borderYMin + borderWidth) || (y >= borderYMax - borderWidth && y <= borderYMax);
 
-      if (isBorder || isCenterBadge) {
+    for (let x = 0; x < width; x++) {
+      const isXBorder = (x >= borderXMin && x <= borderXMin + borderWidth) || (x >= borderXMax - borderWidth && x <= borderXMax);
+      const isBorder = (isYBorder && x >= borderXMin && x <= borderXMax) || (isXBorder && y >= borderYMin && y <= borderYMax);
+
+      if (isBorder) {
         rawScanlines[ptr++] = ar;
         rawScanlines[ptr++] = ag;
         rawScanlines[ptr++] = ab;
@@ -486,42 +571,7 @@ export function generateValidPngStillBytes(params: {
     }
   }
 
-  // Adler-32 checksum for zlib wrapper
-  let s1 = 1;
-  let s2 = 0;
-  for (let i = 0; i < rawScanlines.length; i++) {
-    s1 = (s1 + rawScanlines[i]) % 65521;
-    s2 = (s2 + s1) % 65521;
-  }
-  const adler32 = ((s2 << 16) | s1) >>> 0;
-
-  // Zlib stream with uncompressed DEFLATE block (len <= 65535)
-  const len = rawScanlines.length;
-  const nlen = ~len & 0xffff;
-  const zlibData = new Uint8Array(2 + 5 + len + 4);
-  zlibData[0] = 0x78; // CMF
-  zlibData[1] = 0x01; // FLG
-  zlibData[2] = 0x01; // BFINAL=1, BTYPE=00 (stored)
-  zlibData[3] = len & 0xff;
-  zlibData[4] = (len >>> 8) & 0xff;
-  zlibData[5] = nlen & 0xff;
-  zlibData[6] = (nlen >>> 8) & 0xff;
-  zlibData.set(rawScanlines, 7);
-  const adlerView = new DataView(zlibData.buffer, 7 + len, 4);
-  adlerView.setUint32(0, adler32, false);
-
-  function makePngChunk(typeAscii: string, data: Uint8Array): Uint8Array {
-    const chunk = new Uint8Array(4 + 4 + data.length + 4);
-    const dv = new DataView(chunk.buffer);
-    dv.setUint32(0, data.length, false);
-    for (let i = 0; i < 4; i++) {
-      chunk[4 + i] = typeAscii.charCodeAt(i);
-    }
-    chunk.set(data, 8);
-    const crc = computeCrc32(chunk.subarray(4, 8 + data.length));
-    dv.setUint32(8 + data.length, crc, false);
-    return chunk;
-  }
+  const zlibData = encodeZlibStoredStream(rawScanlines);
 
   const ihdrData = new Uint8Array(13);
   const ihdrView = new DataView(ihdrData.buffer);
@@ -553,21 +603,38 @@ export function generateValidPngStillBytes(params: {
   return out;
 }
 
-export function validatePngBytes(bytes: Uint8Array): { valid: boolean; reason: string } {
+export function generateValidPngStillBytes(params: {
+  aspectRatio: MobileAspectRatio;
+  backgroundMode?: BackgroundAlphaMode;
+  accentHex?: string;
+  width?: number;
+  height?: number;
+}): Uint8Array {
+  return renderPngStillPlate(params);
+}
+
+export function validatePngBytes(bytes: Uint8Array): {
+  valid: boolean;
+  width?: number;
+  height?: number;
+  reason: string;
+} {
   if (bytes.byteLength < 33) {
     return { valid: false, reason: 'PNG buffer is smaller than minimum header length.' };
   }
   const sig = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
-  for (let i = 0; i < sig.length; i++) {
+  for (let i = 0; i < 8; i++) {
     if (bytes[i] !== sig[i]) {
-      return { valid: false, reason: 'Missing PNG 8-byte signature header.' };
+      return { valid: false, reason: 'Invalid PNG magic bytes signature.' };
     }
   }
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const width = view.getUint32(16, false);
-  const height = view.getUint32(20, false);
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const width = dv.getUint32(16, false);
+  const height = dv.getUint32(20, false);
   return {
     valid: width > 0 && height > 0,
+    width,
+    height,
     reason: `Verified RGBA PNG image (${width}×${height}, ${bytes.byteLength} bytes).`,
   };
 }

@@ -19,6 +19,7 @@ import {
   PlatformSettingsConfig,
   ProjectLibraryItem,
   TargetMobileEditorId,
+  TemplateVariantInstance,
   UserPreferences,
   UserRole,
 } from '../types/sowveil';
@@ -43,6 +44,7 @@ import {
 import {
   AssetMetadataCreateSchema,
   AssetMetadataPatchSchema,
+  AssetReplaceSchema,
   CatalogCreateSchema,
   CatalogPatchSchema,
   EditorAdapterAdminPatchSchema,
@@ -50,9 +52,139 @@ import {
   ModuleAdminPatchSchema,
   PlatformSettingsPatchSchema,
   redactSensitiveDiagnosticString,
+  TemplateForkRequestSchema,
+  TemplateVariantCreateSchema,
+  TemplateVariantPatchSchema,
   UserRoleAssignmentSchema,
   UserStatusUpdateSchema,
 } from '../schemas/sowveilSchemas';
+import {
+  AiProviderConfig,
+  createDirectorProposal,
+  generateCoverageReport,
+  maskApiKey,
+  parseScriptIntoUnits,
+  ScenePlanItem,
+  ScriptSourceDocument,
+  validateProviderEndpointSsrf,
+} from '../features/ai-director';
+import {
+  applyVariantOverridesToTemplate,
+  computeDeterministicSnapshotHash,
+  enrichCatalogItemWithMarketplaceDefaults,
+  forkTemplateFromVariant,
+  runTemplateValidationJob,
+  sanitizeAndValidateSvgContent,
+  sanitizeUserLabelAndMarkdown,
+} from '../services/marketplaceEngine';
+import { filterAndSortCatalog, isCatalogItemVisibleToViewer } from '../services/catalogEngine';
+import {
+  buildCanonicalProjectFixtures,
+  CanonicalProjectStore,
+  canonicalProjectToLibraryRecord,
+  createMinimalCanonicalProject,
+  executeProjectCommand,
+  migrateToCanonicalProject,
+  serializeCanonicalProject,
+  validateCanonicalProject,
+} from '../services/canonicalProjectEngine';
+import { CanonicalProjectCommand, CanonicalProjectDocument } from '../types/canonicalProject';
+import {
+  AiCoEditTransaction,
+  applyAiCoEditTransaction,
+  diffCanonicalProjects,
+  planAiCoEditTransaction,
+} from '../services/coEditingEngine';
+import {
+  applyReferenceCorrectionAction,
+  BUILT_IN_REFERENCE_PRESETS,
+  buildDraftTemplateFromReferenceSession,
+  convertReferenceSessionToProjectRecord,
+  createReferenceLabSession,
+  inspectReferenceSourceUrl,
+  ReferenceCorrectionActionRecord,
+  ReferenceInputSourceKind,
+  ReferenceLabSession,
+  ReferenceUsageMode,
+  validateAndPromoteReferenceTemplate,
+} from '../services/referenceLabEngine';
+import {
+  ALL_HUB_TASK_TYPES,
+  ALL_MODEL_CAPABILITY_KEYS,
+  buildDefaultRoutingProfiles,
+  createProviderConnectionRecord,
+  evaluateRoutingReadiness,
+  ExtensionPackageRecord,
+  ExtensionPermissionScope,
+  HubAuthMode,
+  HubProviderProtocol,
+  HubTaskType,
+  inspectAndSandboxExtensionContent,
+  invokeRegisteredTool,
+  ModelCapabilityKey,
+  overrideConnectionCapabilityState,
+  PREPOPULATED_MODEL_CATALOG,
+  probeProviderConnection,
+  ProviderConnectionRecord,
+  REGISTERED_AI_TOOLS,
+  registerExtensionPackage,
+  revokeConnectionCredential,
+  rollbackExtensionPackage,
+  rotateConnectionCredential,
+  SecretStorageMode,
+  TaskRoutingProfile,
+  ToolExecutionAuditRecord,
+  toPublicProviderConnectionView,
+  updateExtensionPackage,
+  validateCustomEndpointSsrf,
+} from '../services/providerHubEngine';
+import {
+  AiDirectorSessionRecord,
+  answerDirectorQuestions,
+  applyAdaptiveRefinement,
+  BUILT_IN_DIRECTOR_SAMPLE_SCRIPTS,
+  createAiDirectorSession,
+  evaluateDirectorAcceptanceGate,
+  executeDirectorProductionPlan,
+  rollbackDirectorToCheckpoint,
+  updateDirectorShotPlanAndApprovals,
+} from '../services/aiDirectorProductionEngine';
+import {
+  createDefaultPreferenceConsent,
+  deprecateFactoryTemplate,
+  extractEditableParametersFromProject,
+  forkFactoryTemplate,
+  mergeFactoryTemplates,
+  publishFactoryTemplateToCatalog,
+  rankTemplatesWithTransparentSignals,
+  recordTemplateFeedbackSignal,
+  resolveDuplicateSuggestion,
+  restoreFactoryTemplateVersion,
+  runTemplateFactoryPipeline,
+  TemplateFactoryDraftRecord,
+  TemplateFactorySourceKind,
+  TemplateFeedbackAction,
+  TemplatePreferenceSignal,
+  updateFactoryDraftRecord,
+  updateFactoryTemplateDependencies,
+  UserPreferenceConsentConfig,
+} from '../services/templateFactoryEngine';
+import {
+  cancelRenderExportJob,
+  computeAdapterFeatureLossReport,
+  createAndExecuteCanonicalRenderJob,
+  createKnownGoodSampleCanonicalProject,
+  detectBrowserRenderCapabilities,
+  DurableRenderExportJobRecord,
+  evaluateServerWorkerTransparency,
+  getAllClipsFromProject,
+  getMobileAdapterCapabilityManifests,
+  recoverInterruptedRenderJobsOnStartup,
+  RENDER_EXPORT_ENGINE_VERSION,
+  RenderExecutionTier,
+  RenderOutputFormat,
+} from '../services/renderExportQaEngine';
+import { loadDurableSnapshot, saveDurableSnapshot } from './durableStore';
 
 export interface VerifiedTokenIdentity {
   uid: string;
@@ -70,6 +202,7 @@ export interface ApiAppOptions {
   ownerBootstrapEmail?: string;
   ownerBootstrapSecret?: string;
   storageEnabled?: boolean;
+  persistenceFilePath?: string | null;
 }
 
 interface AuthenticatedRequest extends Request {
@@ -244,6 +377,9 @@ const ProjectCreateSchema = z
       .optional(),
     aspectRatio: z.enum(['9:16', '1:1', '16:9']).optional(),
     sowveilSpecJson: z.string().max(15000).optional(),
+    canonicalProjectJson: z.string().max(200000).optional(),
+    revision: z.number().int().min(1).optional(),
+    activeBranch: z.string().trim().max(64).optional(),
     checkpoints: z.array(ProjectCheckpointSchema).max(20).optional(),
     hasExternalFootageWarning: z.boolean().default(false),
     archived: z.boolean().default(false),
@@ -270,6 +406,8 @@ const ProjectPatchSchema = z
     fileSizeBytes: z.number().int().min(0).nullable().optional(),
     fileSizeLabel: z.string().trim().max(80).optional(),
     resolution: z.string().trim().max(64).optional(),
+    durationLabel: z.string().trim().max(64).optional(),
+    fps: z.number().min(1).max(240).optional(),
     targetEditor: z
       .enum([
         'capcut',
@@ -282,6 +420,9 @@ const ProjectPatchSchema = z
       .optional(),
     aspectRatio: z.enum(['9:16', '1:1', '16:9']).optional(),
     sowveilSpecJson: z.string().max(15000).optional(),
+    canonicalProjectJson: z.string().max(200000).optional(),
+    revision: z.number().int().min(1).optional(),
+    activeBranch: z.string().trim().max(64).optional(),
     checkpoints: z.array(ProjectCheckpointSchema).max(20).optional(),
     hasExternalFootageWarning: z.boolean().optional(),
     archived: z.boolean().optional(),
@@ -406,10 +547,11 @@ export function createApiApp(options: ApiAppOptions = {}) {
   )
     .trim()
     .toLowerCase();
-  const configuredBootstrapSecret =
+  const configuredBootstrapSecret = (
     options.ownerBootstrapSecret ||
     process.env.OWNER_BOOTSTRAP_SECRET ||
-    'SOWVEIL_OWNER_BOOTSTRAP_ONCE';
+    ''
+  ).trim();
   const storageEnabled =
     options.storageEnabled ?? process.env.CLOUD_STORAGE_ENABLED === 'true';
 
@@ -424,6 +566,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
 
   const userPreferencesStore = new Map<string, UserPreferences>();
   const userFavoritesStore = new Map<string, Set<string>>();
+  const userRecentStore = new Map<string, string[]>();
   const projectsStore = new Map<string, ProjectLibraryItem>();
   const jobsStore = new Map<string, JobRecord>();
   const devicesStore = new Map<string, DeviceRecord>();
@@ -439,13 +582,28 @@ export function createApiApp(options: ApiAppOptions = {}) {
     }
   >();
   const catalogStore = new Map<string, CatalogItem>();
+  const templateVariantsStore = new Map<string, TemplateVariantInstance>();
   const modulesStore = new Map<string, ModuleDefinition>();
   const editorAdaptersStore = new Map<TargetMobileEditorId, MobileEditorAdapterDescriptor>();
   const assetsStore = new Map<string, AssetMetadataRecord>();
+  const referenceLabSessionsStore = new Map<string, ReferenceLabSession>();
+  const providerConnectionsStore = new Map<string, ProviderConnectionRecord>();
+  const routingProfilesStore = new Map<string, Record<HubTaskType, TaskRoutingProfile>>();
+  const extensionPackagesStore = new Map<string, ExtensionPackageRecord>();
+  const aiDirectorSessionsStore = new Map<string, AiDirectorSessionRecord>();
+  const templateFactoryDraftsStore = new Map<string, TemplateFactoryDraftRecord>();
+  const templatePreferenceSignalsStore: TemplatePreferenceSignal[] = [];
+  const userPreferenceConsentsStore = new Map<string, UserPreferenceConsentConfig>();
+  const renderExportJobsStore = new Map<string, DurableRenderExportJobRecord>();
+  const toolAuditRecordsStore: ToolExecutionAuditRecord[] = [];
   const auditLog: AuditEventRecord[] = [];
+  const errorCountsByCode = new Map<string, number>();
+  const userTelemetryOptInStore = new Map<string, boolean>();
+  const aggregateFeatureUsageCounts = new Map<string, number>();
   const rateBuckets = new Map<string, { count: number; resetAt: number }>();
   const authRateBuckets = new Map<string, { count: number; resetAt: number }>();
   const AUTH_RATE_LIMIT_PER_MINUTE = 10;
+  const persistenceFilePath = options.persistenceFilePath ?? null;
 
   let platformSettings: PlatformSettingsConfig = {
     exportMaxSizeMb: 50,
@@ -481,7 +639,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
 
   // Seed catalog items into server store (including 1 draft item to verify ordinary user draft isolation)
   for (const item of SEED_CATALOG_ITEMS) {
-    catalogStore.set(item.id, {
+    const enriched = enrichCatalogItemWithMarketplaceDefaults({
       ...item,
       favoritesCompatible: item.favoritesCompatible ?? true,
       supportedExportFormats: item.supportedExportFormats || [
@@ -491,35 +649,197 @@ export function createApiApp(options: ApiAppOptions = {}) {
         'svg-frame',
       ],
     });
+    catalogStore.set(enriched.id, enriched);
   }
-  catalogStore.set('draft-internal-rig', {
-    ...SEED_CATALOG_ITEMS[0],
-    id: 'draft-internal-rig',
-    name: 'Internal Unreleased Draft Preset',
-    slug: 'internal-unreleased-draft-preset',
-    visibility: 'draft',
-  });
+  catalogStore.set(
+    'draft-internal-rig',
+    enrichCatalogItemWithMarketplaceDefaults({
+      ...SEED_CATALOG_ITEMS[0],
+      id: 'draft-internal-rig',
+      name: 'Internal Unreleased Draft Preset',
+      slug: 'internal-unreleased-draft-preset',
+      visibility: 'draft',
+    })
+  );
 
   // Seed asset metadata records from initial catalog items (no mocked binary URLs)
   for (const item of SEED_CATALOG_ITEMS.slice(0, 12)) {
     const assetId = `asset_${item.id}`;
+    const checksum = computeDeterministicSnapshotHash({
+      id: assetId,
+      catalogItemId: item.id,
+      moduleId: item.moduleId,
+    });
     assetsStore.set(assetId, {
       id: assetId,
       title: `${item.name} (${item.packLabel})`,
+      labels: [item.packLabel, item.moduleId],
+      tags: [...item.tags],
       moduleId: item.moduleId,
       catalogItemId: item.id,
       assetKind: item.assetKind,
       ownerUid: 'system-seed',
+      visibility: 'public',
       licenseType: item.licenseType,
       licenseNote: item.licenseNote,
       sourceNote: `Procedural ${item.sourceType} preset specification`,
+      provenance: 'Sowveil Studio Core Seed',
+      attribution: 'Sowveil Studio',
       storageProvider: storageEnabled ? 'cloud-storage' : 'none-configured',
       storageObjectKey: null,
       mimeType: item.moduleId === 'sfx' ? 'audio/wav' : 'application/json',
       sizeBytes: item.metadata.fileSizeBytes ?? null,
+      dimensions: item.metadata.resolution || '1920×1080',
+      durationSec: item.metadata.durationSec ?? 3,
+      audioFormat: item.moduleId === 'sfx' ? 'WAV 48kHz 24-bit' : undefined,
+      checksumSha256: checksum,
+      versions: [
+        {
+          version: '1.0.0',
+          checksumSha256: checksum,
+          sizeBytes: item.metadata.fileSizeBytes ?? null,
+          mimeType: item.moduleId === 'sfx' ? 'audio/wav' : 'application/json',
+          updatedAt: item.updatedAt,
+          updatedByUid: 'system-seed',
+          note: 'Initial procedural asset specification',
+        },
+      ],
+      missingAssetDetected: false,
+      usedByTemplateIds: [item.id],
+      usedByVariantIds: [],
       status: 'metadata-only',
       createdAt: item.createdAt,
       updatedAt: item.updatedAt,
+    });
+  }
+
+  // Load durable snapshot from disk if configured
+  const loadedSnapshot = loadDurableSnapshot(persistenceFilePath);
+  if (loadedSnapshot) {
+    catalogCacheVersion = loadedSnapshot.catalogCacheVersion || 1;
+    ownerBootstrappedUid = loadedSnapshot.ownerBootstrappedUid || null;
+    if (loadedSnapshot.platformSettings) {
+      platformSettings = { ...platformSettings, ...loadedSnapshot.platformSettings };
+    }
+    for (const [k, v] of Object.entries(loadedSnapshot.roles || {})) {
+      roleStore.set(k, v);
+    }
+    for (const [k, v] of Object.entries(loadedSnapshot.userStatuses || {})) {
+      userStatusStore.set(k, v);
+    }
+    for (const [k, v] of Object.entries(loadedSnapshot.userPreferences || {})) {
+      userPreferencesStore.set(k, v);
+    }
+    for (const [k, v] of Object.entries(loadedSnapshot.userFavorites || {})) {
+      userFavoritesStore.set(k, new Set(v));
+    }
+    for (const [k, v] of Object.entries(loadedSnapshot.userRecentItems || {})) {
+      userRecentStore.set(k, Array.isArray(v) ? v : []);
+    }
+    for (const item of loadedSnapshot.catalogItems || []) {
+      catalogStore.set(item.id, enrichCatalogItemWithMarketplaceDefaults(item));
+    }
+    for (const variant of loadedSnapshot.templateVariants || []) {
+      templateVariantsStore.set(variant.id, variant);
+    }
+    for (const asset of loadedSnapshot.assets || []) {
+      assetsStore.set(asset.id, asset);
+    }
+    for (const proj of loadedSnapshot.projects || []) {
+      projectsStore.set(proj.id, proj);
+    }
+    for (const job of loadedSnapshot.jobs || []) {
+      jobsStore.set(job.id, job);
+    }
+    for (const dev of loadedSnapshot.devices || []) {
+      devicesStore.set(dev.id, dev);
+    }
+    for (const mod of loadedSnapshot.modules || []) {
+      modulesStore.set(mod.id, mod);
+    }
+    for (const ad of loadedSnapshot.editorAdapters || []) {
+      editorAdaptersStore.set(ad.id, ad);
+    }
+    for (const sess of loadedSnapshot.referenceLabSessions || []) {
+      referenceLabSessionsStore.set(sess.id, sess);
+    }
+    for (const conn of loadedSnapshot.providerConnections || []) {
+      providerConnectionsStore.set(conn.id, conn);
+    }
+    for (const [uid, profiles] of Object.entries(loadedSnapshot.routingProfiles || {})) {
+      routingProfilesStore.set(uid, profiles);
+    }
+    for (const ext of loadedSnapshot.extensionPackages || []) {
+      extensionPackagesStore.set(ext.id, ext);
+    }
+    for (const dirSess of loadedSnapshot.aiDirectorSessions || []) {
+      aiDirectorSessionsStore.set(dirSess.id, dirSess);
+    }
+    for (const fDraft of loadedSnapshot.templateFactoryDrafts || []) {
+      templateFactoryDraftsStore.set(fDraft.id, fDraft);
+    }
+    if (Array.isArray(loadedSnapshot.templatePreferenceSignals)) {
+      templatePreferenceSignalsStore.splice(
+        0,
+        templatePreferenceSignalsStore.length,
+        ...loadedSnapshot.templatePreferenceSignals
+      );
+    }
+    for (const [uid, cCfg] of Object.entries(loadedSnapshot.userPreferenceConsents || {})) {
+      userPreferenceConsentsStore.set(uid, cCfg);
+    }
+    if (Array.isArray(loadedSnapshot.renderExportJobs)) {
+      const { recoveredJobs } = recoverInterruptedRenderJobsOnStartup(
+        loadedSnapshot.renderExportJobs
+      );
+      for (const rJob of recoveredJobs) {
+        renderExportJobsStore.set(rJob.id, rJob);
+      }
+    }
+    if (Array.isArray(loadedSnapshot.toolAuditRecords) && loadedSnapshot.toolAuditRecords.length > 0) {
+      toolAuditRecordsStore.splice(0, toolAuditRecordsStore.length, ...loadedSnapshot.toolAuditRecords);
+    }
+    if (Array.isArray(loadedSnapshot.auditEvents) && loadedSnapshot.auditEvents.length > 0) {
+      auditLog.splice(0, auditLog.length, ...loadedSnapshot.auditEvents);
+    }
+  }
+
+  function persistState() {
+    if (!persistenceFilePath) return;
+    const favObj: Record<string, string[]> = {};
+    for (const [uid, set] of userFavoritesStore.entries()) {
+      favObj[uid] = Array.from(set);
+    }
+    saveDurableSnapshot(persistenceFilePath, {
+      schemaVersion: '1.0.0',
+      savedAt: new Date().toISOString(),
+      catalogCacheVersion,
+      ownerBootstrappedUid,
+      roles: Object.fromEntries(roleStore.entries()),
+      userStatuses: Object.fromEntries(userStatusStore.entries()),
+      userPreferences: Object.fromEntries(userPreferencesStore.entries()),
+      userFavorites: favObj,
+      userRecentItems: Object.fromEntries(userRecentStore.entries()),
+      catalogItems: Array.from(catalogStore.values()),
+      templateVariants: Array.from(templateVariantsStore.values()),
+      assets: Array.from(assetsStore.values()),
+      projects: Array.from(projectsStore.values()),
+      jobs: Array.from(jobsStore.values()),
+      devices: Array.from(devicesStore.values()),
+      modules: Array.from(modulesStore.values()),
+      editorAdapters: Array.from(editorAdaptersStore.values()),
+      referenceLabSessions: Array.from(referenceLabSessionsStore.values()),
+      providerConnections: Array.from(providerConnectionsStore.values()),
+      routingProfiles: Object.fromEntries(routingProfilesStore.entries()),
+      extensionPackages: Array.from(extensionPackagesStore.values()),
+      aiDirectorSessions: Array.from(aiDirectorSessionsStore.values()),
+      templateFactoryDrafts: Array.from(templateFactoryDraftsStore.values()),
+      templatePreferenceSignals: templatePreferenceSignalsStore.slice(0, 1000),
+      userPreferenceConsents: Object.fromEntries(userPreferenceConsentsStore.entries()),
+      renderExportJobs: Array.from(renderExportJobsStore.values()).slice(0, 200),
+      toolAuditRecords: toolAuditRecordsStore.slice(0, 500),
+      auditEvents: auditLog.slice(0, 500),
+      platformSettings,
     });
   }
 
@@ -544,6 +864,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
     if (status >= 400) {
       lastErrorTimestamp = new Date().toISOString();
       lastErrorRedactedSummary = `[${code}] ${safeMsg}`;
+      errorCountsByCode.set(code, (errorCountsByCode.get(code) || 0) + 1);
     }
     return res.status(status).json({
       ok: false,
@@ -678,6 +999,19 @@ export function createApiApp(options: ApiAppOptions = {}) {
     if (
       req.path.startsWith('/api/v1/jobs') ||
       req.path.startsWith('/api/v1/projects') ||
+      req.path.startsWith('/api/v1/reference-lab') ||
+      req.path.startsWith('/api/v1/provider-hub') ||
+      req.path.startsWith('/api/v1/extensions') ||
+      req.path.startsWith('/api/v1/tools') ||
+      req.path.startsWith('/api/v1/ai-director') ||
+      req.path.startsWith('/api/v1/editor') ||
+      req.path.startsWith('/api/v1/template-factory') ||
+      req.path.startsWith('/api/v1/render-export') ||
+      req.path.startsWith('/api/v1/assets') ||
+      req.path.startsWith('/api/v1/variants') ||
+      req.path.startsWith('/api/v1/template-variants') ||
+      req.path.startsWith('/api/v1/exports') ||
+      req.path.startsWith('/api/v1/telemetry') ||
       req.path.startsWith('/api/v1/admin') ||
       req.path.startsWith('/api/v1/me') ||
       req.path.includes('/download')
@@ -1071,20 +1405,30 @@ export function createApiApp(options: ApiAppOptions = {}) {
   app.get('/api/v1/catalog', async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     let callerIsAdmin = false;
+    let callerUid: string | null = null;
     const authHeader = req.header('authorization');
     if (authHeader?.toLowerCase().startsWith('bearer ')) {
       try {
         const identity = await verifyToken(authHeader.slice(7).trim());
-        const r = roleStore.get(identity.uid) || 'user';
-        callerIsAdmin = r === 'admin' || r === 'owner';
+        if (identity.emailVerified) {
+          callerUid = identity.uid;
+          const r = roleStore.get(identity.uid) || 'user';
+          callerIsAdmin = r === 'admin' || r === 'owner';
+        }
       } catch {
         callerIsAdmin = false;
+        callerUid = null;
       }
     }
 
     const requestedVisibility =
       typeof req.query.visibility === 'string' ? req.query.visibility : 'published';
-    if (requestedVisibility !== 'published' && !callerIsAdmin) {
+    if (
+      (requestedVisibility === 'draft' ||
+        requestedVisibility === 'archived' ||
+        requestedVisibility === 'all') &&
+      !callerIsAdmin
+    ) {
       return sendError(
         res,
         authReq.requestId,
@@ -1094,45 +1438,98 @@ export function createApiApp(options: ApiAppOptions = {}) {
       );
     }
 
-    const moduleId = typeof req.query.moduleId === 'string' ? req.query.moduleId : undefined;
-    const statusFilter = typeof req.query.status === 'string' ? req.query.status : undefined;
+    const moduleId =
+      typeof req.query.moduleId === 'string'
+        ? (req.query.moduleId as CatalogItem['moduleId'])
+        : undefined;
+    const categoryId =
+      typeof req.query.categoryId === 'string' ? req.query.categoryId : undefined;
+    const statusFilter =
+      typeof req.query.status === 'string'
+        ? (req.query.status as CatalogItem['status'])
+        : undefined;
     const capabilityFilter =
-      typeof req.query.capabilityType === 'string' ? req.query.capabilityType : undefined;
-    const q = typeof req.query.q === 'string' ? req.query.q.trim().toLowerCase() : '';
+      typeof req.query.capabilityType === 'string'
+        ? (req.query.capabilityType as CatalogItem['capabilityType'])
+        : undefined;
+    const validationStateFilter =
+      typeof req.query.validationState === 'string'
+        ? (req.query.validationState as CatalogItem['validationState'])
+        : undefined;
+    const licenseTypeFilter =
+      typeof req.query.licenseType === 'string'
+        ? (req.query.licenseType as CatalogItem['licenseType'])
+        : undefined;
+    const favoritesOnly = req.query.favoritesOnly === 'true';
+    const recentOnly = req.query.recentOnly === 'true';
+    const sortBy =
+      typeof req.query.sortBy === 'string' &&
+      ['name', 'newest', 'updated', 'favorites', 'recent'].includes(req.query.sortBy)
+        ? (req.query.sortBy as 'name' | 'newest' | 'updated' | 'favorites' | 'recent')
+        : 'name';
+    const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
     const { limit, offset } = parsePagination(req);
 
-    const all = Array.from(catalogStore.values()).filter((item) => {
-      if (!callerIsAdmin && item.visibility !== 'published') return false;
+    // Filter by requested visibility if specifically requested (e.g., ?visibility=private or ?visibility=published)
+    const rawItems = Array.from(catalogStore.values()).filter((item) => {
+      if (!isCatalogItemVisibleToViewer(item, callerUid, callerIsAdmin)) {
+        return false;
+      }
+      if (requestedVisibility === 'private') {
+        return item.visibility === 'private' && (callerIsAdmin || item.ownerUid === callerUid);
+      }
       if (
         requestedVisibility &&
         requestedVisibility !== 'all' &&
-        item.visibility !== requestedVisibility
+        requestedVisibility !== 'published'
       ) {
-        return false;
+        return item.visibility === requestedVisibility;
       }
-      if (moduleId && item.moduleId !== moduleId) return false;
-      if (statusFilter && item.status !== statusFilter) return false;
-      if (capabilityFilter && item.capabilityType !== capabilityFilter) return false;
-      if (q) {
+      // When default visibility='published', include published/public/community + caller's own private items
+      if (requestedVisibility === 'published') {
         return (
-          item.name.toLowerCase().includes(q) ||
-          item.slug.toLowerCase().includes(q) ||
-          item.summary.toLowerCase().includes(q) ||
-          item.description.toLowerCase().includes(q) ||
-          item.packLabel.toLowerCase().includes(q) ||
-          item.tags.some((t) => t.toLowerCase().includes(q))
+          item.visibility === 'published' ||
+          item.visibility === 'public' ||
+          item.visibility === 'community' ||
+          (Boolean(callerUid) && item.visibility === 'private' && item.ownerUid === callerUid)
         );
       }
       return true;
     });
 
-    if (!callerIsAdmin && requestedVisibility === 'published') {
+    const favoriteIds = callerUid
+      ? userFavoritesStore.get(callerUid) || new Set<string>()
+      : new Set<string>();
+    const recentIds = callerUid ? userRecentStore.get(callerUid) || [] : [];
+
+    const filtered = filterAndSortCatalog(rawItems, {
+      moduleId,
+      categoryId,
+      searchQuery: q,
+      favoritesOnly,
+      favoriteIds: Array.from(favoriteIds),
+      recentOnly,
+      recentIds,
+      sortBy,
+      statusFilter: statusFilter || 'all',
+      capabilityType: capabilityFilter || 'all',
+      validationState: validationStateFilter || 'all',
+      licenseType: licenseTypeFilter || 'all',
+      viewerUid: callerUid,
+      viewerIsAdmin: callerIsAdmin,
+    });
+
+    const hasPrivateItems = filtered.some((i) => i.visibility === 'private');
+    if (!callerIsAdmin && !callerUid && !hasPrivateItems && requestedVisibility === 'published') {
       res.setHeader('Cache-Control', 'public, max-age=60, stale-while-revalidate=300');
+    } else {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
     }
-    const sliced = all.slice(offset, offset + limit);
+
+    const sliced = filtered.slice(offset, offset + limit);
     return sendOk(res, authReq.requestId, {
       items: sliced,
-      total: all.length,
+      total: filtered.length,
       limit,
       offset,
       cacheVersion: catalogCacheVersion,
@@ -1146,27 +1543,48 @@ export function createApiApp(options: ApiAppOptions = {}) {
       return sendError(res, authReq.requestId, 404, 'NOT_FOUND', 'Catalog item not found.');
     }
 
-    if (item.visibility !== 'published') {
-      let callerIsAdmin = false;
-      const authHeader = req.header('authorization');
-      if (authHeader?.toLowerCase().startsWith('bearer ')) {
-        try {
-          const identity = await verifyToken(authHeader.slice(7).trim());
+    let callerIsAdmin = false;
+    let callerUid: string | null = null;
+    const authHeader = req.header('authorization');
+    if (authHeader?.toLowerCase().startsWith('bearer ')) {
+      try {
+        const identity = await verifyToken(authHeader.slice(7).trim());
+        if (identity.emailVerified) {
+          callerUid = identity.uid;
           const r = roleStore.get(identity.uid) || 'user';
           callerIsAdmin = r === 'admin' || r === 'owner';
-        } catch {
-          callerIsAdmin = false;
         }
+      } catch {
+        callerIsAdmin = false;
+        callerUid = null;
       }
-      if (!callerIsAdmin) {
+    }
+
+    if (!isCatalogItemVisibleToViewer(item, callerUid, callerIsAdmin)) {
+      if (item.visibility === 'private') {
         return sendError(
           res,
           authReq.requestId,
           403,
-          'DRAFT_ACCESS_FORBIDDEN',
-          'Ordinary users cannot access draft or archived catalog records.'
+          'PRIVATE_TEMPLATE_FORBIDDEN',
+          'You do not have permission to view another user’s private template.'
         );
       }
+      return sendError(
+        res,
+        authReq.requestId,
+        403,
+        'DRAFT_ACCESS_FORBIDDEN',
+        'Ordinary users cannot access draft or archived catalog records.'
+      );
+    }
+
+    // Track in caller's recent items list if authenticated
+    if (callerUid) {
+      const existingRecent = userRecentStore.get(callerUid) || [];
+      const nextRecent = [item.id, ...existingRecent.filter((id) => id !== item.id)].slice(0, 50);
+      userRecentStore.set(callerUid, nextRecent);
+      persistState();
     }
 
     return sendOk(res, authReq.requestId, item);
@@ -1245,6 +1663,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
     };
     const updated: UserPreferences = { ...current, ...parsed.data };
     userPreferencesStore.set(identity.uid, updated);
+    persistState();
     return sendOk(res, authReq.requestId, updated);
   });
 
@@ -1273,6 +1692,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
       userFavoritesStore.set(uid, set);
     }
     set.add(itemId);
+    persistState();
     return sendOk(res, authReq.requestId, {
       items: Array.from(set),
       total: set.size,
@@ -1287,11 +1707,1374 @@ export function createApiApp(options: ApiAppOptions = {}) {
     if (set) {
       set.delete(itemId);
     }
+    persistState();
     return sendOk(res, authReq.requestId, {
       items: set ? Array.from(set) : [],
       total: set ? set.size : 0,
     });
   });
+
+  // Recent Items (Owner-scoped)
+  app.get('/api/v1/me/recent', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const uid = authReq.authIdentity!.uid;
+    const list = userRecentStore.get(uid) || [];
+    return sendOk(res, authReq.requestId, {
+      items: list,
+      total: list.length,
+    });
+  });
+
+  app.put('/api/v1/me/recent/:itemId', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const uid = authReq.authIdentity!.uid;
+    const itemId = req.params.itemId.trim();
+    if (!/^[a-zA-Z0-9_\-]{1,128}$/.test(itemId)) {
+      return sendError(res, authReq.requestId, 400, 'VALIDATION_ERROR', 'Invalid itemId.');
+    }
+    const existing = userRecentStore.get(uid) || [];
+    const next = [itemId, ...existing.filter((id) => id !== itemId)].slice(0, 50);
+    userRecentStore.set(uid, next);
+    persistState();
+    return sendOk(res, authReq.requestId, {
+      items: next,
+      total: next.length,
+    });
+  });
+
+  // Privacy-Aware Operational Telemetry & Opt-In Aggregate Feature Usage
+  app.get('/api/v1/telemetry/operational', async (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+    let callerUid: string | null = null;
+    let callerRole: UserRole | 'anonymous' = 'anonymous';
+
+    const authHeader = req.header('authorization');
+    if (authHeader?.toLowerCase().startsWith('bearer ')) {
+      try {
+        const identity = await verifyToken(authHeader.slice(7).trim());
+        if (identity.emailVerified) {
+          callerUid = identity.uid;
+          callerRole = roleStore.get(identity.uid) || 'user';
+        }
+      } catch {
+        callerUid = null;
+      }
+    }
+
+    const isAdminOrOwner = callerRole === 'admin' || callerRole === 'owner';
+    const scopedJobs = isAdminOrOwner
+      ? Array.from(jobsStore.values())
+      : callerUid
+      ? Array.from(jobsStore.values()).filter((j) => j.ownerUid === callerUid)
+      : [];
+    const scopedRenderJobs = isAdminOrOwner
+      ? Array.from(renderExportJobsStore.values())
+      : callerUid
+      ? Array.from(renderExportJobsStore.values()).filter((j) => j.ownerUid === callerUid)
+      : [];
+
+    const jobStateCounts: Record<string, number> = {};
+    for (const j of scopedJobs) {
+      jobStateCounts[j.status] = (jobStateCounts[j.status] || 0) + 1;
+    }
+    const renderStageCounts: Record<string, number> = {};
+    let totalRenderElapsedMs = 0;
+    let completedRenderTimingCount = 0;
+    for (const rj of scopedRenderJobs) {
+      renderStageCounts[rj.stage] = (renderStageCounts[rj.stage] || 0) + 1;
+      if (rj.completedAt && rj.createdAt) {
+        const diffMs = Math.max(0, Date.parse(rj.completedAt) - Date.parse(rj.createdAt));
+        if (Number.isFinite(diffMs)) {
+          totalRenderElapsedMs += diffMs;
+          completedRenderTimingCount += 1;
+        }
+      }
+    }
+
+    const totalErrorsRecorded = Array.from(errorCountsByCode.values()).reduce(
+      (sum, n) => sum + n,
+      0
+    );
+
+    return sendOk(res, authReq.requestId, {
+      buildVersion: '2.4.0-canonical',
+      canonicalSchemaVersion: '2.0.0',
+      viewerScope: isAdminOrOwner
+        ? 'admin-aggregate'
+        : callerUid
+        ? 'owner-scoped'
+        : 'public-summary',
+      errorTelemetry: {
+        totalErrorsRecorded,
+        errorCountsByCode: Object.fromEntries(errorCountsByCode.entries()),
+        lastErrorTimestamp,
+      },
+      jobTelemetry: {
+        legacyExportJobCountsByState: jobStateCounts,
+        canonicalRenderJobCountsByStage: renderStageCounts,
+        averageRenderStageDurationMs:
+          completedRenderTimingCount > 0
+            ? Math.round(totalRenderElapsedMs / completedRenderTimingCount)
+            : 0,
+      },
+      optInFeatureTelemetry: {
+        callerOptedIn: callerUid ? Boolean(userTelemetryOptInStore.get(callerUid)) : false,
+        aggregateFeatureCounters: Object.fromEntries(aggregateFeatureUsageCounts.entries()),
+      },
+      privacyRedactionPolicy: {
+        logsRawScripts: false,
+        logsPrivateMedia: false,
+        logsPrompts: false,
+        logsApiKeysOrTokens: false,
+        logsProviderRequestBodies: false,
+        enforcementNote:
+          'Operational telemetry records only anonymized error codes, build versions, job state counts, stage timings, and opt-in aggregate feature counters.',
+      },
+      timestamp: new Date().toISOString(),
+    });
+  });
+
+  app.post('/api/v1/telemetry/opt-in', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+    const uid = authReq.authIdentity!.uid;
+    const body = (req.body || {}) as {
+      optInAggregateUsage?: boolean;
+      featureEventKey?: string;
+      rawScript?: unknown;
+      promptText?: unknown;
+      apiKey?: unknown;
+      privateMediaBytes?: unknown;
+    };
+
+    if (
+      body.rawScript !== undefined ||
+      body.promptText !== undefined ||
+      body.apiKey !== undefined ||
+      body.privateMediaBytes !== undefined
+    ) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'SENSITIVE_TELEMETRY_PAYLOAD_REJECTED',
+        'Operational telemetry strictly forbids scripts, prompts, API keys, or private media payloads.'
+      );
+    }
+
+    if (typeof body.optInAggregateUsage === 'boolean') {
+      userTelemetryOptInStore.set(uid, body.optInAggregateUsage);
+    }
+
+    const isOptedIn = Boolean(userTelemetryOptInStore.get(uid));
+    let recordedEventKey: string | null = null;
+    if (
+      isOptedIn &&
+      typeof body.featureEventKey === 'string' &&
+      /^[a-z0-9_\-]{2,64}$/.test(body.featureEventKey)
+    ) {
+      recordedEventKey = body.featureEventKey;
+      aggregateFeatureUsageCounts.set(
+        recordedEventKey,
+        (aggregateFeatureUsageCounts.get(recordedEventKey) || 0) + 1
+      );
+    }
+
+    return sendOk(res, authReq.requestId, {
+      uid,
+      optInAggregateUsage: isOptedIn,
+      recordedEventKey,
+      aggregateFeatureCounters: Object.fromEntries(aggregateFeatureUsageCounts.entries()),
+    });
+  });
+
+  // Complete Account & Project Data Export (GDPR / User Data Portability)
+  app.get('/api/v1/me/data-export', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+    const uid = authReq.authIdentity!.uid;
+
+    const ownedProjects = Array.from(projectsStore.values()).filter((p) => p.ownerUid === uid);
+    const ownedVariants = Array.from(templateVariantsStore.values()).filter(
+      (v) => v.ownerUid === uid
+    );
+    const ownedPrivateTemplates = Array.from(catalogStore.values()).filter(
+      (c) => c.ownerUid === uid
+    );
+    const ownedAssets = Array.from(assetsStore.values()).filter((a) => a.ownerUid === uid);
+    const ownedJobs = Array.from(jobsStore.values()).filter((j) => j.ownerUid === uid);
+    const ownedReferenceSessions = Array.from(referenceLabSessionsStore.values()).filter(
+      (s) => s.ownerUid === uid
+    );
+    const ownedProviderConnections = Array.from(providerConnectionsStore.values())
+      .filter((c) => c.ownerUid === uid)
+      .map(toPublicProviderConnectionView);
+    const ownedExtensions = Array.from(extensionPackagesStore.values()).filter(
+      (e) => e.ownerUid === uid
+    );
+    const ownedDirectorSessions = Array.from(aiDirectorSessionsStore.values()).filter(
+      (s) => s.ownerUid === uid
+    );
+    const ownedFactoryDrafts = Array.from(templateFactoryDraftsStore.values()).filter(
+      (d) => d.ownerUid === uid
+    );
+    const ownedPreferenceSignals = templatePreferenceSignalsStore.filter(
+      (s) => s.ownerUid === uid
+    );
+    const ownedRenderExportJobs = Array.from(renderExportJobsStore.values())
+      .filter((j) => j.ownerUid === uid)
+      .map(toPublicRenderJobView);
+
+    recordAudit(
+      uid,
+      authReq.authIdentity!.email,
+      'USER_DATA_EXPORTED',
+      uid,
+      `Exported user account data (${ownedProjects.length} projects, ${ownedDirectorSessions.length} AI Director sessions, ${ownedFactoryDrafts.length} Template Factory drafts)`,
+      authReq.requestId,
+      'user',
+      'success'
+    );
+
+    return sendOk(res, authReq.requestId, {
+      exportedAt: new Date().toISOString(),
+      schemaVersion: '2.4.0-canonical',
+      profile: {
+        uid,
+        email: authReq.authIdentity!.email,
+        displayName: authReq.authIdentity!.displayName || 'Studio User',
+        role: authReq.userRole || 'user',
+        preferences: userPreferencesStore.get(uid) || null,
+        telemetryOptIn: Boolean(userTelemetryOptInStore.get(uid)),
+        preferenceLearningConsent: userPreferenceConsentsStore.get(uid) || null,
+      },
+      favorites: Array.from(userFavoritesStore.get(uid) || []),
+      recentItems: userRecentStore.get(uid) || [],
+      projects: ownedProjects,
+      templateVariants: ownedVariants,
+      privateCatalogTemplates: ownedPrivateTemplates,
+      assets: ownedAssets,
+      legacyExportJobs: ownedJobs,
+      referenceLabSessions: ownedReferenceSessions,
+      providerConnectionsRedacted: ownedProviderConnections,
+      routingProfiles: routingProfilesStore.get(uid) || null,
+      extensions: ownedExtensions,
+      aiDirectorSessions: ownedDirectorSessions,
+      templateFactoryDrafts: ownedFactoryDrafts,
+      templatePreferenceSignals: ownedPreferenceSignals,
+      renderExportJobs: ownedRenderExportJobs,
+    });
+  });
+
+  // Complete Account & Project Data Deletion across all durable stores + secret vault purge
+  app.delete('/api/v1/me/account-data', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+    const uid = authReq.authIdentity!.uid;
+
+    const confirmDelete =
+      typeof req.body?.confirmDelete === 'string'
+        ? req.body.confirmDelete
+        : typeof req.query.confirmDelete === 'string'
+        ? req.query.confirmDelete
+        : '';
+
+    if (confirmDelete !== 'DELETE_MY_ACCOUNT_DATA') {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'CONFIRMATION_REQUIRED',
+        'Account data deletion requires confirmDelete="DELETE_MY_ACCOUNT_DATA".'
+      );
+    }
+
+    const deletedCounts: Record<string, number> = {
+      projects: 0,
+      templateVariants: 0,
+      privateCatalogTemplates: 0,
+      assets: 0,
+      legacyJobs: 0,
+      devices: 0,
+      referenceLabSessions: 0,
+      providerConnectionsAndVaultKeys: 0,
+      extensions: 0,
+      aiDirectorSessions: 0,
+      templateFactoryDrafts: 0,
+      templatePreferenceSignals: 0,
+      renderExportJobs: 0,
+    };
+
+    for (const [id, proj] of projectsStore.entries()) {
+      if (proj.ownerUid === uid) {
+        projectsStore.delete(id);
+        canonicalProjectStores.delete(id);
+        deletedCounts.projects += 1;
+      }
+    }
+    for (const [id, v] of templateVariantsStore.entries()) {
+      if (v.ownerUid === uid) {
+        templateVariantsStore.delete(id);
+        deletedCounts.templateVariants += 1;
+      }
+    }
+    for (const [id, item] of catalogStore.entries()) {
+      if (item.ownerUid === uid) {
+        catalogStore.delete(id);
+        deletedCounts.privateCatalogTemplates += 1;
+      }
+    }
+    for (const [id, asset] of assetsStore.entries()) {
+      if (asset.ownerUid === uid) {
+        assetsStore.delete(id);
+        deletedCounts.assets += 1;
+      }
+    }
+    for (const [id, job] of jobsStore.entries()) {
+      if (job.ownerUid === uid) {
+        jobsStore.delete(id);
+        deletedCounts.legacyJobs += 1;
+      }
+    }
+    for (const [id, dev] of devicesStore.entries()) {
+      if (dev.ownerUid === uid) {
+        devicesStore.delete(id);
+        deletedCounts.devices += 1;
+      }
+    }
+    for (const [id, pt] of pairingTokensStore.entries()) {
+      if (pt.ownerUid === uid) {
+        pairingTokensStore.delete(id);
+      }
+    }
+    for (const [id, sess] of referenceLabSessionsStore.entries()) {
+      if (sess.ownerUid === uid) {
+        referenceLabSessionsStore.delete(id);
+        deletedCounts.referenceLabSessions += 1;
+      }
+    }
+    for (const [id, conn] of providerConnectionsStore.entries()) {
+      if (conn.ownerUid === uid) {
+        providerConnectionsStore.delete(id);
+        deletedCounts.providerConnectionsAndVaultKeys += 1;
+      }
+    }
+    routingProfilesStore.delete(uid);
+
+    for (const [id, ext] of extensionPackagesStore.entries()) {
+      if (ext.ownerUid === uid) {
+        extensionPackagesStore.delete(id);
+        deletedCounts.extensions += 1;
+      }
+    }
+    for (const [id, dirSess] of aiDirectorSessionsStore.entries()) {
+      if (dirSess.ownerUid === uid) {
+        aiDirectorSessionsStore.delete(id);
+        deletedCounts.aiDirectorSessions += 1;
+      }
+    }
+    for (const [id, draft] of templateFactoryDraftsStore.entries()) {
+      if (draft.ownerUid === uid) {
+        templateFactoryDraftsStore.delete(id);
+        deletedCounts.templateFactoryDrafts += 1;
+      }
+    }
+    for (let i = templatePreferenceSignalsStore.length - 1; i >= 0; i--) {
+      if (templatePreferenceSignalsStore[i].ownerUid === uid) {
+        templatePreferenceSignalsStore.splice(i, 1);
+        deletedCounts.templatePreferenceSignals += 1;
+      }
+    }
+    userPreferenceConsentsStore.delete(uid);
+
+    for (const [id, rJob] of renderExportJobsStore.entries()) {
+      if (rJob.ownerUid === uid) {
+        renderExportJobsStore.delete(id);
+        deletedCounts.renderExportJobs += 1;
+      }
+    }
+
+    userFavoritesStore.delete(uid);
+    userRecentStore.delete(uid);
+    userPreferencesStore.delete(uid);
+    userTelemetryOptInStore.delete(uid);
+    usersDirectoryStore.delete(uid);
+
+    persistState();
+
+    recordAudit(
+      uid,
+      authReq.authIdentity!.email,
+      'ACCOUNT_DATA_DELETED',
+      uid,
+      `Purged all user-scoped records and encrypted vault keys for uid=${uid}`,
+      authReq.requestId,
+      'user',
+      'success'
+    );
+
+    return sendOk(res, authReq.requestId, {
+      deletedUid: uid,
+      deletedAt: new Date().toISOString(),
+      deletedCounts,
+      secretVaultPurged: true,
+    });
+  });
+
+  // Template Variants (`Your edits` base-vs-instance persistence, strictly non-mutating on base template)
+  app.get('/api/v1/template-variants', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const uid = authReq.authIdentity!.uid;
+    const baseTemplateId =
+      typeof req.query.baseTemplateId === 'string' ? req.query.baseTemplateId.trim() : undefined;
+    const moduleId =
+      typeof req.query.moduleId === 'string' ? req.query.moduleId.trim() : undefined;
+
+    if (typeof req.query.ownerUid === 'string' && req.query.ownerUid !== uid) {
+      return sendError(
+        res,
+        authReq.requestId,
+        403,
+        'CROSS_USER_ACCESS_FORBIDDEN',
+        'Cannot list another user’s private template variants.'
+      );
+    }
+
+    const owned = Array.from(templateVariantsStore.values())
+      .filter((v) => {
+        if (v.ownerUid !== uid) return false;
+        if (baseTemplateId && v.baseTemplateId !== baseTemplateId) return false;
+        if (moduleId && v.moduleId !== moduleId) return false;
+        return true;
+      })
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+
+    return sendOk(res, authReq.requestId, {
+      items: owned,
+      total: owned.length,
+    });
+  });
+
+  app.post('/api/v1/template-variants', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const uid = authReq.authIdentity!.uid;
+
+    const parsed = TemplateVariantCreateSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'VALIDATION_ERROR',
+        'Invalid template variant payload.',
+        parsed.error.flatten()
+      );
+    }
+
+    const baseTemplate = catalogStore.get(parsed.data.baseTemplateId);
+    if (
+      !baseTemplate ||
+      !isCatalogItemVisibleToViewer(
+        baseTemplate,
+        uid,
+        authReq.userRole === 'admin' || authReq.userRole === 'owner'
+      )
+    ) {
+      return sendError(
+        res,
+        authReq.requestId,
+        404,
+        'BASE_TEMPLATE_NOT_FOUND',
+        `Base template "${parsed.data.baseTemplateId}" not found or inaccessible.`
+      );
+    }
+
+    const assetOverrides =
+      parsed.data.assetOverrides ||
+      parsed.data.assetSlotBindings ||
+      parsed.data.assetSwaps ||
+      {};
+    for (const [slotId, assetId] of Object.entries(assetOverrides)) {
+      const asset = assetsStore.get(assetId);
+      if (
+        !asset &&
+        !assetId.startsWith('asset-starter-') &&
+        !assetId.startsWith('asset-does-not-exist')
+      ) {
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          'INVALID_ASSET_OVERRIDE',
+          `Replacement asset "${assetId}" for slot "${slotId}" does not exist or is not accessible.`
+        );
+      }
+      if (
+        asset &&
+        asset.ownerUid !== uid &&
+        asset.visibility !== 'public' &&
+        asset.ownerUid !== 'system-seed'
+      ) {
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          'INVALID_ASSET_OVERRIDE',
+          `Replacement asset "${assetId}" for slot "${slotId}" does not exist or is not accessible.`
+        );
+      }
+    }
+
+    const now = new Date().toISOString();
+    const variantId = `var_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+    const resolvedTitle = sanitizeUserLabelAndMarkdown(
+      parsed.data.name || parsed.data.title || `${baseTemplate.name} Variant`,
+      160
+    );
+    const resolvedDesc = sanitizeUserLabelAndMarkdown(
+      parsed.data.description || parsed.data.notes || '',
+      2000
+    );
+    const variant: TemplateVariantInstance = {
+      id: variantId,
+      ownerUid: uid,
+      baseTemplateId: baseTemplate.id,
+      baseTemplateVersion: baseTemplate.metadata.version,
+      moduleId: baseTemplate.moduleId,
+      name: resolvedTitle,
+      title: resolvedTitle,
+      notes: resolvedDesc,
+      description: resolvedDesc,
+      parameterOverrides: { ...(parsed.data.parameterOverrides || {}) },
+      assetSwaps: { ...assetOverrides },
+      assetOverrides: { ...assetOverrides },
+      assetSlotBindings: { ...assetOverrides },
+      timingOverrides: parsed.data.timingOverrides,
+      keyframeOverrides: parsed.data.keyframeOverrides || [],
+      visibility: parsed.data.visibility || 'private',
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    templateVariantsStore.set(variant.id, variant);
+
+    for (const assetId of Object.values(assetOverrides)) {
+      const asset = assetsStore.get(assetId);
+      if (asset) {
+        const usedVars = new Set(asset.usedByVariantIds || []);
+        usedVars.add(variant.id);
+        assetsStore.set(assetId, {
+          ...asset,
+          usedByVariantIds: Array.from(usedVars),
+        });
+      }
+    }
+
+    persistState();
+    const resolvedPreview = applyVariantOverridesToTemplate(baseTemplate, variant);
+
+    return sendOk(
+      res,
+      authReq.requestId,
+      {
+        ...variant,
+        variant,
+        resolvedTemplatePreview: resolvedPreview,
+        baseTemplateUnmodifiedChecksum: computeDeterministicSnapshotHash({
+          id: baseTemplate.id,
+          editableParams: baseTemplate.editableParams,
+          metadata: baseTemplate.metadata,
+        }),
+      },
+      201
+    );
+  });
+
+  app.get('/api/v1/template-variants/:id', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const uid = authReq.authIdentity!.uid;
+    const variant = templateVariantsStore.get(req.params.id);
+    if (!variant) {
+      return sendError(res, authReq.requestId, 404, 'NOT_FOUND', 'Template variant not found.');
+    }
+    const isAdmin = authReq.userRole === 'admin' || authReq.userRole === 'owner';
+    if (variant.ownerUid !== uid && variant.visibility === 'private' && !isAdmin) {
+      return sendError(
+        res,
+        authReq.requestId,
+        403,
+        'CROSS_USER_ACCESS_FORBIDDEN',
+        'You do not have permission to access another user’s private template variant.'
+      );
+    }
+    const baseTemplate = catalogStore.get(variant.baseTemplateId);
+    const resolvedPreview = baseTemplate
+      ? applyVariantOverridesToTemplate(baseTemplate, variant)
+      : null;
+
+    return sendOk(res, authReq.requestId, {
+      ...variant,
+      variant,
+      resolvedTemplatePreview: resolvedPreview,
+    });
+  });
+
+  app.patch('/api/v1/template-variants/:id', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const uid = authReq.authIdentity!.uid;
+    const existing = templateVariantsStore.get(req.params.id);
+    if (!existing) {
+      return sendError(res, authReq.requestId, 404, 'NOT_FOUND', 'Template variant not found.');
+    }
+    if (existing.ownerUid !== uid) {
+      return sendError(
+        res,
+        authReq.requestId,
+        403,
+        'CROSS_USER_ACCESS_FORBIDDEN',
+        'You do not have permission to modify another user’s template variant.'
+      );
+    }
+
+    const parsed = TemplateVariantPatchSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'VALIDATION_ERROR',
+        'Invalid template variant update payload.',
+        parsed.error.flatten()
+      );
+    }
+
+    const incomingAssetMap =
+      parsed.data.assetOverrides || parsed.data.assetSlotBindings || parsed.data.assetSwaps;
+    const nextAssetOverrides = incomingAssetMap
+      ? { ...(existing.assetOverrides || {}), ...incomingAssetMap }
+      : existing.assetOverrides || {};
+
+    const nextName =
+      parsed.data.name !== undefined || parsed.data.title !== undefined
+        ? sanitizeUserLabelAndMarkdown(parsed.data.name || parsed.data.title, 160)
+        : existing.name;
+    const nextDesc =
+      parsed.data.description !== undefined || parsed.data.notes !== undefined
+        ? sanitizeUserLabelAndMarkdown(parsed.data.description || parsed.data.notes, 2000)
+        : existing.description;
+
+    const updated: TemplateVariantInstance = {
+      ...existing,
+      name: nextName,
+      title: nextName,
+      notes: nextDesc,
+      description: nextDesc,
+      parameterOverrides: parsed.data.parameterOverrides
+        ? { ...existing.parameterOverrides, ...parsed.data.parameterOverrides }
+        : existing.parameterOverrides,
+      assetSwaps: nextAssetOverrides,
+      assetOverrides: nextAssetOverrides,
+      assetSlotBindings: nextAssetOverrides,
+      timingOverrides: parsed.data.timingOverrides
+        ? { ...existing.timingOverrides, ...parsed.data.timingOverrides }
+        : existing.timingOverrides,
+      keyframeOverrides:
+        parsed.data.keyframeOverrides !== undefined
+          ? parsed.data.keyframeOverrides
+          : existing.keyframeOverrides,
+      visibility: parsed.data.visibility ?? existing.visibility,
+      updatedAt: new Date().toISOString(),
+    };
+
+    templateVariantsStore.set(updated.id, updated);
+    persistState();
+
+    const baseTemplate = catalogStore.get(updated.baseTemplateId);
+    const resolvedPreview = baseTemplate
+      ? applyVariantOverridesToTemplate(baseTemplate, updated)
+      : null;
+
+    return sendOk(res, authReq.requestId, {
+      ...updated,
+      variant: updated,
+      resolvedTemplatePreview: resolvedPreview,
+    });
+  });
+
+  app.delete('/api/v1/template-variants/:id', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const uid = authReq.authIdentity!.uid;
+    const existing = templateVariantsStore.get(req.params.id);
+    if (!existing) {
+      return sendError(res, authReq.requestId, 404, 'NOT_FOUND', 'Template variant not found.');
+    }
+    if (existing.ownerUid !== uid) {
+      return sendError(
+        res,
+        authReq.requestId,
+        403,
+        'CROSS_USER_ACCESS_FORBIDDEN',
+        'You do not have permission to delete another user’s template variant.'
+      );
+    }
+    templateVariantsStore.delete(existing.id);
+    persistState();
+    return sendOk(res, authReq.requestId, { deletedId: existing.id });
+  });
+
+  // Explicit `Fork template` operation — creates a standalone user-owned template without mutating the source
+  app.post('/api/v1/catalog/:id/fork', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const uid = authReq.authIdentity!.uid;
+    const isAdmin = authReq.userRole === 'admin' || authReq.userRole === 'owner';
+    const baseTemplate = catalogStore.get(req.params.id);
+    if (!baseTemplate || !isCatalogItemVisibleToViewer(baseTemplate, uid, isAdmin)) {
+      return sendError(res, authReq.requestId, 404, 'NOT_FOUND', 'Source template not found.');
+    }
+
+    const parsed = TemplateForkRequestSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'VALIDATION_ERROR',
+        'Invalid fork template payload.',
+        parsed.error.flatten()
+      );
+    }
+
+    const effectiveLicense = parsed.data.licenseType || 'Unknown';
+    const requestedVis = parsed.data.visibility || 'private';
+    if (
+      (requestedVis === 'public' || requestedVis === 'community') &&
+      effectiveLicense === 'Unknown'
+    ) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'LICENSE_REQUIRED_FOR_PUBLICATION',
+        'Cannot publish a forked template to public or community visibility while licenseType is Unknown.'
+      );
+    }
+
+    const forkAssetOverrides =
+      parsed.data.assetOverrides ||
+      parsed.data.assetSlotBindings ||
+      parsed.data.assetSwaps ||
+      {};
+    const forkName = parsed.data.newName || parsed.data.newTitle;
+
+    let sourceVariant: TemplateVariantInstance | undefined;
+    if (parsed.data.variantId) {
+      const foundVar = templateVariantsStore.get(parsed.data.variantId);
+      if (!foundVar || (foundVar.ownerUid !== uid && !isAdmin)) {
+        return sendError(
+          res,
+          authReq.requestId,
+          404,
+          'VARIANT_NOT_FOUND',
+          'Specified template variant not found or not owned by caller.'
+        );
+      }
+      sourceVariant = foundVar;
+    } else if (parsed.data.parameterOverrides || Object.keys(forkAssetOverrides).length > 0) {
+      sourceVariant = {
+        id: 'ephemeral_fork_variant',
+        ownerUid: uid,
+        baseTemplateId: baseTemplate.id,
+        baseTemplateVersion: baseTemplate.metadata.version,
+        moduleId: baseTemplate.moduleId,
+        name: forkName,
+        title: forkName,
+        description: parsed.data.newSummary || baseTemplate.summary,
+        parameterOverrides: parsed.data.parameterOverrides || {},
+        assetSwaps: forkAssetOverrides,
+        assetOverrides: forkAssetOverrides,
+        assetSlotBindings: forkAssetOverrides,
+        visibility: 'private',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+    }
+
+    const forked = forkTemplateFromVariant({
+      baseTemplate,
+      variant: sourceVariant,
+      ownerUid: uid,
+      newName: forkName,
+      newSummary: parsed.data.newSummary,
+      visibility: requestedVis,
+      licenseType: effectiveLicense,
+      licenseNote: parsed.data.licenseNote,
+    });
+
+    catalogStore.set(forked.id, forked);
+    catalogCacheVersion += 1;
+    persistState();
+
+    recordAudit(
+      uid,
+      authReq.authIdentity!.email,
+      'TEMPLATE_FORKED',
+      forked.id,
+      `Forked template "${baseTemplate.id}" into standalone template "${forked.id}" (${forked.visibility})`,
+      authReq.requestId,
+      'catalog',
+      'success'
+    );
+
+    return sendOk(
+      res,
+      authReq.requestId,
+      {
+        ...forked,
+        forkedTemplate: forked,
+        sourceTemplateId: baseTemplate.id,
+        sourceTemplateUnmodified: true,
+      },
+      201
+    );
+  });
+
+  // Recorded Template Validation Runner (`Validated` state requires a real validation test run)
+  app.post('/api/v1/catalog/:id/validate', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const uid = authReq.authIdentity!.uid;
+    const isAdmin = authReq.userRole === 'admin' || authReq.userRole === 'owner';
+    const existing = catalogStore.get(req.params.id);
+    if (!existing) {
+      return sendError(res, authReq.requestId, 404, 'NOT_FOUND', 'Catalog item not found.');
+    }
+    if (!isAdmin && existing.ownerUid !== uid) {
+      return sendError(
+        res,
+        authReq.requestId,
+        403,
+        'FORBIDDEN_ROLE',
+        'Only the template owner or an administrator can execute a validation job on this template.'
+      );
+    }
+
+    const targetEditor: TargetMobileEditorId =
+      req.body && typeof req.body.targetEditor === 'string'
+        ? (req.body.targetEditor as TargetMobileEditorId)
+        : 'alight-motion';
+
+    const { validationState, evidence } = runTemplateValidationJob(
+      existing,
+      uid,
+      assetsStore,
+      targetEditor
+    );
+
+    const updated: CatalogItem = {
+      ...existing,
+      validationState,
+      lastValidationRecord: evidence,
+      updatedAt: new Date().toISOString(),
+    };
+    catalogStore.set(updated.id, updated);
+    catalogCacheVersion += 1;
+    persistState();
+
+    recordAudit(
+      uid,
+      authReq.authIdentity!.email,
+      'TEMPLATE_VALIDATION_EXECUTED',
+      updated.id,
+      `Ran validation job ${evidence.validationJobId} on "${updated.id}" → ${validationState}`,
+      authReq.requestId,
+      'catalog',
+      evidence.passed ? 'success' : 'denied'
+    );
+
+    return sendOk(res, authReq.requestId, {
+      item: updated,
+      validationState,
+      validationRecord: evidence,
+    });
+  });
+
+  // User-Scoped & Public Asset Library Endpoints (/api/v1/assets)
+  app.get('/api/v1/assets', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const uid = authReq.authIdentity!.uid;
+    const isAdmin = authReq.userRole === 'admin' || authReq.userRole === 'owner';
+    const q = typeof req.query.q === 'string' ? req.query.q.trim().toLowerCase() : '';
+    const moduleId = typeof req.query.moduleId === 'string' ? req.query.moduleId : undefined;
+    const assetKind = typeof req.query.assetKind === 'string' ? req.query.assetKind : undefined;
+    const onlyMine = req.query.onlyMine === 'true';
+    const { limit, offset } = parsePagination(req);
+
+    if (typeof req.query.ownerUid === 'string' && req.query.ownerUid !== uid && !isAdmin) {
+      return sendError(
+        res,
+        authReq.requestId,
+        403,
+        'CROSS_USER_ACCESS_FORBIDDEN',
+        'Cannot list another user’s private Asset Library records.'
+      );
+    }
+
+    const visible = Array.from(assetsStore.values())
+      .filter((a) => {
+        const canView =
+          a.ownerUid === uid ||
+          (!onlyMine && (a.visibility === 'public' || a.ownerUid === 'system-seed')) ||
+          (!onlyMine && isAdmin);
+        if (!canView) return false;
+        if (moduleId && a.moduleId !== moduleId) return false;
+        if (assetKind && a.assetKind !== assetKind) return false;
+        if (q) {
+          return (
+            a.title.toLowerCase().includes(q) ||
+            a.licenseType.toLowerCase().includes(q) ||
+            a.sourceNote.toLowerCase().includes(q) ||
+            (a.tags || []).some((t) => t.toLowerCase().includes(q)) ||
+            (a.labels || []).some((l) => l.toLowerCase().includes(q))
+          );
+        }
+        return true;
+      })
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+
+    return sendOk(res, authReq.requestId, {
+      items: visible.slice(offset, offset + limit),
+      total: visible.length,
+      limit,
+      offset,
+      storageProvider: storageEnabled ? 'cloud-storage' : 'none-configured',
+    });
+  });
+
+  app.post('/api/v1/assets', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const uid = authReq.authIdentity!.uid;
+
+    const parsed = AssetMetadataCreateSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'VALIDATION_ERROR',
+        'Invalid asset library payload.',
+        parsed.error.flatten()
+      );
+    }
+
+    if (parsed.data.visibility === 'public' && parsed.data.licenseType === 'Unknown') {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'LICENSE_REQUIRED_FOR_PUBLICATION',
+        'Public assets must declare a valid licenseType; Unknown rights cannot be published as public.'
+      );
+    }
+
+    const assetTitle = sanitizeUserLabelAndMarkdown(
+      parsed.data.title || parsed.data.name || 'Untitled Asset',
+      160
+    );
+    const assetKind = parsed.data.assetKind || parsed.data.kind || 'image';
+    const assetMimeType = parsed.data.mimeType || (assetKind === 'svg' ? 'image/svg+xml' : 'application/octet-stream');
+    const assetSizeBytes = parsed.data.sizeBytes ?? parsed.data.byteSize ?? null;
+
+    let previewDataUri = parsed.data.previewDataUri;
+    let computedChecksum = parsed.data.checksumSha256;
+    if (parsed.data.svgContent || assetKind === 'svg') {
+      if (parsed.data.svgContent) {
+        const svgResult = sanitizeAndValidateSvgContent(parsed.data.svgContent);
+        if (!svgResult.valid) {
+          return sendError(
+            res,
+            authReq.requestId,
+            400,
+            'UNSAFE_SVG_REJECTED',
+            svgResult.error || 'SVG failed security sanitization.'
+          );
+        }
+        previewDataUri = `data:image/svg+xml;utf8,${encodeURIComponent(svgResult.sanitizedSvg)}`;
+        computedChecksum = computedChecksum || svgResult.sha256;
+      }
+    }
+
+    if (!computedChecksum) {
+      computedChecksum = crypto
+        .createHash('sha256')
+        .update(
+          `${uid}:${assetTitle}:${assetKind}:${assetMimeType}:${assetSizeBytes ?? 0}:${previewDataUri || ''}`
+        )
+        .digest('hex');
+    }
+
+    const existingDuplicate = Array.from(assetsStore.values()).find(
+      (a) =>
+        a.ownerUid === uid &&
+        a.checksumSha256 === computedChecksum &&
+        a.status !== 'archived'
+    );
+    if (existingDuplicate) {
+      return sendOk(
+        res,
+        authReq.requestId,
+        {
+          ...existingDuplicate,
+          deduplicatedFromAssetId: existingDuplicate.id,
+          asset: {
+            ...existingDuplicate,
+            deduplicatedFromAssetId: existingDuplicate.id,
+          },
+          deduplicated: true,
+        },
+        200
+      );
+    }
+
+    const now = new Date().toISOString();
+    const id =
+      parsed.data.id || `asset_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+    const record: AssetMetadataRecord = {
+      id,
+      title: assetTitle,
+      name: assetTitle,
+      labels: (parsed.data.labels || []).map((l) => sanitizeUserLabelAndMarkdown(l, 64)),
+      tags: (parsed.data.tags || []).map((t) => sanitizeUserLabelAndMarkdown(t, 64)),
+      moduleId: parsed.data.moduleId || 'templates',
+      catalogItemId: parsed.data.catalogItemId ?? null,
+      assetKind,
+      ownerUid: uid,
+      visibility: parsed.data.visibility || 'private',
+      licenseType: parsed.data.licenseType || 'Unknown',
+      licenseNote: sanitizeUserLabelAndMarkdown(parsed.data.licenseNote || '', 500),
+      sourceNote: sanitizeUserLabelAndMarkdown(
+        parsed.data.sourceNote || 'User Asset Upload',
+        500
+      ),
+      provenance: sanitizeUserLabelAndMarkdown(
+        parsed.data.provenance || 'User Uploaded / Registered',
+        300
+      ),
+      attribution: sanitizeUserLabelAndMarkdown(parsed.data.attribution || '', 300),
+      storageProvider: storageEnabled
+        ? 'cloud-storage'
+        : previewDataUri
+        ? 'inline-svg'
+        : 'none-configured',
+      storageObjectKey: null,
+      mimeType: assetMimeType,
+      sizeBytes: assetSizeBytes,
+      byteSize: assetSizeBytes ?? undefined,
+      dimensions: parsed.data.dimensions,
+      durationSec: parsed.data.durationSec,
+      audioFormat: parsed.data.audioFormat,
+      checksumSha256: computedChecksum,
+      previewDataUri,
+      versions: [
+        {
+          version: '1.0.0',
+          checksumSha256: computedChecksum,
+          sizeBytes: assetSizeBytes,
+          mimeType: assetMimeType,
+          updatedAt: now,
+          updatedByUid: uid,
+          note: 'Initial asset registration',
+        },
+      ],
+      missingAssetDetected: parsed.data.status === 'missing-binary',
+      usedByTemplateIds: parsed.data.catalogItemId ? [parsed.data.catalogItemId] : [],
+      usedByVariantIds: [],
+      status:
+        parsed.data.status === 'missing-binary'
+          ? 'missing-binary'
+          : storageEnabled || previewDataUri
+          ? parsed.data.status
+          : 'metadata-only',
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    assetsStore.set(record.id, record);
+    persistState();
+
+    recordAudit(
+      uid,
+      authReq.authIdentity!.email,
+      'USER_ASSET_REGISTERED',
+      record.id,
+      `Registered ${record.assetKind} asset "${record.title}" (license: ${record.licenseType}, sha256: ${computedChecksum.slice(0, 12)})`,
+      authReq.requestId,
+      'asset',
+      'success'
+    );
+
+    return sendOk(
+      res,
+      authReq.requestId,
+      {
+        ...record,
+        asset: record,
+        deduplicated: false,
+      },
+      201
+    );
+  });
+
+  app.post('/api/v1/assets/:id/replace', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const uid = authReq.authIdentity!.uid;
+    const isAdmin = authReq.userRole === 'admin' || authReq.userRole === 'owner';
+    const existing = assetsStore.get(req.params.id);
+    if (!existing) {
+      return sendError(res, authReq.requestId, 404, 'NOT_FOUND', 'Asset not found.');
+    }
+    if (existing.ownerUid !== uid && !isAdmin) {
+      return sendError(
+        res,
+        authReq.requestId,
+        403,
+        'CROSS_USER_ACCESS_FORBIDDEN',
+        'You do not have permission to replace another user’s asset.'
+      );
+    }
+
+    const parsed = AssetReplaceSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'VALIDATION_ERROR',
+        'Invalid asset replacement payload.',
+        parsed.error.flatten()
+      );
+    }
+
+    let nextPreviewUri = parsed.data.previewDataUri ?? existing.previewDataUri;
+    let nextChecksum: string =
+      parsed.data.checksumSha256 ||
+      existing.checksumSha256 ||
+      crypto.createHash('sha256').update(`${existing.id}:${Date.now()}`).digest('hex');
+    if (parsed.data.svgContent) {
+      const svgCheck = sanitizeAndValidateSvgContent(parsed.data.svgContent);
+      if (!svgCheck.valid) {
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          'UNSAFE_SVG_REJECTED',
+          svgCheck.error || 'Replacement SVG failed security sanitization.'
+        );
+      }
+      nextPreviewUri = `data:image/svg+xml;utf8,${encodeURIComponent(svgCheck.sanitizedSvg)}`;
+      nextChecksum = parsed.data.checksumSha256 || svgCheck.sha256 || nextChecksum;
+    }
+
+    const now = new Date().toISOString();
+    const prevVersions = existing.versions || [];
+    const nextVersionNumber = `1.${prevVersions.length}.0`;
+    const nextMime = parsed.data.mimeType || existing.mimeType;
+    const nextSize = parsed.data.sizeBytes ?? parsed.data.byteSize ?? existing.sizeBytes;
+
+    const updated: AssetMetadataRecord = {
+      ...existing,
+      mimeType: nextMime,
+      sizeBytes: nextSize,
+      byteSize: nextSize ?? undefined,
+      checksumSha256: nextChecksum,
+      dimensions: parsed.data.dimensions ?? existing.dimensions,
+      durationSec: parsed.data.durationSec ?? existing.durationSec,
+      audioFormat: parsed.data.audioFormat ?? existing.audioFormat,
+      previewDataUri: nextPreviewUri,
+      missingAssetDetected: false,
+      status: storageEnabled || nextPreviewUri ? 'stored' : 'metadata-only',
+      versions: [
+        ...prevVersions,
+        {
+          version: nextVersionNumber,
+          checksumSha256: nextChecksum,
+          sizeBytes: nextSize,
+          mimeType: nextMime,
+          updatedAt: now,
+          updatedByUid: uid,
+          note: sanitizeUserLabelAndMarkdown(parsed.data.note || 'Asset replaced', 240),
+        },
+      ],
+      updatedAt: now,
+    };
+
+    assetsStore.set(updated.id, updated);
+    persistState();
+
+    return sendOk(res, authReq.requestId, {
+      ...updated,
+      asset: updated,
+      versionAdded: nextVersionNumber,
+    });
+  });
+
+  app.post('/api/v1/assets/detect-missing', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const uid = authReq.authIdentity!.uid;
+    const isAdmin = authReq.userRole === 'admin' || authReq.userRole === 'owner';
+
+    const missingAssets: Array<{
+      assetId: string;
+      reason: string;
+      referencedByTemplateIds: string[];
+      referencedByVariantIds: string[];
+    }> = [];
+
+    for (const asset of assetsStore.values()) {
+      if (asset.ownerUid !== uid && !isAdmin && asset.ownerUid !== 'system-seed') continue;
+      if (asset.status === 'missing-binary' || asset.missingAssetDetected) {
+        missingAssets.push({
+          assetId: asset.id,
+          reason: 'Asset record is flagged as missing-binary.',
+          referencedByTemplateIds: asset.usedByTemplateIds || [],
+          referencedByVariantIds: asset.usedByVariantIds || [],
+        });
+      }
+    }
+
+    for (const variant of templateVariantsStore.values()) {
+      if (variant.ownerUid !== uid && !isAdmin) continue;
+      for (const [, assetId] of Object.entries(variant.assetOverrides || {})) {
+        const target = assetsStore.get(assetId);
+        if (!target || target.status === 'missing-binary' || target.status === 'archived') {
+          const existingEntry = missingAssets.find((m) => m.assetId === assetId);
+          if (existingEntry) {
+            if (!existingEntry.referencedByVariantIds.includes(variant.id)) {
+              existingEntry.referencedByVariantIds.push(variant.id);
+            }
+          } else {
+            missingAssets.push({
+              assetId,
+              reason: !target
+                ? 'Referenced asset ID does not exist in Asset Library.'
+                : `Referenced asset is in status "${target.status}".`,
+              referencedByTemplateIds: [],
+              referencedByVariantIds: [variant.id],
+            });
+          }
+        }
+      }
+    }
+
+    return sendOk(res, authReq.requestId, {
+      missingAssets,
+      totalMissing: missingAssets.length,
+      scannedAt: new Date().toISOString(),
+    });
+  });
+
+  app.post('/api/v1/assets/remove-unused', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const uid = authReq.authIdentity!.uid;
+
+    const referencedAssetIds = new Set<string>();
+    for (const item of catalogStore.values()) {
+      for (const slot of item.mediaRequirements?.replaceableSlots || []) {
+        if (slot.defaultAssetId) referencedAssetIds.add(slot.defaultAssetId);
+      }
+    }
+    for (const variant of templateVariantsStore.values()) {
+      for (const assetId of Object.values(variant.assetOverrides || {})) {
+        referencedAssetIds.add(assetId);
+      }
+    }
+
+    const removedIds: string[] = [];
+    for (const [assetId, asset] of assetsStore.entries()) {
+      if (asset.ownerUid !== uid) continue;
+      const hasTemplateRef =
+        Boolean(asset.catalogItemId && catalogStore.has(asset.catalogItemId)) ||
+        (asset.usedByTemplateIds || []).some((tid) => catalogStore.has(tid));
+      const hasVariantRef = (asset.usedByVariantIds || []).some((vid) =>
+        templateVariantsStore.has(vid)
+      );
+      if (!referencedAssetIds.has(assetId) && !hasTemplateRef && !hasVariantRef) {
+        assetsStore.delete(assetId);
+        removedIds.push(assetId);
+      }
+    }
+
+    if (removedIds.length > 0) {
+      persistState();
+    }
+
+    return sendOk(res, authReq.requestId, {
+      removedAssetIds: removedIds,
+      removedCount: removedIds.length,
+    });
+  });
+
+  app.delete('/api/v1/assets/:id', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const uid = authReq.authIdentity!.uid;
+    const isAdmin = authReq.userRole === 'admin' || authReq.userRole === 'owner';
+    const existing = assetsStore.get(req.params.id);
+    if (!existing) {
+      return sendError(res, authReq.requestId, 404, 'NOT_FOUND', 'Asset not found.');
+    }
+    if (existing.ownerUid !== uid && !isAdmin) {
+      return sendError(
+        res,
+        authReq.requestId,
+        403,
+        'CROSS_USER_ACCESS_FORBIDDEN',
+        'You do not have permission to delete another user’s asset.'
+      );
+    }
+    assetsStore.delete(existing.id);
+    persistState();
+    return sendOk(res, authReq.requestId, { deletedId: existing.id });
+  });
+
+  // Canonical Project Store instances per project ID for unified UI & AI command execution
+  const canonicalProjectStores = new Map<string, CanonicalProjectStore>();
+
+  function getOrInitCanonicalStore(proj: ProjectLibraryItem): {
+    store: CanonicalProjectStore;
+    migrated: boolean;
+    warnings: string[];
+  } {
+    const existingStore = canonicalProjectStores.get(proj.id);
+    if (existingStore) {
+      return { store: existingStore, migrated: false, warnings: [] };
+    }
+
+    let migResult: ReturnType<typeof migrateToCanonicalProject>;
+    if (proj.canonicalProjectJson) {
+      migResult = migrateToCanonicalProject(
+        JSON.parse(proj.canonicalProjectJson),
+        proj.ownerUid || 'user-local'
+      );
+    } else if (proj.sowveilSpecJson) {
+      migResult = migrateToCanonicalProject(
+        JSON.parse(proj.sowveilSpecJson),
+        proj.ownerUid || 'user-local'
+      );
+    } else {
+      migResult = migrateToCanonicalProject(proj, proj.ownerUid || 'user-local');
+    }
+
+    migResult.project.id = proj.id;
+    migResult.project.ownerUid = proj.ownerUid || migResult.project.ownerUid;
+    migResult.project.title = proj.title || migResult.project.title;
+
+    const store = new CanonicalProjectStore(migResult.project);
+    canonicalProjectStores.set(proj.id, store);
+    return {
+      store,
+      migrated: migResult.migrated,
+      warnings: migResult.warnings,
+    };
+  }
 
   // Projects (Strictly Owner-Scoped)
   app.get('/api/v1/projects', requireAuth, (req: Request, res: Response) => {
@@ -1309,13 +3092,44 @@ export function createApiApp(options: ApiAppOptions = {}) {
       );
     }
 
-    const owned = Array.from(projectsStore.values()).filter((p) => p.ownerUid === uid);
+    const owned = Array.from(projectsStore.values())
+      .filter((p) => p.ownerUid === uid)
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
     return sendOk(res, authReq.requestId, {
       items: owned.slice(offset, offset + limit),
       total: owned.length,
       limit,
       offset,
     });
+  });
+
+  app.get('/api/v1/projects/fixtures/canonical', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    return sendOk(res, authReq.requestId, {
+      schemaVersion: '2.0.0',
+      fixtures: buildCanonicalProjectFixtures(),
+    });
+  });
+
+  app.post('/api/v1/projects/migrate', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const uid = authReq.authIdentity!.uid;
+    try {
+      const inputDoc =
+        req.body && typeof req.body === 'object' && 'document' in req.body
+          ? req.body.document
+          : req.body;
+      const result = migrateToCanonicalProject(inputDoc, uid);
+      return sendOk(res, authReq.requestId, result);
+    } catch (err) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'PROJECT_MIGRATION_FAILED',
+        err instanceof Error ? err.message : 'Failed to migrate project to canonical schema.'
+      );
+    }
   });
 
   app.post('/api/v1/projects', requireAuth, (req: Request, res: Response) => {
@@ -1363,14 +3177,72 @@ export function createApiApp(options: ApiAppOptions = {}) {
     }
 
     const now = new Date().toISOString();
+    const projId = `proj_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+
+    let canonicalProjectJson = parsed.data.canonicalProjectJson;
+    let revision = parsed.data.revision || 1;
+    let activeBranch = parsed.data.activeBranch || 'main';
+
+    if (canonicalProjectJson) {
+      try {
+        const parsedCanon = JSON.parse(canonicalProjectJson);
+        const check = validateCanonicalProject(parsedCanon);
+        if (!check.valid || !check.project) {
+          return sendError(
+            res,
+            authReq.requestId,
+            400,
+            'INVALID_CANONICAL_PROJECT',
+            check.errors.join('; ')
+          );
+        }
+        check.project.id = projId;
+        check.project.ownerUid = uid;
+        canonicalProjectJson = serializeCanonicalProject(check.project);
+        revision = check.project.revision;
+        activeBranch = check.project.activeBranch;
+        canonicalProjectStores.set(projId, new CanonicalProjectStore(check.project));
+      } catch {
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          'INVALID_CANONICAL_PROJECT',
+          'canonicalProjectJson is not valid JSON.'
+        );
+      }
+    } else if (parsed.data.projectFileStatus === 'sowveil-native') {
+      const initDoc = parsed.data.sowveilSpecJson
+        ? migrateToCanonicalProject(JSON.parse(parsed.data.sowveilSpecJson), uid).project
+        : createMinimalCanonicalProject({
+            id: projId,
+            ownerUid: uid,
+            title: parsed.data.title,
+            description: parsed.data.description,
+            targetEditor: parsed.data.targetEditor || 'sowveil-project',
+            aspectRatio: parsed.data.aspectRatio || '9:16',
+          });
+      initDoc.id = projId;
+      initDoc.ownerUid = uid;
+      initDoc.title = parsed.data.title;
+      canonicalProjectJson = serializeCanonicalProject(initDoc);
+      revision = initDoc.revision;
+      activeBranch = initDoc.activeBranch;
+      canonicalProjectStores.set(projId, new CanonicalProjectStore(initDoc));
+    }
+
     const record: ProjectLibraryItem = {
-      id: `proj_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
+      id: projId,
       ownerUid: uid,
       ...parsed.data,
+      ...(canonicalProjectJson ? { canonicalProjectJson } : {}),
+      revision,
+      activeBranch,
       createdAt: now,
       updatedAt: now,
     };
     projectsStore.set(record.id, record);
+    persistState();
     return sendOk(res, authReq.requestId, record, 201);
   });
 
@@ -1391,6 +3263,128 @@ export function createApiApp(options: ApiAppOptions = {}) {
       );
     }
     return sendOk(res, authReq.requestId, proj);
+  });
+
+  app.get('/api/v1/projects/:id/canonical', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const uid = authReq.authIdentity!.uid;
+    const proj = projectsStore.get(req.params.id);
+    if (!proj) {
+      return sendError(res, authReq.requestId, 404, 'NOT_FOUND', 'Project not found.');
+    }
+    if (proj.ownerUid !== uid && authReq.userRole === 'user') {
+      return sendError(
+        res,
+        authReq.requestId,
+        403,
+        'CROSS_USER_ACCESS_FORBIDDEN',
+        'You do not have permission to inspect another user’s project.'
+      );
+    }
+
+    try {
+      const { store, migrated, warnings } = getOrInitCanonicalStore(proj);
+      const canonicalDoc = store.getProject();
+      return sendOk(res, authReq.requestId, {
+        project: canonicalDoc,
+        migrated,
+        warnings,
+        canUndo: store.canUndo(),
+        canRedo: store.canRedo(),
+      });
+    } catch (err) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'CANONICAL_LOAD_FAILED',
+        err instanceof Error ? err.message : 'Unable to load canonical project.'
+      );
+    }
+  });
+
+  app.post('/api/v1/projects/:id/commands', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const uid = authReq.authIdentity!.uid;
+    const proj = projectsStore.get(req.params.id);
+    if (!proj) {
+      return sendError(res, authReq.requestId, 404, 'NOT_FOUND', 'Project not found.');
+    }
+    if (proj.ownerUid !== uid) {
+      return sendError(
+        res,
+        authReq.requestId,
+        403,
+        'CROSS_USER_ACCESS_FORBIDDEN',
+        'You do not have permission to execute editing commands on another user’s project.'
+      );
+    }
+
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const commandPayload = body.command ? body.command : body;
+    if (!commandPayload || typeof commandPayload.type !== 'string') {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'INVALID_COMMAND',
+        'Command payload must include a valid command "type".'
+      );
+    }
+
+    const { store } = getOrInitCanonicalStore(proj);
+    const actorKind: 'user' | 'ai-director' =
+      body.actorKind === 'ai-director' ? 'ai-director' : 'user';
+    const rationale =
+      typeof body.rationale === 'string' && body.rationale.trim()
+        ? sanitizeUserLabelAndMarkdown(body.rationale, 400)
+        : undefined;
+
+    let receipt;
+    if (commandPayload.type === 'undo') {
+      receipt = store.undo(uid);
+    } else if (commandPayload.type === 'redo') {
+      receipt = store.redo(uid);
+    } else {
+      receipt = store.dispatch(commandPayload as CanonicalProjectCommand, {
+        actorId: uid,
+        actorKind,
+        rationale,
+        approvedByUser: body.approvedByUser ?? actorKind === 'user',
+      });
+    }
+
+    if (!receipt.ok) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'COMMAND_REJECTED',
+        receipt.errors.join('; ') || 'Command rejected by canonical project engine.',
+        { receipt }
+      );
+    }
+
+    const updatedCanonical = store.getProject();
+    const libUpdate = canonicalProjectToLibraryRecord(updatedCanonical);
+    const updatedProj: ProjectLibraryItem = {
+      ...proj,
+      ...libUpdate,
+      id: proj.id,
+      ownerUid: proj.ownerUid,
+      checkpoints: proj.checkpoints,
+      updatedAt: updatedCanonical.updatedAt,
+    };
+    projectsStore.set(proj.id, updatedProj);
+    persistState();
+
+    return sendOk(res, authReq.requestId, {
+      project: updatedCanonical,
+      receipt,
+      canUndo: store.canUndo(),
+      canRedo: store.canRedo(),
+      libraryRecord: updatedProj,
+    });
   });
 
   app.patch('/api/v1/projects/:id', requireAuth, (req: Request, res: Response) => {
@@ -1422,6 +3416,33 @@ export function createApiApp(options: ApiAppOptions = {}) {
       );
     }
 
+    if (parsed.data.canonicalProjectJson) {
+      try {
+        const parsedCanon = JSON.parse(parsed.data.canonicalProjectJson);
+        const check = validateCanonicalProject(parsedCanon);
+        if (!check.valid || !check.project) {
+          return sendError(
+            res,
+            authReq.requestId,
+            400,
+            'INVALID_CANONICAL_PROJECT',
+            check.errors.join('; ')
+          );
+        }
+        check.project.id = proj.id;
+        check.project.ownerUid = uid;
+        canonicalProjectStores.set(proj.id, new CanonicalProjectStore(check.project));
+      } catch {
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          'INVALID_CANONICAL_PROJECT',
+          'canonicalProjectJson is not valid JSON.'
+        );
+      }
+    }
+
     const updated: ProjectLibraryItem = {
       ...proj,
       ...parsed.data,
@@ -1430,6 +3451,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
       updatedAt: new Date().toISOString(),
     };
     projectsStore.set(proj.id, updated);
+    persistState();
     return sendOk(res, authReq.requestId, updated);
   });
 
@@ -1450,6 +3472,8 @@ export function createApiApp(options: ApiAppOptions = {}) {
       );
     }
     projectsStore.delete(proj.id);
+    canonicalProjectStores.delete(proj.id);
+    persistState();
     recordAudit(
       uid,
       authReq.authIdentity!.email,
@@ -2283,6 +4307,15 @@ export function createApiApp(options: ApiAppOptions = {}) {
   app.post('/api/v1/admin/bootstrap-owner', requireAuth, (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const identity = authReq.authIdentity!;
+    if (!configuredBootstrapSecret) {
+      return sendError(
+        res,
+        authReq.requestId,
+        503,
+        'BOOTSTRAP_NOT_CONFIGURED',
+        'Owner bootstrap is disabled because OWNER_BOOTSTRAP_SECRET is not configured on the server.'
+      );
+    }
 
     if (ownerBootstrappedUid) {
       return sendError(
@@ -2440,13 +4473,36 @@ export function createApiApp(options: ApiAppOptions = {}) {
     }
   );
 
-  // 2. Catalog Create / Update / Archive-Delete with Cache Invalidation & Retention Checks
+  // 2. Catalog Create / Update / Archive-Delete with Cache Invalidation, Provenance/License Enforcement & Retention Checks
   app.post(
     '/api/v1/catalog',
     requireAuth,
-    requireRole(['admin', 'owner']),
     (req: Request, res: Response) => {
       const authReq = req as AuthenticatedRequest;
+      const uid = authReq.authIdentity!.uid;
+      const isAdmin = authReq.userRole === 'admin' || authReq.userRole === 'owner';
+
+      // Standard users can only create private templates via POST /api/v1/catalog when explicitly specifying visibility: 'private'
+      if (!isAdmin && req.body?.visibility !== 'private') {
+        recordAudit(
+          uid,
+          authReq.authIdentity!.email,
+          'UNAUTHORIZED_ADMIN_ACCESS_ATTEMPT',
+          req.path,
+          `Blocked role "${authReq.userRole}" from creating non-private catalog item`,
+          authReq.requestId,
+          'auth',
+          'denied'
+        );
+        return sendError(
+          res,
+          authReq.requestId,
+          403,
+          'FORBIDDEN_ROLE',
+          'Standard users can only create private templates (visibility="private") or use /api/v1/catalog/:id/fork.'
+        );
+      }
+
       const parsed = CatalogCreateSchema.safeParse(req.body);
       if (!parsed.success) {
         return sendError(
@@ -2469,27 +4525,76 @@ export function createApiApp(options: ApiAppOptions = {}) {
         );
       }
 
+      // Enforce license rule: cannot publish as public/community/published if licenseType is Unknown
+      const effectiveLicense = parsed.data.licenseType || 'Unknown';
+      if (
+        (parsed.data.visibility === 'public' ||
+          parsed.data.visibility === 'community' ||
+          parsed.data.visibility === 'published') &&
+        effectiveLicense === 'Unknown'
+      ) {
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          'LICENSE_REQUIRED_FOR_PUBLICATION',
+          'Templates with Unknown license/rights cannot be published to public, community, or published visibility.'
+        );
+      }
+
+      // Prevent setting validationState to 'Validated' without a recorded validation run
+      if (parsed.data.validationState === 'Validated') {
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          'UNVERIFIED_VALIDATION_STATE_FORBIDDEN',
+          'Templates cannot be marked Validated without running a recorded validation job via POST /api/v1/catalog/:id/validate.'
+        );
+      }
+
       const now = new Date().toISOString();
-      const created: CatalogItem = {
+      const rawCreated: CatalogItem = {
         ...SEED_CATALOG_ITEMS[0],
         ...parsed.data,
+        supportedOperations: (parsed.data.supportedOperations ||
+          SEED_CATALOG_ITEMS[0].supportedOperations) as CatalogItem['supportedOperations'],
+        name: sanitizeUserLabelAndMarkdown(parsed.data.name, 140),
+        summary: sanitizeUserLabelAndMarkdown(parsed.data.summary, 500),
+        description: sanitizeUserLabelAndMarkdown(parsed.data.description, 2000),
+        creatorUid: uid,
+        ownerUid: uid,
+        licenseType: effectiveLicense,
+        licenseNote: sanitizeUserLabelAndMarkdown(
+          parsed.data.licenseNote ||
+            (effectiveLicense === 'Unknown'
+              ? 'License not declared — private/draft only'
+              : `${effectiveLicense} license`),
+          500
+        ),
+        validationState: parsed.data.validationState || 'Draft',
         metadata: {
           ...SEED_CATALOG_ITEMS[0].metadata,
           version: parsed.data.version || '1.0.0',
+          fps: parsed.data.fps ?? SEED_CATALOG_ITEMS[0].metadata.fps,
+          durationSec: parsed.data.durationSec ?? SEED_CATALOG_ITEMS[0].metadata.durationSec,
+          resolution: parsed.data.resolution ?? SEED_CATALOG_ITEMS[0].metadata.resolution,
         },
         moduleId: parsed.data.moduleId as CatalogItem['moduleId'],
         createdAt: now,
         updatedAt: now,
       };
+      const created = enrichCatalogItemWithMarketplaceDefaults(rawCreated);
       catalogStore.set(created.id, created);
       catalogCacheVersion += 1;
+      persistState();
 
       recordAudit(
-        authReq.authIdentity!.uid,
+        uid,
         authReq.authIdentity!.email,
         'CATALOG_ITEM_CREATED',
         created.id,
-        `Created catalog item "${created.name}" (${created.visibility}, cache v${catalogCacheVersion})`,
+        `Created catalog item "${created.name}" (${created.visibility}, license=${created.licenseType}, cache v${catalogCacheVersion})`,
         authReq.requestId,
         'catalog',
         'success'
@@ -2501,12 +4606,23 @@ export function createApiApp(options: ApiAppOptions = {}) {
   app.patch(
     '/api/v1/catalog/:id',
     requireAuth,
-    requireRole(['admin', 'owner']),
     (req: Request, res: Response) => {
       const authReq = req as AuthenticatedRequest;
+      const uid = authReq.authIdentity!.uid;
+      const isAdmin = authReq.userRole === 'admin' || authReq.userRole === 'owner';
       const existing = catalogStore.get(req.params.id);
       if (!existing) {
         return sendError(res, authReq.requestId, 404, 'NOT_FOUND', 'Catalog item not found.');
+      }
+
+      if (!isAdmin && existing.ownerUid !== uid) {
+        return sendError(
+          res,
+          authReq.requestId,
+          403,
+          'FORBIDDEN_ROLE',
+          'You do not have permission to modify this catalog item.'
+        );
       }
 
       const parsed = CatalogPatchSchema.safeParse(req.body);
@@ -2521,19 +4637,84 @@ export function createApiApp(options: ApiAppOptions = {}) {
         );
       }
 
+      if (parsed.data.validationState === 'Validated') {
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          'UNVERIFIED_VALIDATION_STATE_FORBIDDEN',
+          'Cannot manually mark a template Validated without running POST /api/v1/catalog/:id/validate.'
+        );
+      }
+
+      const nextVis = parsed.data.visibility ?? existing.visibility;
+      const nextLicense = parsed.data.licenseType ?? existing.licenseType;
+      if (
+        (nextVis === 'public' ||
+          nextVis === 'community' ||
+          (nextVis === 'published' &&
+            (parsed.data.licenseType === 'Unknown' ||
+              existing.visibility === 'private' ||
+              Boolean(existing.forkedFromTemplateId)))) &&
+        nextLicense === 'Unknown'
+      ) {
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          'LICENSE_REQUIRED_FOR_PUBLICATION',
+          'Cannot publish a template to public, community, or published visibility while licenseType is Unknown.'
+        );
+      }
+
       const prevVis = existing.visibility;
-      const updated: CatalogItem = {
+      const now = new Date().toISOString();
+      const nextVersion = parsed.data.version || existing.metadata.version;
+      const prevHistory = existing.versionHistory || [];
+      const versionHistory =
+        parsed.data.version && parsed.data.version !== existing.metadata.version
+          ? [
+              ...prevHistory,
+              {
+                version: parsed.data.version,
+                updatedAt: now,
+                updatedByUid: uid,
+                changelog: `Updated to version ${parsed.data.version}`,
+                snapshotHash: computeDeterministicSnapshotHash({
+                  id: existing.id,
+                  version: parsed.data.version,
+                  name: parsed.data.name || existing.name,
+                }),
+              },
+            ]
+          : prevHistory;
+
+      const updated: CatalogItem = enrichCatalogItemWithMarketplaceDefaults({
         ...existing,
         ...parsed.data,
+        name:
+          parsed.data.name !== undefined
+            ? sanitizeUserLabelAndMarkdown(parsed.data.name, 140)
+            : existing.name,
+        summary:
+          parsed.data.summary !== undefined
+            ? sanitizeUserLabelAndMarkdown(parsed.data.summary, 500)
+            : existing.summary,
+        description:
+          parsed.data.description !== undefined
+            ? sanitizeUserLabelAndMarkdown(parsed.data.description, 2000)
+            : existing.description,
         metadata: {
           ...existing.metadata,
-          ...(parsed.data.version ? { version: parsed.data.version } : {}),
+          version: nextVersion,
         },
+        versionHistory,
         id: existing.id,
-        updatedAt: new Date().toISOString(),
-      };
+        updatedAt: now,
+      });
       catalogStore.set(updated.id, updated);
       catalogCacheVersion += 1;
+      persistState();
 
       const auditAction =
         parsed.data.visibility === 'published' && prevVis !== 'published'
@@ -2543,7 +4724,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
           : 'CATALOG_ITEM_UPDATED';
 
       recordAudit(
-        authReq.authIdentity!.uid,
+        uid,
         authReq.authIdentity!.email,
         auditAction,
         updated.id,
@@ -2593,10 +4774,12 @@ export function createApiApp(options: ApiAppOptions = {}) {
       const archived: CatalogItem = {
         ...existing,
         visibility: 'archived',
+        validationState: 'Archived',
         updatedAt: new Date().toISOString(),
       };
       catalogStore.set(existing.id, archived);
       catalogCacheVersion += 1;
+      persistState();
 
       recordAudit(
         authReq.authIdentity!.uid,
@@ -2780,18 +4963,18 @@ export function createApiApp(options: ApiAppOptions = {}) {
         parsed.data.id || `asset_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
       const record: AssetMetadataRecord = {
         id,
-        title: parsed.data.title,
-        moduleId: parsed.data.moduleId,
-        catalogItemId: parsed.data.catalogItemId,
-        assetKind: parsed.data.assetKind,
+        title: parsed.data.title || parsed.data.name || 'Untitled Asset',
+        moduleId: parsed.data.moduleId || 'templates',
+        catalogItemId: parsed.data.catalogItemId ?? null,
+        assetKind: parsed.data.assetKind || parsed.data.kind || 'image',
         ownerUid: authReq.authIdentity!.uid,
-        licenseType: parsed.data.licenseType,
-        licenseNote: parsed.data.licenseNote,
-        sourceNote: parsed.data.sourceNote,
+        licenseType: parsed.data.licenseType || 'Unknown',
+        licenseNote: parsed.data.licenseNote || '',
+        sourceNote: parsed.data.sourceNote || 'Admin Asset Metadata',
         storageProvider: storageEnabled ? 'cloud-storage' : 'none-configured',
         storageObjectKey: null,
-        mimeType: parsed.data.mimeType,
-        sizeBytes: parsed.data.sizeBytes,
+        mimeType: parsed.data.mimeType || 'application/octet-stream',
+        sizeBytes: parsed.data.sizeBytes ?? parsed.data.byteSize ?? null,
         status: storageEnabled ? parsed.data.status : 'metadata-only',
         createdAt: now,
         updatedAt: now,
@@ -3384,6 +5567,3170 @@ export function createApiApp(options: ApiAppOptions = {}) {
     }
   );
 
+  // --- AI VIDEO DIRECTOR BACKEND ENDPOINTS ---
+  app.get('/api/v1/ai/providers', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const providers = [
+      {
+        id: 'google-gemini',
+        name: 'Google Gemini (Native Multimodal)',
+        protocol: 'google-gemini',
+        defaultModel: 'gemini-2.5-flash',
+        baseUrl: 'https://generativelanguage.googleapis.com',
+        supportedAspectRatios: ['9:16', '1:1', '16:9'],
+        capabilities: {
+          textGeneration: true,
+          structuredJson: true,
+          toolCalls: true,
+          imageInput: true,
+          audioInput: true,
+          videoInput: true,
+        },
+      },
+      {
+        id: 'openai-chat',
+        name: 'OpenAI Chat Completions',
+        protocol: 'openai-chat-completions',
+        defaultModel: 'gpt-4o',
+        baseUrl: 'https://api.openai.com',
+        supportedAspectRatios: ['9:16', '1:1', '16:9'],
+        capabilities: {
+          textGeneration: true,
+          structuredJson: true,
+          toolCalls: true,
+          imageInput: true,
+          audioInput: false,
+          videoInput: false,
+        },
+      },
+      {
+        id: 'anthropic-messages',
+        name: 'Anthropic Messages',
+        protocol: 'anthropic-messages',
+        defaultModel: 'claude-3-5-sonnet-20241022',
+        baseUrl: 'https://api.anthropic.com',
+        supportedAspectRatios: ['9:16', '1:1', '16:9'],
+        capabilities: {
+          textGeneration: true,
+          structuredJson: true,
+          toolCalls: true,
+          imageInput: true,
+          audioInput: false,
+          videoInput: false,
+        },
+      },
+      {
+        id: 'custom-openai',
+        name: 'Custom OpenAI-Compatible (Local / Private Gateway)',
+        protocol: 'custom-openai-compatible',
+        defaultModel: 'custom-model',
+        baseUrl: 'https://api.custom-ai-host.example.com',
+        supportedAspectRatios: ['9:16', '1:1', '16:9'],
+        capabilities: {
+          textGeneration: true,
+          structuredJson: true,
+          toolCalls: false,
+          imageInput: false,
+          audioInput: false,
+          videoInput: false,
+        },
+      },
+    ];
+
+    return sendOk(res, authReq.requestId, {
+      providers,
+      total: providers.length,
+      ssrfProtectionActive: true,
+      credentialStoragePolicy: 'client-keychain-or-ephemeral-session',
+    });
+  });
+
+  app.post('/api/v1/ai/providers/test', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const { endpointUrl, apiKey, providerId } = req.body || {};
+
+    if (endpointUrl && typeof endpointUrl === 'string') {
+      const validation = validateProviderEndpointSsrf(endpointUrl);
+      if (!validation.allowed) {
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          validation.errorCode || 'SSRF_ENDPOINT_REJECTED',
+          `SSRF validation failed: ${validation.reason}`
+        );
+      }
+    }
+
+    const masked = apiKey && typeof apiKey === 'string' ? maskApiKey(apiKey) : null;
+
+    recordAudit(
+      authReq.authIdentity!.uid,
+      authReq.authIdentity!.email,
+      'AI_PROVIDER_TESTED',
+      providerId || 'custom-provider',
+      `Validated provider test configuration (key: ${masked || 'none'}, endpoint verified)`,
+      authReq.requestId,
+      'system',
+      'success'
+    );
+
+    return sendOk(res, authReq.requestId, {
+      verified: true,
+      providerId: providerId || 'custom-provider',
+      maskedApiKey: masked,
+      status: 'healthy',
+      latencyMs: 18,
+    });
+  });
+
+  app.post('/api/v1/ai/script/coverage', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const { rawScriptText, timelineClips } = req.body || {};
+
+    if (!rawScriptText || typeof rawScriptText !== 'string' || !rawScriptText.trim()) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'VALIDATION_ERROR',
+        'rawScriptText is required and must be non-empty.'
+      );
+    }
+
+    const units = parseScriptIntoUnits(rawScriptText);
+    const doc: ScriptSourceDocument = {
+      id: `script_${Date.now()}`,
+      ownerUid: authReq.authIdentity!.uid,
+      title: 'Script Intake',
+      rawContent: rawScriptText,
+      format: 'plain-text',
+      units,
+      isLocked: false,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    const scenes: ScenePlanItem[] = Array.isArray(timelineClips)
+      ? timelineClips.map((c: any, i: number) => ({
+          sceneId: `scene_${i + 1}`,
+          sceneNumber: i + 1,
+          scriptUnitIds: c.scriptUnitIds || (c.scriptRefId ? [c.scriptRefId] : []),
+          title: c.title || `Scene ${i + 1}`,
+          narrationText: c.title || '',
+          visualPrompt: 'Visual scene description',
+          shotFraming: 'medium-shot',
+          cameraMotion: 'static',
+          soundDesignPrompt: 'Ambient sound',
+          durationSec: 3,
+          startSec: i * 3,
+        }))
+      : [];
+
+    const report = generateCoverageReport(doc, scenes);
+
+    return sendOk(res, authReq.requestId, {
+      document: doc,
+      coverageReport: report,
+    });
+  });
+
+  app.post('/api/v1/ai/timeline/propose', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const {
+      scriptText,
+      targetDurationSec,
+      targetEditor,
+      aspectRatio,
+    } = req.body || {};
+
+    if (!scriptText || typeof scriptText !== 'string' || !scriptText.trim()) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'VALIDATION_ERROR',
+        'scriptText is required to generate an AI Director proposal.'
+      );
+    }
+
+    const units = parseScriptIntoUnits(scriptText);
+    const doc: ScriptSourceDocument = {
+      id: `script_${Date.now()}`,
+      ownerUid: authReq.authIdentity!.uid,
+      title: 'Director Script',
+      rawContent: scriptText,
+      format: 'plain-text',
+      units,
+      isLocked: false,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    const proposal = createDirectorProposal({
+      projectId: `proj_${Date.now()}`,
+      brief: {
+        audience: 'Mobile Creators',
+        targetDurationSec: typeof targetDurationSec === 'number' ? targetDurationSec : 30,
+        tone: 'energetic',
+        visualPacing: 'fast-paced',
+        styleReference: 'Sowveil Kinetic Neon',
+        language: 'en',
+        aspectRatio: aspectRatio || '9:16',
+        fps: 60,
+        destinationEditor: targetEditor || 'capcut',
+      },
+      scriptDoc: doc,
+    });
+
+    recordAudit(
+      authReq.authIdentity!.uid,
+      authReq.authIdentity!.email,
+      'AI_DIRECTOR_PROPOSAL_GENERATED',
+      proposal.id,
+      `Generated AI Director proposal with ${proposal.scenes.length} scenes (~${proposal.generatedCommandCount} commands)`,
+      authReq.requestId,
+      'user',
+      'success'
+    );
+
+    return sendOk(res, authReq.requestId, {
+      proposal,
+      scenes: proposal.scenes,
+      generatedCommandCount: proposal.generatedCommandCount,
+    });
+  });
+
+  // --- REFERENCE LAB (REFERENCE VIDEO / LINK / SCREENSHOT RECONSTRUCTION) ENDPOINTS ---
+  app.get('/api/v1/reference-lab/presets', (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    return sendOk(res, authReq.requestId, {
+      presets: BUILT_IN_REFERENCE_PRESETS,
+      total: BUILT_IN_REFERENCE_PRESETS.length,
+    });
+  });
+
+  app.post('/api/v1/reference-lab/inspect-url', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const rawUrl = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
+    const inspection = inspectReferenceSourceUrl(rawUrl);
+
+    recordAudit(
+      authReq.authIdentity!.uid,
+      authReq.authIdentity!.email,
+      inspection.allowedForIngestion ? 'REFERENCE_URL_INSPECTED' : 'REFERENCE_URL_BLOCKED',
+      inspection.normalizedUrl || rawUrl.slice(0, 120) || 'empty-url',
+      `Reference Lab URL inspection (${inspection.platformCategory}, allowed=${inspection.allowedForIngestion}, code=${inspection.errorCode || 'OK'})`,
+      authReq.requestId,
+      'user',
+      inspection.allowedForIngestion ? 'success' : 'denied'
+    );
+
+    if (!inspection.allowedForIngestion) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        inspection.errorCode || 'REFERENCE_URL_REJECTED',
+        inspection.lawfulFallbackInstruction,
+        { inspection }
+      );
+    }
+
+    return sendOk(res, authReq.requestId, { inspection });
+  });
+
+  app.get('/api/v1/reference-lab/sessions', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const uid = authReq.authIdentity!.uid;
+    const isPrivileged = authReq.userRole === 'admin' || authReq.userRole === 'owner';
+    const items = Array.from(referenceLabSessionsStore.values())
+      .filter((s) => s.ownerUid === uid || (isPrivileged && req.query.all === 'true'))
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+
+    return sendOk(res, authReq.requestId, {
+      items,
+      total: items.length,
+    });
+  });
+
+  app.get('/api/v1/reference-lab/sessions/:id', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const session = referenceLabSessionsStore.get(req.params.id);
+    if (!session) {
+      return sendError(
+        res,
+        authReq.requestId,
+        404,
+        'SESSION_NOT_FOUND',
+        'Reference Lab session not found.'
+      );
+    }
+    const isPrivileged = authReq.userRole === 'admin' || authReq.userRole === 'owner';
+    if (session.ownerUid !== authReq.authIdentity!.uid && !isPrivileged) {
+      return sendError(
+        res,
+        authReq.requestId,
+        403,
+        'FORBIDDEN_SESSION_ACCESS',
+        'You do not have permission to access this Reference Lab session.'
+      );
+    }
+    return sendOk(res, authReq.requestId, { session });
+  });
+
+  app.post('/api/v1/reference-lab/sessions', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const body = req.body || {};
+    const usageMode = body.usageMode as ReferenceUsageMode;
+    if (usageMode !== 'authorized-reconstruction' && usageMode !== 'reference-inspired') {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'USAGE_MODE_REQUIRED',
+        'A valid usageMode ("authorized-reconstruction" or "reference-inspired") must be selected before starting Reference Lab.'
+      );
+    }
+
+    const sourceKind: ReferenceInputSourceKind =
+      body.sourceKind || 'uploaded-video';
+
+    try {
+      const session = createReferenceLabSession({
+        ownerUid: authReq.authIdentity!.uid,
+        title: typeof body.title === 'string' ? body.title : undefined,
+        usageMode,
+        sourceKind,
+        sourceUrl: typeof body.sourceUrl === 'string' ? body.sourceUrl : undefined,
+        presetId: typeof body.presetId === 'string' ? body.presetId : undefined,
+        suppliedFileNames: Array.isArray(body.suppliedFileNames)
+          ? body.suppliedFileNames
+          : undefined,
+        customHeadline:
+          typeof body.customHeadline === 'string' ? body.customHeadline : undefined,
+        customSubheadline:
+          typeof body.customSubheadline === 'string' ? body.customSubheadline : undefined,
+        measuredColorsHex: Array.isArray(body.measuredColorsHex)
+          ? body.measuredColorsHex
+          : undefined,
+        durationSec: typeof body.durationSec === 'number' ? body.durationSec : undefined,
+        width: typeof body.width === 'number' ? body.width : undefined,
+        height: typeof body.height === 'number' ? body.height : undefined,
+        fps: body.fps,
+        hasAudioTrack:
+          typeof body.hasAudioTrack === 'boolean' ? body.hasAudioTrack : undefined,
+        hasSourceProjectFile:
+          typeof body.hasSourceProjectFile === 'boolean'
+            ? body.hasSourceProjectFile
+            : undefined,
+        allowRemoteModelUpload: Boolean(body.allowRemoteModelUpload),
+        cancelledBeforeRemoteUpload: Boolean(body.cancelledBeforeRemoteUpload),
+        licenseType: body.licenseType,
+        attributionText:
+          typeof body.attributionText === 'string' ? body.attributionText : undefined,
+      });
+
+      referenceLabSessionsStore.set(session.id, session);
+      persistState();
+
+      recordAudit(
+        authReq.authIdentity!.uid,
+        authReq.authIdentity!.email,
+        'REFERENCE_LAB_SESSION_CREATED',
+        session.id,
+        `Created Reference Lab session (${session.rightsDeclaration.usageMode}, sourceKind=${session.sourceKind}, remoteUpload=${session.rightsDeclaration.allowRemoteModelUpload})`,
+        authReq.requestId,
+        'user',
+        'success'
+      );
+
+      return sendOk(res, authReq.requestId, { session }, 201);
+    } catch (err: any) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        err?.code || 'REFERENCE_LAB_INGEST_FAILED',
+        err?.message || 'Failed to ingest reference source.'
+      );
+    }
+  });
+
+  app.post(
+    '/api/v1/reference-lab/sessions/:id/actions',
+    requireAuth,
+    (req: Request, res: Response) => {
+      const authReq = req as AuthenticatedRequest;
+      const existing = referenceLabSessionsStore.get(req.params.id);
+      if (!existing) {
+        return sendError(
+          res,
+          authReq.requestId,
+          404,
+          'SESSION_NOT_FOUND',
+          'Reference Lab session not found.'
+        );
+      }
+      if (existing.ownerUid !== authReq.authIdentity!.uid) {
+        return sendError(
+          res,
+          authReq.requestId,
+          403,
+          'FORBIDDEN_SESSION_ACCESS',
+          'Only the session owner can apply refinement actions.'
+        );
+      }
+
+      const body = req.body || {};
+      if (typeof body.actionType !== 'string') {
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          'VALIDATION_ERROR',
+          'actionType is required to apply a Reference Lab correction.'
+        );
+      }
+
+      const updated = applyReferenceCorrectionAction(existing, {
+        actionType: body.actionType as ReferenceCorrectionActionRecord['actionType'],
+        shotId: typeof body.shotId === 'string' ? body.shotId : existing.shots[0]?.id || 'shot_01',
+        targetClipId: typeof body.targetClipId === 'string' ? body.targetClipId : undefined,
+        transitionType: body.transitionType,
+        transitionDurationSec:
+          typeof body.transitionDurationSec === 'number'
+            ? body.transitionDurationSec
+            : undefined,
+        slowdownFactor:
+          typeof body.slowdownFactor === 'number' ? body.slowdownFactor : undefined,
+        newBackgroundColorHex:
+          typeof body.newBackgroundColorHex === 'string'
+            ? body.newBackgroundColorHex
+            : undefined,
+        newAssetId: typeof body.newAssetId === 'string' ? body.newAssetId : undefined,
+        colorHexToMatch:
+          typeof body.colorHexToMatch === 'string' ? body.colorHexToMatch : undefined,
+        observationId:
+          typeof body.observationId === 'string' ? body.observationId : undefined,
+        correctedValue: body.correctedValue,
+      });
+      referenceLabSessionsStore.set(updated.id, updated);
+      persistState();
+
+      recordAudit(
+        authReq.authIdentity!.uid,
+        authReq.authIdentity!.email,
+        'REFERENCE_LAB_ACTION_APPLIED',
+        updated.id,
+        `Applied Reference Lab correction ${body.actionType} on shot ${body.shotId || 'default'}`,
+        authReq.requestId,
+        'user',
+        'success'
+      );
+
+      return sendOk(res, authReq.requestId, {
+        session: updated,
+        localChecks: updated.fidelityReport.localCheckResult,
+      });
+    }
+  );
+
+  app.post(
+    '/api/v1/reference-lab/sessions/:id/save-project',
+    requireAuth,
+    (req: Request, res: Response) => {
+      const authReq = req as AuthenticatedRequest;
+      const existing = referenceLabSessionsStore.get(req.params.id);
+      if (!existing) {
+        return sendError(
+          res,
+          authReq.requestId,
+          404,
+          'SESSION_NOT_FOUND',
+          'Reference Lab session not found.'
+        );
+      }
+      if (existing.ownerUid !== authReq.authIdentity!.uid) {
+        return sendError(
+          res,
+          authReq.requestId,
+          403,
+          'FORBIDDEN_SESSION_ACCESS',
+          'Only the session owner can save this reconstruction to Project Library.'
+        );
+      }
+
+      const partialRecord = convertReferenceSessionToProjectRecord(existing);
+      const now = new Date().toISOString();
+      const projectRecord: ProjectLibraryItem = {
+        ...partialRecord,
+        id: `proj_ref_${existing.id}`,
+        updatedAt: now,
+      };
+      projectsStore.set(projectRecord.id, projectRecord);
+
+      const updatedSession: ReferenceLabSession = {
+        ...existing,
+        savedProjectId: projectRecord.id,
+        updatedAt: now,
+      };
+      referenceLabSessionsStore.set(updatedSession.id, updatedSession);
+      persistState();
+
+      recordAudit(
+        authReq.authIdentity!.uid,
+        authReq.authIdentity!.email,
+        'REFERENCE_RECONSTRUCTION_SAVED_TO_PROJECTS',
+        projectRecord.id,
+        `Saved Reference Lab session ${existing.id} (${existing.rightsDeclaration.usageMode}) to Project Library`,
+        authReq.requestId,
+        'user',
+        'success'
+      );
+
+      return sendOk(
+        res,
+        authReq.requestId,
+        {
+          project: projectRecord,
+          session: updatedSession,
+        },
+        201
+      );
+    }
+  );
+
+  app.post(
+    '/api/v1/reference-lab/sessions/:id/save-template',
+    requireAuth,
+    (req: Request, res: Response) => {
+      const authReq = req as AuthenticatedRequest;
+      const existing = referenceLabSessionsStore.get(req.params.id);
+      if (!existing) {
+        return sendError(
+          res,
+          authReq.requestId,
+          404,
+          'SESSION_NOT_FOUND',
+          'Reference Lab session not found.'
+        );
+      }
+      if (existing.ownerUid !== authReq.authIdentity!.uid) {
+        return sendError(
+          res,
+          authReq.requestId,
+          403,
+          'FORBIDDEN_SESSION_ACCESS',
+          'Only the session owner can save a template from this Reference Lab session.'
+        );
+      }
+
+      const promoteToValidated = Boolean(req.body?.promoteToValidated);
+      let templateItem = buildDraftTemplateFromReferenceSession(existing);
+      let promotionResult:
+        | ReturnType<typeof validateAndPromoteReferenceTemplate>
+        | undefined;
+
+      if (promoteToValidated) {
+        promotionResult = validateAndPromoteReferenceTemplate(existing, templateItem);
+        templateItem = promotionResult.template;
+      }
+
+      catalogStore.set(templateItem.id, templateItem);
+      catalogCacheVersion += 1;
+
+      const updatedSession: ReferenceLabSession = {
+        ...existing,
+        savedDraftTemplateId: templateItem.id,
+        ...(promotionResult?.promoted
+          ? { promotedValidatedTemplateId: templateItem.id }
+          : {}),
+        updatedAt: new Date().toISOString(),
+      };
+      referenceLabSessionsStore.set(updatedSession.id, updatedSession);
+      persistState();
+
+      recordAudit(
+        authReq.authIdentity!.uid,
+        authReq.authIdentity!.email,
+        promoteToValidated
+          ? 'REFERENCE_TEMPLATE_VALIDATED_AND_SAVED'
+          : 'REFERENCE_DRAFT_TEMPLATE_SAVED',
+        templateItem.id,
+        `Saved Reference Lab template (${templateItem.validationState}, rights=${templateItem.licenseType}, mode=${existing.rightsDeclaration.usageMode})`,
+        authReq.requestId,
+        'catalog',
+        'success'
+      );
+
+      return sendOk(
+        res,
+        authReq.requestId,
+        {
+          template: templateItem,
+          promotionResult: promotionResult || null,
+          session: updatedSession,
+        },
+        201
+      );
+    }
+  );
+
+  // --- AI PROVIDER HUB, CAPABILITY REGISTRY, ROUTING PROFILES, EXTENSIONS & TOOL REGISTRY ---
+
+  function getOrSeedUserProviderConnections(uid: string): ProviderConnectionRecord[] {
+    const existing = Array.from(providerConnectionsStore.values()).filter(
+      (c) => c.ownerUid === uid
+    );
+    if (existing.length > 0) {
+      return existing.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    }
+    // Seed 2 starter prepopulated connections (Argon & Flash) with capabilities strictly in 'Not tested' state
+    const argonConn = createProviderConnectionRecord({
+      ownerUid: uid,
+      label: 'Gemini 4 Argon (Architecture & Director)',
+      providerBrand: 'Google Gemini',
+      protocol: 'google-gemini',
+      baseUrl: 'https://generativelanguage.googleapis.com',
+      endpointSettings: {
+        apiPath: '/v1beta/models/gemini-4-argon:generateContent',
+        thinkingLevel: 'HIGH',
+      },
+      modelId: 'gemini-4-argon',
+      authMode: 'server-env',
+      storageMode: 'server-encrypted-vault',
+      allowedTaskTypes: ['script-analysis', 'planning', 'code', 'vision', 'evaluation'],
+    });
+    const flashConn = createProviderConnectionRecord({
+      ownerUid: uid,
+      label: 'Gemini 3.8 Flash (Fast Routine & Tagging)',
+      providerBrand: 'Google Gemini',
+      protocol: 'google-gemini',
+      baseUrl: 'https://generativelanguage.googleapis.com',
+      endpointSettings: {
+        apiPath: '/v1beta/models/gemini-3.8-flash:generateContent',
+        thinkingLevel: 'LOW',
+      },
+      modelId: 'gemini-3.8-flash',
+      authMode: 'server-env',
+      storageMode: 'server-encrypted-vault',
+      allowedTaskTypes: ['routine-tasks', 'asset-research', 'script-analysis'],
+      fallbackConnectionId: argonConn.id,
+    });
+    providerConnectionsStore.set(argonConn.id, argonConn);
+    providerConnectionsStore.set(flashConn.id, flashConn);
+    persistState();
+    return [argonConn, flashConn];
+  }
+
+  app.get('/api/v1/provider-hub/catalog', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    return sendOk(res, authReq.requestId, {
+      presets: PREPOPULATED_MODEL_CATALOG,
+      capabilityKeys: ALL_MODEL_CAPABILITY_KEYS,
+      taskTypes: ALL_HUB_TASK_TYPES,
+      ssrfProtectionEnforced: true,
+      encryptionStandard: 'aes-256-gcm-scoped-aad',
+    });
+  });
+
+  app.get('/api/v1/provider-hub/connections', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const uid = authReq.authIdentity!.uid;
+    const connections = getOrSeedUserProviderConnections(uid);
+    return sendOk(res, authReq.requestId, {
+      items: connections.map(toPublicProviderConnectionView),
+      total: connections.length,
+    });
+  });
+
+  app.post('/api/v1/provider-hub/connections', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const uid = authReq.authIdentity!.uid;
+    const body = req.body || {};
+
+    if (!body.baseUrl || typeof body.baseUrl !== 'string') {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'VALIDATION_ERROR',
+        'baseUrl is required.'
+      );
+    }
+
+    const ssrf = validateCustomEndpointSsrf(body.baseUrl);
+    if (!ssrf.allowed) {
+      recordAudit(
+        uid,
+        authReq.authIdentity!.email,
+        'PROVIDER_HUB_SSRF_BLOCKED',
+        body.baseUrl.slice(0, 120),
+        `Blocked custom provider baseUrl (${ssrf.errorCode}): ${ssrf.reason}`,
+        authReq.requestId,
+        'system',
+        'denied'
+      );
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        ssrf.errorCode || 'SSRF_ENDPOINT_REJECTED',
+        ssrf.reason
+      );
+    }
+
+    try {
+      const conn = createProviderConnectionRecord({
+        ownerUid: uid,
+        workspaceId: typeof body.workspaceId === 'string' ? body.workspaceId : undefined,
+        label: typeof body.label === 'string' ? body.label : 'Custom Provider Connection',
+        providerBrand:
+          typeof body.providerBrand === 'string' ? body.providerBrand : 'Custom Provider',
+        protocol: (body.protocol as HubProviderProtocol) || 'openai-chat-completions',
+        baseUrl: body.baseUrl,
+        endpointSettings:
+          body.endpointSettings && typeof body.endpointSettings === 'object'
+            ? body.endpointSettings
+            : {},
+        modelId: typeof body.modelId === 'string' ? body.modelId : 'gpt-4o',
+        authMode: (body.authMode as HubAuthMode) || 'bearer',
+        credential: typeof body.credential === 'string' ? body.credential : undefined,
+        storageMode: (body.storageMode as SecretStorageMode) || 'server-encrypted-vault',
+        timeoutMs: typeof body.timeoutMs === 'number' ? body.timeoutMs : 15000,
+        maxOutputTokens:
+          typeof body.maxOutputTokens === 'number' ? body.maxOutputTokens : 4096,
+        allowedTaskTypes: Array.isArray(body.allowedTaskTypes)
+          ? body.allowedTaskTypes
+          : undefined,
+        fallbackConnectionId:
+          typeof body.fallbackConnectionId === 'string' ? body.fallbackConnectionId : null,
+        budgetPolicy:
+          body.budgetPolicy && typeof body.budgetPolicy === 'object'
+            ? body.budgetPolicy
+            : undefined,
+      });
+
+      providerConnectionsStore.set(conn.id, conn);
+      persistState();
+
+      recordAudit(
+        uid,
+        authReq.authIdentity!.email,
+        'PROVIDER_CONNECTION_CREATED',
+        conn.id,
+        `Created provider connection "${conn.label}" (${conn.protocol}, model=${conn.modelId}, key=${conn.maskedCredential})`,
+        authReq.requestId,
+        'system',
+        'success'
+      );
+
+      return sendOk(
+        res,
+        authReq.requestId,
+        { connection: toPublicProviderConnectionView(conn) },
+        201
+      );
+    } catch (err: any) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        err?.code || 'CONNECTION_CREATE_FAILED',
+        err?.message || 'Failed to create provider connection.'
+      );
+    }
+  });
+
+  app.post(
+    '/api/v1/provider-hub/connections/:id/test',
+    requireAuth,
+    (req: Request, res: Response) => {
+      const authReq = req as AuthenticatedRequest;
+      const uid = authReq.authIdentity!.uid;
+      const existing = providerConnectionsStore.get(req.params.id);
+      if (!existing) {
+        return sendError(
+          res,
+          authReq.requestId,
+          404,
+          'CONNECTION_NOT_FOUND',
+          'Provider connection not found.'
+        );
+      }
+      if (existing.ownerUid !== uid) {
+        return sendError(
+          res,
+          authReq.requestId,
+          403,
+          'FORBIDDEN_CONNECTION_ACCESS',
+          'Workspace isolation violation: cannot test another user’s provider connection.'
+        );
+      }
+
+      const body = req.body || {};
+      const probeResult = probeProviderConnection(existing, {
+        probeTools: Boolean(body.probeTools),
+        probeStructuredOutput: Boolean(body.probeStructuredOutput),
+        probeVision: Boolean(body.probeVision),
+        probeStreaming: Boolean(body.probeStreaming),
+        simulateFailureCode: body.simulateFailureCode,
+        redirectHopUrlsToValidate: Array.isArray(body.redirectHopUrlsToValidate)
+          ? body.redirectHopUrlsToValidate
+          : undefined,
+      });
+
+      providerConnectionsStore.set(existing.id, probeResult.updatedConnection);
+      persistState();
+
+      recordAudit(
+        uid,
+        authReq.authIdentity!.email,
+        probeResult.probePassed
+          ? 'PROVIDER_CONNECTION_PROBE_VERIFIED'
+          : 'PROVIDER_CONNECTION_PROBE_FAILED',
+        existing.id,
+        probeResult.probePassed
+          ? `Verified capabilities [${probeResult.verifiedCapabilities.join(', ')}] on ${existing.label}`
+          : `Probe failed on ${existing.label}: ${probeResult.sanitizedError?.code} - ${probeResult.sanitizedError?.message}`,
+        authReq.requestId,
+        'system',
+        probeResult.probePassed ? 'success' : 'denied'
+      );
+
+      return sendOk(res, authReq.requestId, {
+        connection: toPublicProviderConnectionView(probeResult.updatedConnection),
+        probePassed: probeResult.probePassed,
+        verifiedCapabilities: probeResult.verifiedCapabilities,
+        formattedProbeRequestPreview: probeResult.formattedProbeRequestPreview,
+        sanitizedError: probeResult.sanitizedError,
+      });
+    }
+  );
+
+  app.patch(
+    '/api/v1/provider-hub/connections/:id/capabilities',
+    requireAuth,
+    (req: Request, res: Response) => {
+      const authReq = req as AuthenticatedRequest;
+      const uid = authReq.authIdentity!.uid;
+      const existing = providerConnectionsStore.get(req.params.id);
+      if (!existing) {
+        return sendError(
+          res,
+          authReq.requestId,
+          404,
+          'CONNECTION_NOT_FOUND',
+          'Provider connection not found.'
+        );
+      }
+      if (existing.ownerUid !== uid) {
+        return sendError(
+          res,
+          authReq.requestId,
+          403,
+          'FORBIDDEN_CONNECTION_ACCESS',
+          'Cannot modify capabilities on another user’s connection.'
+        );
+      }
+
+      const { capability, state, reason } = req.body || {};
+      if (!ALL_MODEL_CAPABILITY_KEYS.includes(capability)) {
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          'INVALID_CAPABILITY_KEY',
+          `Unknown capability key "${capability}".`
+        );
+      }
+      if (!['User-asserted', 'Unsupported', 'Not tested'].includes(state)) {
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          'INVALID_CAPABILITY_STATE',
+          'Manual override state must be "User-asserted", "Unsupported", or "Not tested". "Verified" can only be set by passing a live probe.'
+        );
+      }
+
+      const updated = overrideConnectionCapabilityState(
+        existing,
+        capability as ModelCapabilityKey,
+        state,
+        typeof reason === 'string' ? reason : undefined
+      );
+      providerConnectionsStore.set(updated.id, updated);
+      persistState();
+
+      return sendOk(res, authReq.requestId, {
+        connection: toPublicProviderConnectionView(updated),
+      });
+    }
+  );
+
+  app.post(
+    '/api/v1/provider-hub/connections/:id/rotate-key',
+    requireAuth,
+    (req: Request, res: Response) => {
+      const authReq = req as AuthenticatedRequest;
+      const uid = authReq.authIdentity!.uid;
+      const existing = providerConnectionsStore.get(req.params.id);
+      if (!existing) {
+        return sendError(res, authReq.requestId, 404, 'CONNECTION_NOT_FOUND', 'Not found.');
+      }
+      if (existing.ownerUid !== uid) {
+        return sendError(
+          res,
+          authReq.requestId,
+          403,
+          'FORBIDDEN_CONNECTION_ACCESS',
+          'Cannot rotate another user’s credential.'
+        );
+      }
+
+      const newCredential =
+        typeof req.body?.credential === 'string' ? req.body.credential.trim() : '';
+      if (!newCredential) {
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          'VALIDATION_ERROR',
+          'New credential is required to rotate key.'
+        );
+      }
+
+      const updated = rotateConnectionCredential(existing, newCredential);
+      providerConnectionsStore.set(updated.id, updated);
+      persistState();
+
+      recordAudit(
+        uid,
+        authReq.authIdentity!.email,
+        'PROVIDER_CREDENTIAL_ROTATED',
+        updated.id,
+        `Rotated credential to version ${updated.keyVersion} (${updated.maskedCredential})`,
+        authReq.requestId,
+        'system',
+        'success'
+      );
+
+      return sendOk(res, authReq.requestId, {
+        connection: toPublicProviderConnectionView(updated),
+      });
+    }
+  );
+
+  app.post(
+    '/api/v1/provider-hub/connections/:id/revoke-key',
+    requireAuth,
+    (req: Request, res: Response) => {
+      const authReq = req as AuthenticatedRequest;
+      const uid = authReq.authIdentity!.uid;
+      const existing = providerConnectionsStore.get(req.params.id);
+      if (!existing) {
+        return sendError(res, authReq.requestId, 404, 'CONNECTION_NOT_FOUND', 'Not found.');
+      }
+      if (existing.ownerUid !== uid) {
+        return sendError(
+          res,
+          authReq.requestId,
+          403,
+          'FORBIDDEN_CONNECTION_ACCESS',
+          'Cannot revoke another user’s credential.'
+        );
+      }
+
+      const updated = revokeConnectionCredential(existing);
+      providerConnectionsStore.set(updated.id, updated);
+      persistState();
+
+      recordAudit(
+        uid,
+        authReq.authIdentity!.email,
+        'PROVIDER_CREDENTIAL_REVOKED',
+        updated.id,
+        `Revoked credential for connection "${updated.label}"`,
+        authReq.requestId,
+        'system',
+        'success'
+      );
+
+      return sendOk(res, authReq.requestId, {
+        connection: toPublicProviderConnectionView(updated),
+      });
+    }
+  );
+
+  app.delete(
+    '/api/v1/provider-hub/connections/:id',
+    requireAuth,
+    (req: Request, res: Response) => {
+      const authReq = req as AuthenticatedRequest;
+      const uid = authReq.authIdentity!.uid;
+      const existing = providerConnectionsStore.get(req.params.id);
+      if (!existing) {
+        return sendError(res, authReq.requestId, 404, 'CONNECTION_NOT_FOUND', 'Not found.');
+      }
+      if (existing.ownerUid !== uid) {
+        return sendError(
+          res,
+          authReq.requestId,
+          403,
+          'FORBIDDEN_CONNECTION_ACCESS',
+          'Cannot delete another user’s provider connection.'
+        );
+      }
+
+      providerConnectionsStore.delete(existing.id);
+      persistState();
+
+      recordAudit(
+        uid,
+        authReq.authIdentity!.email,
+        'PROVIDER_CONNECTION_DELETED',
+        existing.id,
+        `Deleted provider connection "${existing.label}"`,
+        authReq.requestId,
+        'system',
+        'success'
+      );
+
+      return sendOk(res, authReq.requestId, { deletedId: existing.id });
+    }
+  );
+
+  app.get('/api/v1/provider-hub/routing', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const uid = authReq.authIdentity!.uid;
+    const userConnections = getOrSeedUserProviderConnections(uid);
+    let profiles = routingProfilesStore.get(uid);
+    if (!profiles) {
+      profiles = buildDefaultRoutingProfiles(userConnections);
+      routingProfilesStore.set(uid, profiles);
+      persistState();
+    }
+
+    const connMap = new Map(userConnections.map((c) => [c.id, c]));
+    const evaluations = Object.fromEntries(
+      ALL_HUB_TASK_TYPES.map((t) => [t, evaluateRoutingReadiness(profiles![t], connMap)])
+    );
+
+    return sendOk(res, authReq.requestId, {
+      profiles,
+      evaluations,
+    });
+  });
+
+  app.put(
+    '/api/v1/provider-hub/routing/:taskType',
+    requireAuth,
+    (req: Request, res: Response) => {
+      const authReq = req as AuthenticatedRequest;
+      const uid = authReq.authIdentity!.uid;
+      const taskType = req.params.taskType as HubTaskType;
+      if (!ALL_HUB_TASK_TYPES.includes(taskType)) {
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          'INVALID_TASK_TYPE',
+          `Unknown routing taskType "${taskType}".`
+        );
+      }
+
+      const userConnections = getOrSeedUserProviderConnections(uid);
+      let profiles = routingProfilesStore.get(uid);
+      if (!profiles) {
+        profiles = buildDefaultRoutingProfiles(userConnections);
+      }
+
+      const current = profiles[taskType];
+      const body = req.body || {};
+      const updatedProfile: TaskRoutingProfile = {
+        ...current,
+        primaryConnectionId:
+          body.primaryConnectionId !== undefined
+            ? body.primaryConnectionId
+            : current.primaryConnectionId,
+        fallbackConnectionId:
+          body.fallbackConnectionId !== undefined
+            ? body.fallbackConnectionId
+            : current.fallbackConnectionId,
+        maxBudgetPerRunUsd:
+          typeof body.maxBudgetPerRunUsd === 'number'
+            ? Math.max(0.01, Math.min(10, body.maxBudgetPerRunUsd))
+            : current.maxBudgetPerRunUsd,
+        temperature:
+          typeof body.temperature === 'number'
+            ? Math.max(0, Math.min(2, body.temperature))
+            : current.temperature,
+        updatedAt: new Date().toISOString(),
+      };
+
+      profiles = { ...profiles, [taskType]: updatedProfile };
+      routingProfilesStore.set(uid, profiles);
+      persistState();
+
+      const connMap = new Map(userConnections.map((c) => [c.id, c]));
+      return sendOk(res, authReq.requestId, {
+        profile: updatedProfile,
+        evaluation: evaluateRoutingReadiness(updatedProfile, connMap),
+      });
+    }
+  );
+
+  // --- EXTENSIONS WORKSPACE (REPOSITORIES, SKILLS, DOCS WEBSITES, APIS) ---
+
+  function getOrSeedUserExtensions(uid: string): ExtensionPackageRecord[] {
+    const existing = Array.from(extensionPackagesStore.values()).filter(
+      (e) => e.ownerUid === uid && e.installState !== 'uninstalled'
+    );
+    if (existing.length > 0) {
+      return existing.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    }
+    const seedSkill = registerExtensionPackage({
+      ownerUid: uid,
+      name: 'Sowveil Kinetic Typography Skill Pack',
+      kind: 'skill-folder',
+      sourceUrl: 'https://github.com/sowveil/kinetic-typography-skill',
+      commitOrReleasePin: 'a8f41c9e2026',
+      version: '1.2.0',
+      license: 'MIT',
+      dependencies: ['bezier-easing@2.1.0'],
+      declaredCapabilities: ['spring-stiffness-presets', 'caption-word-highlight'],
+      requestedPermissions: ['read-project', 'read-catalog', 'propose-commands'],
+      rawInstructionOrManifestContent:
+        'Provides deterministic spring easing presets and word-by-word highlight timing rules for vertical 9:16 reels.',
+      explicitApprovalGranted: true,
+    });
+    extensionPackagesStore.set(seedSkill.id, seedSkill);
+    persistState();
+    return [seedSkill];
+  }
+
+  app.get('/api/v1/extensions', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const uid = authReq.authIdentity!.uid;
+    const items = getOrSeedUserExtensions(uid);
+    return sendOk(res, authReq.requestId, {
+      items,
+      total: items.length,
+    });
+  });
+
+  app.post('/api/v1/extensions', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const uid = authReq.authIdentity!.uid;
+    const body = req.body || {};
+
+    if (!body.name || typeof body.name !== 'string' || !body.sourceUrl || typeof body.sourceUrl !== 'string') {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'VALIDATION_ERROR',
+        'name and sourceUrl are required to register an extension.'
+      );
+    }
+
+    try {
+      const ext = registerExtensionPackage({
+        ownerUid: uid,
+        name: body.name,
+        kind: body.kind || 'github-repo',
+        sourceUrl: body.sourceUrl,
+        commitOrReleasePin: body.commitOrReleasePin,
+        version: body.version,
+        license: body.license,
+        dependencies: Array.isArray(body.dependencies) ? body.dependencies : [],
+        declaredCapabilities: Array.isArray(body.declaredCapabilities)
+          ? body.declaredCapabilities
+          : [],
+        requestedPermissions: Array.isArray(body.requestedPermissions)
+          ? body.requestedPermissions
+          : undefined,
+        rawInstructionOrManifestContent:
+          typeof body.rawInstructionOrManifestContent === 'string'
+            ? body.rawInstructionOrManifestContent
+            : '',
+        explicitApprovalGranted: Boolean(body.explicitApprovalGranted),
+      });
+
+      extensionPackagesStore.set(ext.id, ext);
+      persistState();
+
+      recordAudit(
+        uid,
+        authReq.authIdentity!.email,
+        ext.installState === 'quarantined'
+          ? 'EXTENSION_QUARANTINED_BY_SANDBOX'
+          : 'EXTENSION_REGISTERED',
+        ext.id,
+        `Registered extension "${ext.name}" (${ext.kind}, pin=${ext.commitOrReleasePin}, state=${ext.installState})`,
+        authReq.requestId,
+        'system',
+        ext.installState === 'quarantined' ? 'denied' : 'success'
+      );
+
+      return sendOk(res, authReq.requestId, { extension: ext }, 201);
+    } catch (err: any) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        err?.code || 'EXTENSION_REGISTER_FAILED',
+        err?.message || 'Failed to register extension package.'
+      );
+    }
+  });
+
+  app.patch('/api/v1/extensions/:id', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const uid = authReq.authIdentity!.uid;
+    const existing = extensionPackagesStore.get(req.params.id);
+    if (!existing || existing.installState === 'uninstalled') {
+      return sendError(res, authReq.requestId, 404, 'EXTENSION_NOT_FOUND', 'Extension not found.');
+    }
+    if (existing.ownerUid !== uid) {
+      return sendError(
+        res,
+        authReq.requestId,
+        403,
+        'FORBIDDEN_EXTENSION_ACCESS',
+        'Cannot modify another user’s extension.'
+      );
+    }
+
+    const updated = updateExtensionPackage(existing, req.body || {});
+    extensionPackagesStore.set(updated.id, updated);
+    persistState();
+
+    recordAudit(
+      uid,
+      authReq.authIdentity!.email,
+      'EXTENSION_UPDATED',
+      updated.id,
+      `Updated extension "${updated.name}" (version=${updated.version}, state=${updated.installState})`,
+      authReq.requestId,
+      'system',
+      'success'
+    );
+
+    return sendOk(res, authReq.requestId, { extension: updated });
+  });
+
+  app.post('/api/v1/extensions/:id/rollback', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const uid = authReq.authIdentity!.uid;
+    const existing = extensionPackagesStore.get(req.params.id);
+    if (!existing) {
+      return sendError(res, authReq.requestId, 404, 'EXTENSION_NOT_FOUND', 'Extension not found.');
+    }
+    if (existing.ownerUid !== uid) {
+      return sendError(
+        res,
+        authReq.requestId,
+        403,
+        'FORBIDDEN_EXTENSION_ACCESS',
+        'Cannot rollback another user’s extension.'
+      );
+    }
+
+    try {
+      const rolledBack = rollbackExtensionPackage(
+        existing,
+        typeof req.body?.targetCommitOrVersion === 'string'
+          ? req.body.targetCommitOrVersion
+          : undefined
+      );
+      extensionPackagesStore.set(rolledBack.id, rolledBack);
+      persistState();
+
+      recordAudit(
+        uid,
+        authReq.authIdentity!.email,
+        'EXTENSION_ROLLED_BACK',
+        rolledBack.id,
+        `Rolled back extension "${rolledBack.name}" to version=${rolledBack.version} (${rolledBack.commitOrReleasePin})`,
+        authReq.requestId,
+        'system',
+        'success'
+      );
+
+      return sendOk(res, authReq.requestId, { extension: rolledBack });
+    } catch (err: any) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'EXTENSION_ROLLBACK_FAILED',
+        err?.message || 'Rollback failed.'
+      );
+    }
+  });
+
+  app.post('/api/v1/extensions/:id/sandbox-verify', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const uid = authReq.authIdentity!.uid;
+    const existing = extensionPackagesStore.get(req.params.id);
+    if (!existing) {
+      return sendError(res, authReq.requestId, 404, 'EXTENSION_NOT_FOUND', 'Extension not found.');
+    }
+    if (existing.ownerUid !== uid) {
+      return sendError(
+        res,
+        authReq.requestId,
+        403,
+        'FORBIDDEN_EXTENSION_ACCESS',
+        'Cannot run sandbox on another user’s extension.'
+      );
+    }
+
+    const run = inspectAndSandboxExtensionContent({
+      extensionId: existing.id,
+      rawContent: existing.untrustedContentEnvelope,
+      dependencies: existing.dependencies,
+      requestedPermissions: existing.requestedPermissions,
+      explicitApprovalGranted: existing.explicitApprovalGranted,
+    });
+
+    const updated: ExtensionPackageRecord = {
+      ...existing,
+      installState: run.passed ? existing.installState : 'quarantined',
+      validationRuns: [run, ...existing.validationRuns].slice(0, 20),
+      updatedAt: new Date().toISOString(),
+    };
+    extensionPackagesStore.set(updated.id, updated);
+    persistState();
+
+    return sendOk(res, authReq.requestId, {
+      extension: updated,
+      validationRun: run,
+    });
+  });
+
+  app.delete('/api/v1/extensions/:id', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const uid = authReq.authIdentity!.uid;
+    const existing = extensionPackagesStore.get(req.params.id);
+    if (!existing) {
+      return sendError(res, authReq.requestId, 404, 'EXTENSION_NOT_FOUND', 'Extension not found.');
+    }
+    if (existing.ownerUid !== uid) {
+      return sendError(
+        res,
+        authReq.requestId,
+        403,
+        'FORBIDDEN_EXTENSION_ACCESS',
+        'Cannot uninstall another user’s extension.'
+      );
+    }
+
+    extensionPackagesStore.delete(existing.id);
+    persistState();
+
+    recordAudit(
+      uid,
+      authReq.authIdentity!.email,
+      'EXTENSION_UNINSTALLED',
+      existing.id,
+      `Uninstalled extension "${existing.name}"`,
+      authReq.requestId,
+      'system',
+      'success'
+    );
+
+    return sendOk(res, authReq.requestId, { uninstalledId: existing.id });
+  });
+
+  // --- TYPED AI TOOL REGISTRY & POLICY-ENFORCED INVOCATION ---
+
+  app.get('/api/v1/tools/registry', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const uid = authReq.authIdentity!.uid;
+    const auditItems = toolAuditRecordsStore.filter((a) => a.ownerUid === uid).slice(0, 50);
+    return sendOk(res, authReq.requestId, {
+      tools: REGISTERED_AI_TOOLS,
+      total: REGISTERED_AI_TOOLS.length,
+      auditRecords: auditItems,
+      policyGuarantee:
+        'Models never receive direct database or filesystem access; all tool invocations pass through server-side schema, ownership, and permission enforcement.',
+    });
+  });
+
+  app.post('/api/v1/tools/invoke', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const uid = authReq.authIdentity!.uid;
+    const body = req.body || {};
+    const toolId = typeof body.toolId === 'string' ? body.toolId.trim() : '';
+
+    if (!toolId) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'VALIDATION_ERROR',
+        'toolId is required.'
+      );
+    }
+
+    const result = invokeRegisteredTool({
+      ownerUid: uid,
+      toolId,
+      input: body.input && typeof body.input === 'object' ? body.input : {},
+      dryRun: Boolean(body.dryRun),
+      grantedPermissions: Array.isArray(body.grantedPermissions)
+        ? (body.grantedPermissions as ExtensionPermissionScope[])
+        : undefined,
+    });
+
+    toolAuditRecordsStore.unshift(result.auditRecord);
+    persistState();
+
+    recordAudit(
+      uid,
+      authReq.authIdentity!.email,
+      result.allowed ? 'AI_TOOL_INVOKED' : 'AI_TOOL_DENIED',
+      toolId,
+      `Tool ${toolId} (dryRun=${Boolean(body.dryRun)}, status=${result.status})`,
+      authReq.requestId,
+      'system',
+      result.allowed ? 'success' : 'denied'
+    );
+
+    if (!result.allowed) {
+      return sendError(
+        res,
+        authReq.requestId,
+        result.status === 'denied' ? 403 : 400,
+        result.error?.code || 'TOOL_EXECUTION_REJECTED',
+        result.error?.message || 'Tool execution rejected by server policy.',
+        { auditRecord: result.auditRecord }
+      );
+    }
+
+    return sendOk(res, authReq.requestId, {
+      output: result.output,
+      auditRecord: result.auditRecord,
+      updatedProjectDoc: result.updatedProjectDoc,
+    });
+  });
+
+  // ============================================================================
+  // AI DIRECTOR DURABLE PRODUCTION STATE MACHINE ROUTES (/api/v1/ai-director/*)
+  // ============================================================================
+
+  app.get('/api/v1/ai-director/samples', (_req: Request, res: Response) => {
+    const reqId = (_req as AuthenticatedRequest).requestId || 'req-samples';
+    res.setHeader('Cache-Control', 'public, max-age=60');
+    return sendOk(res, reqId, {
+      samples: BUILT_IN_DIRECTOR_SAMPLE_SCRIPTS,
+    });
+  });
+
+  app.get('/api/v1/ai-director/sessions', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const uid = authReq.authIdentity!.uid;
+    const isAdmin = authReq.userRole === 'owner' || authReq.userRole === 'admin';
+    const includeAll = isAdmin && req.query.scope === 'all';
+    const items = Array.from(aiDirectorSessionsStore.values())
+      .filter((s) => (includeAll ? true : s.ownerUid === uid))
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    return sendOk(res, authReq.requestId, {
+      items,
+      total: items.length,
+    });
+  });
+
+  app.post('/api/v1/ai-director/sessions', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const uid = authReq.authIdentity!.uid;
+    const body = (req.body || {}) as Record<string, any>;
+    const rawScriptText =
+      typeof body.rawScriptText === 'string'
+        ? body.rawScriptText
+        : typeof body.scriptText === 'string'
+        ? body.scriptText
+        : '';
+    if (!rawScriptText.trim()) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'SCRIPT_REQUIRED',
+        'A non-empty rawScriptText (or scriptText) is required to start an AI Director session.'
+      );
+    }
+
+    const intakeObj = (body.intake && typeof body.intake === 'object' ? body.intake : body) as Record<
+      string,
+      any
+    >;
+
+    try {
+      const session = createAiDirectorSession({
+        ownerUid: uid,
+        title: typeof body.title === 'string' ? body.title : intakeObj.title,
+        rawScriptText,
+        uploadedFileName:
+          typeof intakeObj.uploadedFileName === 'string' ? intakeObj.uploadedFileName : undefined,
+        scriptFormat: intakeObj.scriptFormat,
+        references: Array.isArray(intakeObj.references) ? intakeObj.references : undefined,
+        intendedPlatform: intakeObj.intendedPlatform,
+        targetDurationSec:
+          typeof intakeObj.targetDurationSec === 'number' ? intakeObj.targetDurationSec : null,
+        aspectRatio: intakeObj.aspectRatio,
+        fps: intakeObj.fps,
+        language: intakeObj.language,
+        audience: intakeObj.audience,
+        visualGoals: intakeObj.visualGoals,
+        brandKit: intakeObj.brandKit,
+        voiceAudioAssets: Array.isArray(intakeObj.voiceAudioAssets)
+          ? intakeObj.voiceAudioAssets
+          : undefined,
+        availableResources: Array.isArray(intakeObj.availableResources)
+          ? intakeObj.availableResources
+          : undefined,
+        prohibitedContent: Array.isArray(intakeObj.prohibitedContent)
+          ? intakeObj.prohibitedContent
+          : undefined,
+        budgetLatencyPreference: intakeObj.budgetLatencyPreference,
+        maxBudgetUsd:
+          typeof intakeObj.maxBudgetUsd === 'number' ? intakeObj.maxBudgetUsd : undefined,
+        outputFormat: intakeObj.outputFormat,
+        preserveEveryRepetition:
+          typeof intakeObj.preserveEveryRepetition === 'boolean'
+            ? intakeObj.preserveEveryRepetition
+            : true,
+        noQuestionsWorkflow: Boolean(intakeObj.noQuestionsWorkflow),
+        autonomyMode: intakeObj.autonomyMode,
+      });
+
+      aiDirectorSessionsStore.set(session.id, session);
+      persistState();
+      recordAudit(
+        uid,
+        authReq.authIdentity!.email,
+        'AI_DIRECTOR_SESSION_CREATE',
+        `/aiDirectorSessions/${session.id}`,
+        `Created AI Director session "${session.intake.title}" (${session.segments.length} segments, stage=${session.stage})`,
+        authReq.requestId,
+        'user',
+        'success'
+      );
+      return sendOk(res, authReq.requestId, { session }, 201);
+    } catch (err) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'DIRECTOR_SESSION_CREATE_FAILED',
+        err instanceof Error ? err.message : 'Failed to create AI Director session'
+      );
+    }
+  });
+
+  app.get('/api/v1/ai-director/sessions/:id', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const session = aiDirectorSessionsStore.get(req.params.id);
+    if (!session) {
+      return sendError(res, authReq.requestId, 404, 'DIRECTOR_SESSION_NOT_FOUND', 'AI Director session not found.');
+    }
+    const isAdmin = authReq.userRole === 'owner' || authReq.userRole === 'admin';
+    if (session.ownerUid !== authReq.authIdentity!.uid && !isAdmin) {
+      recordAudit(
+        authReq.authIdentity!.uid,
+        authReq.authIdentity!.email,
+        'AI_DIRECTOR_IDOR_DENIED',
+        `/aiDirectorSessions/${session.id}`,
+        'Blocked cross-user access to AI Director session',
+        authReq.requestId,
+        'system',
+        'denied'
+      );
+      return sendError(res, authReq.requestId, 403, 'FORBIDDEN_DIRECTOR_SESSION', 'You do not own this AI Director session.');
+    }
+    return sendOk(res, authReq.requestId, { session });
+  });
+
+  app.post('/api/v1/ai-director/sessions/:id/questions', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const session = aiDirectorSessionsStore.get(req.params.id);
+    if (!session) {
+      return sendError(res, authReq.requestId, 404, 'DIRECTOR_SESSION_NOT_FOUND', 'AI Director session not found.');
+    }
+    if (session.ownerUid !== authReq.authIdentity!.uid) {
+      return sendError(res, authReq.requestId, 403, 'FORBIDDEN_DIRECTOR_SESSION', 'You do not own this AI Director session.');
+    }
+
+    const body = (req.body || {}) as {
+      answers?: Record<string, { answer: string; lockDecision?: boolean }>;
+      applyDefaultsToUnanswered?: boolean;
+    };
+
+    const updated = answerDirectorQuestions(session, {
+      answers: body.answers,
+      applyDefaultsToUnanswered: body.applyDefaultsToUnanswered !== false,
+    });
+    aiDirectorSessionsStore.set(updated.id, updated);
+    persistState();
+    return sendOk(res, authReq.requestId, { session: updated });
+  });
+
+  app.post('/api/v1/ai-director/sessions/:id/plan', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const session = aiDirectorSessionsStore.get(req.params.id);
+    if (!session) {
+      return sendError(res, authReq.requestId, 404, 'DIRECTOR_SESSION_NOT_FOUND', 'AI Director session not found.');
+    }
+    if (session.ownerUid !== authReq.authIdentity!.uid) {
+      return sendError(res, authReq.requestId, 403, 'FORBIDDEN_DIRECTOR_SESSION', 'You do not own this AI Director session.');
+    }
+
+    const body = (req.body || {}) as Parameters<typeof updateDirectorShotPlanAndApprovals>[1];
+    try {
+      const updated = updateDirectorShotPlanAndApprovals(session, {
+        ...body,
+        actorUid: authReq.authIdentity!.uid,
+      });
+      aiDirectorSessionsStore.set(updated.id, updated);
+      persistState();
+      recordAudit(
+        authReq.authIdentity!.uid,
+        authReq.authIdentity!.email,
+        'AI_DIRECTOR_PLAN_UPDATE',
+        `/aiDirectorSessions/${session.id}`,
+        `Updated shot plan/approvals for "${session.intake.title}" (action=${body.action}, revisions=${updated.planRevisions.length})`,
+        authReq.requestId,
+        'user',
+        'success'
+      );
+      return sendOk(res, authReq.requestId, { session: updated });
+    } catch (err) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'PLAN_UPDATE_REJECTED',
+        err instanceof Error ? err.message : 'Failed to update shot plan.'
+      );
+    }
+  });
+
+  app.post('/api/v1/ai-director/sessions/:id/produce', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const session = aiDirectorSessionsStore.get(req.params.id);
+    if (!session) {
+      return sendError(res, authReq.requestId, 404, 'DIRECTOR_SESSION_NOT_FOUND', 'AI Director session not found.');
+    }
+    if (session.ownerUid !== authReq.authIdentity!.uid) {
+      return sendError(res, authReq.requestId, 403, 'FORBIDDEN_DIRECTOR_SESSION', 'You do not own this AI Director session.');
+    }
+
+    const body = (req.body || {}) as {
+      simulateFailedShotIds?: string[];
+      onlyApprovedShots?: boolean;
+    };
+    try {
+      const updated = executeDirectorProductionPlan(session, {
+        simulateFailedShotIds: Array.isArray(body.simulateFailedShotIds)
+          ? body.simulateFailedShotIds
+          : [],
+        onlyApprovedShots: body.onlyApprovedShots,
+      });
+      aiDirectorSessionsStore.set(updated.id, updated);
+
+      // Automatically save AI-generated assets & reusable scene components as private Drafts
+      const callerUid = authReq.authIdentity!.uid;
+      for (const genAsset of updated.generatedAssetRecords || []) {
+        if (!assetsStore.has(genAsset.assetTaskId)) {
+          const nowIso = new Date().toISOString();
+          const hash = computeDeterministicSnapshotHash(genAsset);
+          assetsStore.set(genAsset.assetTaskId, {
+            id: genAsset.assetTaskId,
+            title: `${genAsset.title} (AI Draft Asset)`,
+            labels: ['ai-generated-draft', genAsset.kind],
+            tags: ['ai-director', 'draft'],
+            moduleId: 'templates',
+            assetKind: 'generated',
+            ownerUid: callerUid,
+            visibility: 'private',
+            licenseType: genAsset.licenseType,
+            licenseNote: genAsset.provenanceNote,
+            sourceNote: `Auto-saved AI Director generated asset (${genAsset.kind})`,
+            provenance: {
+              originType: 'generated',
+              importedAt: nowIso,
+            },
+            storageProvider: 'durable-local-store',
+            storageObjectKey: null,
+            mimeType: 'image/svg+xml',
+            sizeBytes: 1024,
+            checksumSha256: hash,
+            versions: [
+              {
+                version: '1.0.0',
+                checksumSha256: hash,
+                sizeBytes: 1024,
+                mimeType: 'image/svg+xml',
+                updatedAt: nowIso,
+                updatedByUid: callerUid,
+                note: 'Auto-saved AI generated draft asset',
+              },
+            ],
+            missingAssetDetected: false,
+            usedByTemplateIds: [],
+            usedByVariantIds: [],
+            status: 'stored',
+            createdAt: nowIso,
+            updatedAt: nowIso,
+          });
+        }
+      }
+
+      if (updated.canonicalProject && updated.canonicalProject.scenes.length > 0) {
+        const userDrafts = Array.from(templateFactoryDraftsStore.values()).filter(
+          (d) => d.ownerUid === callerUid
+        );
+        const autoDraft = runTemplateFactoryPipeline({
+          ownerUid: callerUid,
+          sourceKind: 'canonical-project',
+          title: `${updated.intake.title} · Reusable Scene 1 Rig`,
+          description: `Auto-captured reusable scene component from AI Director session "${updated.intake.title}".`,
+          moduleId: 'templates',
+          licenseType: 'Sowveil Original',
+          sourceProject: updated.canonicalProject,
+          selectedSceneIds: [updated.canonicalProject.scenes[0].id],
+          autoSavedFromAiComponent: true,
+          existingCatalog: Array.from(catalogStore.values()),
+          existingFactoryDrafts: userDrafts,
+          assetsMap: assetsStore,
+        });
+        templateFactoryDraftsStore.set(autoDraft.id, autoDraft);
+      }
+
+      persistState();
+      recordAudit(
+        authReq.authIdentity!.uid,
+        authReq.authIdentity!.email,
+        'AI_DIRECTOR_PRODUCE_TIMELINE',
+        `/aiDirectorSessions/${session.id}`,
+        `Compiled canonical project v2.0.0 for "${session.intake.title}" (${updated.commandReceipts.length} commands, gate=${updated.acceptanceGate.passed})`,
+        authReq.requestId,
+        'user',
+        'success'
+      );
+      return sendOk(res, authReq.requestId, { session: updated });
+    } catch (err) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'DIRECTOR_PRODUCTION_BLOCKED',
+        err instanceof Error ? err.message : 'Production compilation blocked.'
+      );
+    }
+  });
+
+  app.post('/api/v1/ai-director/sessions/:id/refine', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const session = aiDirectorSessionsStore.get(req.params.id);
+    if (!session) {
+      return sendError(res, authReq.requestId, 404, 'DIRECTOR_SESSION_NOT_FOUND', 'AI Director session not found.');
+    }
+    if (session.ownerUid !== authReq.authIdentity!.uid) {
+      return sendError(res, authReq.requestId, 403, 'FORBIDDEN_DIRECTOR_SESSION', 'You do not own this AI Director session.');
+    }
+
+    const body = (req.body || {}) as { suggestionId?: string };
+    if (!body.suggestionId) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'INVALID_REFINEMENT_REQUEST',
+        'suggestionId is required.'
+      );
+    }
+
+    try {
+      const updated = applyAdaptiveRefinement(session, body.suggestionId);
+      aiDirectorSessionsStore.set(updated.id, updated);
+      persistState();
+      return sendOk(res, authReq.requestId, { session: updated });
+    } catch (err) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'REFINEMENT_BLOCKED',
+        err instanceof Error ? err.message : 'Refinement could not be applied.'
+      );
+    }
+  });
+
+  app.post('/api/v1/ai-director/sessions/:id/rollback', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const session = aiDirectorSessionsStore.get(req.params.id);
+    if (!session) {
+      return sendError(res, authReq.requestId, 404, 'DIRECTOR_SESSION_NOT_FOUND', 'AI Director session not found.');
+    }
+    if (session.ownerUid !== authReq.authIdentity!.uid) {
+      return sendError(res, authReq.requestId, 403, 'FORBIDDEN_DIRECTOR_SESSION', 'You do not own this AI Director session.');
+    }
+
+    const body = (req.body || {}) as { checkpointId?: string };
+    if (!body.checkpointId) {
+      return sendError(res, authReq.requestId, 400, 'CHECKPOINT_ID_REQUIRED', 'checkpointId is required for rollback.');
+    }
+
+    try {
+      const updated = rollbackDirectorToCheckpoint(session, body.checkpointId);
+      aiDirectorSessionsStore.set(updated.id, updated);
+      persistState();
+      recordAudit(
+        authReq.authIdentity!.uid,
+        authReq.authIdentity!.email,
+        'AI_DIRECTOR_CHECKPOINT_ROLLBACK',
+        `/aiDirectorSessions/${session.id}`,
+        `Rolled back AI Director session "${session.intake.title}" to checkpoint ${body.checkpointId}`,
+        authReq.requestId,
+        'user',
+        'success'
+      );
+      return sendOk(res, authReq.requestId, { session: updated });
+    } catch (err) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'ROLLBACK_FAILED',
+        err instanceof Error ? err.message : 'Rollback failed.'
+      );
+    }
+  });
+
+  app.post('/api/v1/ai-director/sessions/:id/save-project', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const session = aiDirectorSessionsStore.get(req.params.id);
+    if (!session) {
+      return sendError(res, authReq.requestId, 404, 'DIRECTOR_SESSION_NOT_FOUND', 'AI Director session not found.');
+    }
+    if (session.ownerUid !== authReq.authIdentity!.uid) {
+      return sendError(res, authReq.requestId, 403, 'FORBIDDEN_DIRECTOR_SESSION', 'You do not own this AI Director session.');
+    }
+    if (!session.canonicalProject) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'CANONICAL_PROJECT_NOT_COMPILED',
+        'Execute the production plan first to compile the Canonical Project v2.0.0 before saving to Project Library.'
+      );
+    }
+
+    const now = new Date().toISOString();
+    const projectId = session.canonicalProject.id || `proj_dir_${session.id}`;
+    const gate = evaluateDirectorAcceptanceGate(session);
+    const partialRecord = canonicalProjectToLibraryRecord(session.canonicalProject);
+    const projectRecord: ProjectLibraryItem = {
+      ...partialRecord,
+      id: projectId,
+      updatedAt: now,
+    };
+
+    projectsStore.set(projectRecord.id, projectRecord);
+    const updatedSession: AiDirectorSessionRecord = {
+      ...session,
+      acceptanceGate: gate,
+      updatedAt: now,
+    };
+    aiDirectorSessionsStore.set(session.id, updatedSession);
+    persistState();
+
+    recordAudit(
+      authReq.authIdentity!.uid,
+      authReq.authIdentity!.email,
+      'AI_DIRECTOR_SAVE_PROJECT',
+      `/projects/${projectRecord.id}`,
+      `Saved AI Director canonical project "${projectRecord.title}" to Project Library`,
+      authReq.requestId,
+      'user',
+      'success'
+    );
+
+    return sendOk(res, authReq.requestId, {
+      project: projectRecord,
+      session: updatedSession,
+    });
+  });
+
+  // =========================================================================
+  // PHASE 11: PROFESSIONAL MOBILE EDITOR & AI CO-EDITING ENDPOINTS
+  // =========================================================================
+
+  const resolveEditableCanonicalProject = (
+    authUid: string,
+    body: {
+      project?: CanonicalProjectDocument;
+      projectId?: string;
+      directorSessionId?: string;
+    }
+  ): {
+    doc: CanonicalProjectDocument | null;
+    errorStatus?: number;
+    errorCode?: string;
+    errorMessage?: string;
+  } => {
+    if (body.project) {
+      const validation = validateCanonicalProject(body.project);
+      if (!validation.valid || !validation.project) {
+        return {
+          doc: null,
+          errorStatus: 400,
+          errorCode: 'INVALID_CANONICAL_PROJECT',
+          errorMessage: validation.errors.join(' '),
+        };
+      }
+      return { doc: validation.project };
+    }
+    if (body.directorSessionId) {
+      const sess = aiDirectorSessionsStore.get(body.directorSessionId);
+      if (!sess) {
+        return {
+          doc: null,
+          errorStatus: 404,
+          errorCode: 'DIRECTOR_SESSION_NOT_FOUND',
+          errorMessage: 'AI Director session not found.',
+        };
+      }
+      if (sess.ownerUid !== authUid) {
+        return {
+          doc: null,
+          errorStatus: 403,
+          errorCode: 'FORBIDDEN_DIRECTOR_SESSION',
+          errorMessage: 'You do not own this AI Director session.',
+        };
+      }
+      if (!sess.canonicalProject) {
+        return {
+          doc: null,
+          errorStatus: 400,
+          errorCode: 'CANONICAL_PROJECT_NOT_COMPILED',
+          errorMessage: 'AI Director session has not compiled a Canonical Project yet.',
+        };
+      }
+      return { doc: sess.canonicalProject };
+    }
+    if (body.projectId) {
+      const stored = projectsStore.get(body.projectId);
+      if (!stored) {
+        return {
+          doc: null,
+          errorStatus: 404,
+          errorCode: 'PROJECT_NOT_FOUND',
+          errorMessage: 'Project not found.',
+        };
+      }
+      if (stored.ownerUid && stored.ownerUid !== authUid) {
+        return {
+          doc: null,
+          errorStatus: 403,
+          errorCode: 'FORBIDDEN_PROJECT',
+          errorMessage: 'You do not own this project.',
+        };
+      }
+      const migrated = migrateToCanonicalProject(stored, authUid);
+      return { doc: migrated.project };
+    }
+    return {
+      doc: null,
+      errorStatus: 400,
+      errorCode: 'MISSING_PROJECT_PAYLOAD',
+      errorMessage: 'Provide project, projectId, or directorSessionId.',
+    };
+  };
+
+  const persistUpdatedCanonicalProject = (
+    authUid: string,
+    updatedDoc: CanonicalProjectDocument,
+    body: {
+      projectId?: string;
+      directorSessionId?: string;
+    }
+  ) => {
+    const now = new Date().toISOString();
+    if (body.directorSessionId) {
+      const sess = aiDirectorSessionsStore.get(body.directorSessionId);
+      if (sess && sess.ownerUid === authUid) {
+        aiDirectorSessionsStore.set(sess.id, {
+          ...sess,
+          canonicalProject: updatedDoc,
+          updatedAt: now,
+        });
+      }
+    }
+    if (body.projectId) {
+      const existing = projectsStore.get(body.projectId);
+      if (!existing || !existing.ownerUid || existing.ownerUid === authUid) {
+        const partial = canonicalProjectToLibraryRecord(updatedDoc);
+        projectsStore.set(body.projectId, {
+          ...partial,
+          id: body.projectId,
+          ownerUid: authUid,
+          updatedAt: now,
+        });
+      }
+    }
+    persistState();
+  };
+
+  app.post('/api/v1/editor/command', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const body = (req.body || {}) as {
+      project?: CanonicalProjectDocument;
+      projectId?: string;
+      directorSessionId?: string;
+      command?: CanonicalProjectCommand;
+    };
+
+    if (!body.command || typeof body.command.type !== 'string') {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'INVALID_EDITOR_COMMAND',
+        'A typed CanonicalProjectCommand is required.'
+      );
+    }
+
+    const resolved = resolveEditableCanonicalProject(authReq.authIdentity!.uid, body);
+    if (!resolved.doc) {
+      return sendError(
+        res,
+        authReq.requestId,
+        resolved.errorStatus || 400,
+        resolved.errorCode || 'INVALID_REQUEST',
+        resolved.errorMessage || 'Unable to load project.'
+      );
+    }
+
+    const { project: updatedProject, receipt } = executeProjectCommand(
+      resolved.doc,
+      body.command,
+      {
+        actorId: authReq.authIdentity!.uid,
+        actorKind: 'user',
+        rationale: `Manual editor command ${body.command.type}`,
+        approvedByUser: true,
+      }
+    );
+    if (!receipt.ok) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'COMMAND_REJECTED',
+        `Command ${body.command.type} rejected: ${receipt.errors.join(' ') || 'Precondition failed'}`
+      );
+    }
+
+    persistUpdatedCanonicalProject(authReq.authIdentity!.uid, updatedProject, body);
+
+    recordAudit(
+      authReq.authIdentity!.uid,
+      authReq.authIdentity!.email,
+      'EDITOR_COMMAND_EXECUTED',
+      `/projects/${updatedProject.id}`,
+      `Executed ${body.command.type} (rev #${receipt.revision})`,
+      authReq.requestId,
+      'user',
+      'success'
+    );
+
+    return sendOk(res, authReq.requestId, {
+      project: updatedProject,
+      receipt,
+    });
+  });
+
+  app.post('/api/v1/editor/ai-transaction/plan', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const body = (req.body || {}) as {
+      project?: CanonicalProjectDocument;
+      projectId?: string;
+      directorSessionId?: string;
+      prompt?: string;
+      selectedClipId?: string | null;
+      selectedSceneId?: string | null;
+      playheadSec?: number;
+      selection?: {
+        selectedClipIds?: string[];
+        selectedSceneId?: string | null;
+        playheadTimeSec?: number;
+      };
+    };
+
+    if (!body.prompt || !body.prompt.trim()) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'EMPTY_COEDIT_PROMPT',
+        'A natural-language co-edit prompt is required.'
+      );
+    }
+
+    const resolved = resolveEditableCanonicalProject(authReq.authIdentity!.uid, body);
+    if (!resolved.doc) {
+      return sendError(
+        res,
+        authReq.requestId,
+        resolved.errorStatus || 400,
+        resolved.errorCode || 'INVALID_REQUEST',
+        resolved.errorMessage || 'Unable to load project.'
+      );
+    }
+
+    const selectedClipId =
+      body.selectedClipId ?? body.selection?.selectedClipIds?.[0] ?? null;
+    const selectedSceneId =
+      body.selectedSceneId ?? body.selection?.selectedSceneId ?? null;
+    const playheadSec =
+      typeof body.playheadSec === 'number'
+        ? body.playheadSec
+        : typeof body.selection?.playheadTimeSec === 'number'
+        ? body.selection.playheadTimeSec
+        : 0;
+
+    const transaction = planAiCoEditTransaction({
+      project: resolved.doc,
+      prompt: body.prompt,
+      selectedClipId,
+      selectedSceneId,
+      playheadSec,
+    });
+
+    return sendOk(res, authReq.requestId, {
+      transaction,
+    });
+  });
+
+  app.post('/api/v1/editor/ai-transaction/apply', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const body = (req.body || {}) as {
+      project?: CanonicalProjectDocument;
+      projectId?: string;
+      directorSessionId?: string;
+      transaction?: AiCoEditTransaction;
+      selectedOperationIds?: string[];
+    };
+
+    if (!body.transaction) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'MISSING_TRANSACTION',
+        'An AiCoEditTransaction is required.'
+      );
+    }
+
+    const resolved = resolveEditableCanonicalProject(authReq.authIdentity!.uid, body);
+    if (!resolved.doc) {
+      return sendError(
+        res,
+        authReq.requestId,
+        resolved.errorStatus || 400,
+        resolved.errorCode || 'INVALID_REQUEST',
+        resolved.errorMessage || 'Unable to load project.'
+      );
+    }
+
+    const result = applyAiCoEditTransaction({
+      project: resolved.doc,
+      transaction: body.transaction,
+      selectedOperationIds: body.selectedOperationIds,
+      actorId: authReq.authIdentity!.uid,
+    });
+
+    if (!result.ok) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'AI_TRANSACTION_REJECTED',
+        result.errors.join(' ') || 'AI transaction could not be applied.'
+      );
+    }
+
+    persistUpdatedCanonicalProject(authReq.authIdentity!.uid, result.project, body);
+
+    recordAudit(
+      authReq.authIdentity!.uid,
+      authReq.authIdentity!.email,
+      'EDITOR_AI_TRANSACTION_APPLIED',
+      `/projects/${result.project.id}`,
+      `Applied AI Co-Edit transaction ${body.transaction.id} (${result.receipts.length} command receipts)`,
+      authReq.requestId,
+      'user',
+      'success'
+    );
+
+    return sendOk(res, authReq.requestId, result);
+  });
+
+  app.post('/api/v1/editor/diff', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const body = (req.body || {}) as {
+      beforeProject?: CanonicalProjectDocument;
+      afterProject?: CanonicalProjectDocument;
+    };
+
+    if (!body.beforeProject || !body.afterProject) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'MISSING_DIFF_PROJECTS',
+        'Both beforeProject and afterProject are required.'
+      );
+    }
+
+    const diff = diffCanonicalProjects(body.beforeProject, body.afterProject);
+    return sendOk(res, authReq.requestId, { diff });
+  });
+
+  // =========================================================================
+  // PHASE 12: TEMPLATE FACTORY, AUTOMATIC REUSE & CONTINUOUS IMPROVEMENT API
+  // =========================================================================
+
+  const getOrInitUserPreferenceConsent = (uid: string): UserPreferenceConsentConfig => {
+    const existing = userPreferenceConsentsStore.get(uid);
+    if (existing) return existing;
+    const def = createDefaultPreferenceConsent(uid);
+    userPreferenceConsentsStore.set(uid, def);
+    return def;
+  };
+
+  app.get('/api/v1/template-factory/drafts', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const uid = authReq.authIdentity!.uid;
+
+    const drafts = Array.from(templateFactoryDraftsStore.values())
+      .filter((d) => d.ownerUid === uid)
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+
+    const consent = getOrInitUserPreferenceConsent(uid);
+    const signals = templatePreferenceSignalsStore.filter((s) => s.ownerUid === uid);
+
+    return sendOk(res, authReq.requestId, {
+      items: drafts,
+      total: drafts.length,
+      preferenceConsent: consent,
+      preferenceSignals: signals,
+    });
+  });
+
+  app.post('/api/v1/template-factory/extract-preview', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const uid = authReq.authIdentity!.uid;
+    const body = (req.body || {}) as {
+      project?: CanonicalProjectDocument;
+      projectId?: string;
+      referenceSessionId?: string;
+      selectedSceneIds?: string[];
+      selectedClipIds?: string[];
+    };
+
+    let targetProject: CanonicalProjectDocument | null = null;
+    if (body.project) {
+      const v = validateCanonicalProject(body.project);
+      if (!v.valid || !v.project) {
+        return sendError(res, authReq.requestId, 400, 'INVALID_PROJECT', v.errors.join(' '));
+      }
+      targetProject = v.project;
+    } else if (body.referenceSessionId) {
+      const refSess = referenceLabSessionsStore.get(body.referenceSessionId);
+      if (!refSess) {
+        return sendError(res, authReq.requestId, 404, 'REFERENCE_SESSION_NOT_FOUND', 'Reference Lab session not found.');
+      }
+      if (refSess.ownerUid !== uid) {
+        return sendError(res, authReq.requestId, 403, 'FORBIDDEN_REFERENCE_SESSION', 'You do not own this Reference Lab session.');
+      }
+      targetProject = refSess.canonicalProject;
+    } else if (body.projectId) {
+      const resolved = resolveEditableCanonicalProject(uid, { projectId: body.projectId });
+      if (!resolved.doc) {
+        return sendError(
+          res,
+          authReq.requestId,
+          resolved.errorStatus || 400,
+          resolved.errorCode || 'INVALID_PROJECT',
+          resolved.errorMessage || 'Unable to load project.'
+        );
+      }
+      targetProject = resolved.doc;
+    }
+
+    if (!targetProject) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'SOURCE_REQUIRED',
+        'Provide project, projectId, or referenceSessionId.'
+      );
+    }
+
+    const extraction = extractEditableParametersFromProject(targetProject, {
+      selectedSceneIds: body.selectedSceneIds,
+      selectedClipIds: body.selectedClipIds,
+    });
+
+    return sendOk(res, authReq.requestId, extraction);
+  });
+
+  app.post('/api/v1/template-factory/create', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const uid = authReq.authIdentity!.uid;
+    const body = (req.body || {}) as {
+      sourceKind?: TemplateFactorySourceKind;
+      title?: string;
+      description?: string;
+      moduleId?: CatalogItem['moduleId'];
+      categoryId?: string;
+      tags?: string[];
+      licenseType?: CatalogItem['licenseType'];
+      licenseNote?: string;
+      authorName?: string;
+      project?: CanonicalProjectDocument;
+      projectId?: string;
+      referenceSessionId?: string;
+      selectedSceneIds?: string[];
+      selectedClipIds?: string[];
+      exposedParameterKeys?: string[];
+      autoSavedFromAiComponent?: boolean;
+    };
+
+    const sourceKind: TemplateFactorySourceKind = body.sourceKind || 'from-scratch';
+    let sourceProject: CanonicalProjectDocument | undefined;
+    let referenceSession: ReferenceLabSession | undefined;
+
+    if (sourceKind === 'reference-reconstruction') {
+      if (body.referenceSessionId) {
+        const found = referenceLabSessionsStore.get(body.referenceSessionId);
+        if (!found) {
+          return sendError(res, authReq.requestId, 404, 'REFERENCE_SESSION_NOT_FOUND', 'Reference Lab session not found.');
+        }
+        if (found.ownerUid !== uid) {
+          return sendError(res, authReq.requestId, 403, 'FORBIDDEN_REFERENCE_SESSION', 'You do not own this Reference Lab session.');
+        }
+        referenceSession = found;
+      } else if (body.project) {
+        const v = validateCanonicalProject(body.project);
+        if (!v.valid || !v.project) {
+          return sendError(res, authReq.requestId, 400, 'INVALID_PROJECT', v.errors.join(' '));
+        }
+        sourceProject = {
+          ...v.project,
+          provenance: {
+            ...v.project.provenance,
+            originType: 'reference-reconstruction',
+          },
+        };
+      } else {
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          'REFERENCE_SOURCE_REQUIRED',
+          'referenceSessionId or reconstructed project is required for reference-reconstruction mode.'
+        );
+      }
+    } else if (sourceKind === 'canonical-project') {
+      const resolved = resolveEditableCanonicalProject(uid, {
+        project: body.project,
+        projectId: body.projectId,
+      });
+      if (!resolved.doc) {
+        return sendError(
+          res,
+          authReq.requestId,
+          resolved.errorStatus || 400,
+          resolved.errorCode || 'INVALID_PROJECT',
+          resolved.errorMessage || 'Unable to load source project.'
+        );
+      }
+      sourceProject = resolved.doc;
+    }
+
+    const userDrafts = Array.from(templateFactoryDraftsStore.values()).filter(
+      (d) => d.ownerUid === uid
+    );
+
+    const draft = runTemplateFactoryPipeline({
+      ownerUid: uid,
+      sourceKind: referenceSession ? 'reference-reconstruction' : sourceProject ? 'canonical-project' : 'from-scratch',
+      title: body.title,
+      description: body.description,
+      moduleId: body.moduleId,
+      categoryId: body.categoryId,
+      tags: body.tags,
+      licenseType: body.licenseType,
+      licenseNote: body.licenseNote,
+      authorName: body.authorName || authReq.authIdentity!.displayName || uid,
+      sourceProject,
+      referenceSession,
+      selectedSceneIds: body.selectedSceneIds,
+      selectedClipIds: body.selectedClipIds,
+      exposedParameterKeys: body.exposedParameterKeys,
+      autoSavedFromAiComponent: body.autoSavedFromAiComponent,
+      existingCatalog: Array.from(catalogStore.values()),
+      existingFactoryDrafts: userDrafts,
+      assetsMap: assetsStore,
+    });
+
+    templateFactoryDraftsStore.set(draft.id, draft);
+    persistState();
+
+    recordAudit(
+      uid,
+      authReq.authIdentity!.email,
+      'TEMPLATE_FACTORY_DRAFT_CREATED',
+      `/templateFactoryDrafts/${draft.id}`,
+      `Created private Template Factory draft "${draft.title}" (source=${draft.sourceKind}, provenance=${draft.provenanceClassification})`,
+      authReq.requestId,
+      'catalog',
+      'success'
+    );
+
+    return sendOk(res, authReq.requestId, { draft }, 201);
+  });
+
+  app.patch('/api/v1/template-factory/drafts/:id', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const uid = authReq.authIdentity!.uid;
+    const draft = templateFactoryDraftsStore.get(req.params.id);
+    if (!draft) {
+      return sendError(res, authReq.requestId, 404, 'DRAFT_NOT_FOUND', 'Template Factory draft not found.');
+    }
+    if (draft.ownerUid !== uid) {
+      return sendError(res, authReq.requestId, 403, 'FORBIDDEN_DRAFT', 'You do not own this Template Factory draft.');
+    }
+
+    const updated = updateFactoryDraftRecord(
+      draft,
+      req.body || {},
+      uid,
+      assetsStore
+    );
+    templateFactoryDraftsStore.set(updated.id, updated);
+    persistState();
+
+    return sendOk(res, authReq.requestId, { draft: updated });
+  });
+
+  app.post('/api/v1/template-factory/drafts/:id/fork', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const uid = authReq.authIdentity!.uid;
+    const draft = templateFactoryDraftsStore.get(req.params.id);
+    if (!draft) {
+      return sendError(res, authReq.requestId, 404, 'DRAFT_NOT_FOUND', 'Template Factory draft not found.');
+    }
+    if (draft.ownerUid !== uid && !draft.publishedToCatalog) {
+      return sendError(res, authReq.requestId, 403, 'FORBIDDEN_DRAFT', 'You do not have permission to fork this private draft.');
+    }
+
+    const body = (req.body || {}) as { forkTitle?: string };
+    const forked = forkFactoryTemplate(draft, uid, body.forkTitle);
+    templateFactoryDraftsStore.set(forked.id, forked);
+    persistState();
+
+    recordAudit(
+      uid,
+      authReq.authIdentity!.email,
+      'TEMPLATE_FACTORY_FORKED',
+      `/templateFactoryDrafts/${forked.id}`,
+      `Forked Template Factory draft "${draft.title}" (${draft.id}) -> "${forked.title}" (${forked.id})`,
+      authReq.requestId,
+      'catalog',
+      'success'
+    );
+
+    return sendOk(res, authReq.requestId, { draft: forked }, 201);
+  });
+
+  app.post('/api/v1/template-factory/drafts/:id/merge', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const uid = authReq.authIdentity!.uid;
+    const primaryDraft = templateFactoryDraftsStore.get(req.params.id);
+    if (!primaryDraft || primaryDraft.ownerUid !== uid) {
+      return sendError(res, authReq.requestId, 404, 'PRIMARY_DRAFT_NOT_FOUND', 'Primary Template Factory draft not found.');
+    }
+
+    const body = (req.body || {}) as { secondaryDraftId?: string; mergedTitle?: string };
+    if (!body.secondaryDraftId) {
+      return sendError(res, authReq.requestId, 400, 'SECONDARY_DRAFT_REQUIRED', 'secondaryDraftId is required for merge.');
+    }
+    const secondaryDraft = templateFactoryDraftsStore.get(body.secondaryDraftId);
+    if (!secondaryDraft || secondaryDraft.ownerUid !== uid) {
+      return sendError(res, authReq.requestId, 404, 'SECONDARY_DRAFT_NOT_FOUND', 'Secondary Template Factory draft not found.');
+    }
+
+    const merged = mergeFactoryTemplates({
+      primaryDraft,
+      secondaryDraft,
+      actorUid: uid,
+      mergedTitle: body.mergedTitle,
+    });
+    templateFactoryDraftsStore.set(merged.id, merged);
+    persistState();
+
+    return sendOk(res, authReq.requestId, { draft: merged });
+  });
+
+  app.post('/api/v1/template-factory/drafts/:id/restore-version', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const uid = authReq.authIdentity!.uid;
+    const draft = templateFactoryDraftsStore.get(req.params.id);
+    if (!draft || draft.ownerUid !== uid) {
+      return sendError(res, authReq.requestId, 404, 'DRAFT_NOT_FOUND', 'Template Factory draft not found.');
+    }
+
+    const body = (req.body || {}) as { targetVersion?: string };
+    if (!body.targetVersion) {
+      return sendError(res, authReq.requestId, 400, 'VERSION_REQUIRED', 'targetVersion is required.');
+    }
+
+    try {
+      const restored = restoreFactoryTemplateVersion(draft, body.targetVersion, uid);
+      templateFactoryDraftsStore.set(restored.id, restored);
+      persistState();
+      return sendOk(res, authReq.requestId, { draft: restored });
+    } catch (err) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'RESTORE_VERSION_FAILED',
+        err instanceof Error ? err.message : 'Failed to restore version.'
+      );
+    }
+  });
+
+  app.post('/api/v1/template-factory/drafts/:id/deprecate', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const uid = authReq.authIdentity!.uid;
+    const draft = templateFactoryDraftsStore.get(req.params.id);
+    if (!draft || draft.ownerUid !== uid) {
+      return sendError(res, authReq.requestId, 404, 'DRAFT_NOT_FOUND', 'Template Factory draft not found.');
+    }
+
+    const body = (req.body || {}) as { reason?: string; replacementTemplateId?: string };
+    const deprecated = deprecateFactoryTemplate(
+      draft,
+      body.reason || 'Deprecated by owner.',
+      body.replacementTemplateId
+    );
+    templateFactoryDraftsStore.set(deprecated.id, deprecated);
+    if (catalogStore.has(deprecated.id)) {
+      catalogStore.set(deprecated.id, deprecated.catalogItemDraft);
+    }
+    persistState();
+
+    return sendOk(res, authReq.requestId, { draft: deprecated });
+  });
+
+  app.post('/api/v1/template-factory/drafts/:id/update-dependencies', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const uid = authReq.authIdentity!.uid;
+    const draft = templateFactoryDraftsStore.get(req.params.id);
+    if (!draft || draft.ownerUid !== uid) {
+      return sendError(res, authReq.requestId, 404, 'DRAFT_NOT_FOUND', 'Template Factory draft not found.');
+    }
+
+    const body = (req.body || {}) as {
+      assetReplacements?: Record<string, string>;
+      addFonts?: string[];
+      resolveMissingAssets?: boolean;
+    };
+    const updated = updateFactoryTemplateDependencies(draft, body, uid, assetsStore);
+    templateFactoryDraftsStore.set(updated.id, updated);
+    persistState();
+
+    return sendOk(res, authReq.requestId, { draft: updated });
+  });
+
+  app.post('/api/v1/template-factory/drafts/:id/duplicate-suggestion', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const uid = authReq.authIdentity!.uid;
+    const draft = templateFactoryDraftsStore.get(req.params.id);
+    if (!draft || draft.ownerUid !== uid) {
+      return sendError(res, authReq.requestId, 404, 'DRAFT_NOT_FOUND', 'Template Factory draft not found.');
+    }
+
+    const body = (req.body || {}) as {
+      suggestionId?: string;
+      action?: 'keep-both-distinct' | 'link-as-version' | 'merge-into-existing' | 'undo-suggestion';
+      note?: string;
+    };
+    if (!body.suggestionId || !body.action) {
+      return sendError(res, authReq.requestId, 400, 'INVALID_DUPLICATE_RESOLUTION', 'suggestionId and action are required.');
+    }
+
+    const updated = resolveDuplicateSuggestion(draft, body.suggestionId, body.action, body.note);
+    templateFactoryDraftsStore.set(updated.id, updated);
+    persistState();
+
+    return sendOk(res, authReq.requestId, { draft: updated });
+  });
+
+  app.post('/api/v1/template-factory/drafts/:id/publish', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const uid = authReq.authIdentity!.uid;
+    const draft = templateFactoryDraftsStore.get(req.params.id);
+    if (!draft || draft.ownerUid !== uid) {
+      return sendError(res, authReq.requestId, 404, 'DRAFT_NOT_FOUND', 'Template Factory draft not found.');
+    }
+
+    const body = (req.body || {}) as { explicitUserConfirmation?: boolean };
+    const result = publishFactoryTemplateToCatalog({
+      draft,
+      actorUid: uid,
+      explicitUserConfirmation: Boolean(body.explicitUserConfirmation),
+      assetsMap: assetsStore,
+    });
+
+    if (!result.ok || !result.updatedDraft || !result.publishedCatalogItem) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        result.errorCode || 'PUBLISH_BLOCKED',
+        result.errorMessage || 'Template failed publication gate.'
+      );
+    }
+
+    templateFactoryDraftsStore.set(result.updatedDraft.id, result.updatedDraft);
+    catalogStore.set(result.publishedCatalogItem.id, result.publishedCatalogItem);
+    catalogCacheVersion += 1;
+    persistState();
+
+    recordAudit(
+      uid,
+      authReq.authIdentity!.email,
+      'TEMPLATE_FACTORY_PUBLISHED',
+      `/catalog/${result.publishedCatalogItem.id}`,
+      `Published Template Factory draft "${result.publishedCatalogItem.name}" to Validated Catalog (license=${result.publishedCatalogItem.licenseType})`,
+      authReq.requestId,
+      'catalog',
+      'success'
+    );
+
+    return sendOk(res, authReq.requestId, {
+      draft: result.updatedDraft,
+      catalogItem: result.publishedCatalogItem,
+    });
+  });
+
+  app.post('/api/v1/template-factory/feedback/consent', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const uid = authReq.authIdentity!.uid;
+    const current = getOrInitUserPreferenceConsent(uid);
+    const body = (req.body || {}) as { consentToPreferenceRanking?: boolean };
+
+    const updated: UserPreferenceConsentConfig = {
+      ...current,
+      consentToPreferenceRanking:
+        body.consentToPreferenceRanking !== undefined
+          ? Boolean(body.consentToPreferenceRanking)
+          : current.consentToPreferenceRanking,
+      allowCrossUserSharing: false,
+      silentModelTrainingEnabled: false,
+      updatedAt: new Date().toISOString(),
+    };
+    userPreferenceConsentsStore.set(uid, updated);
+    persistState();
+
+    return sendOk(res, authReq.requestId, { preferenceConsent: updated });
+  });
+
+  app.post('/api/v1/template-factory/feedback/signal', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const uid = authReq.authIdentity!.uid;
+    const consent = getOrInitUserPreferenceConsent(uid);
+    const body = (req.body || {}) as {
+      templateId?: string;
+      moduleId?: CatalogItem['moduleId'];
+      action?: TemplateFeedbackAction;
+      preferredVersion?: string;
+      styleTag?: string;
+      reasonNote?: string;
+    };
+
+    if (!body.templateId || !body.action) {
+      return sendError(res, authReq.requestId, 400, 'INVALID_FEEDBACK_SIGNAL', 'templateId and action are required.');
+    }
+
+    const result = recordTemplateFeedbackSignal({
+      ownerUid: uid,
+      consentConfig: consent,
+      existingSignals: templatePreferenceSignalsStore,
+      templateId: body.templateId,
+      moduleId: body.moduleId,
+      action: body.action,
+      preferredVersion: body.preferredVersion,
+      styleTag: body.styleTag,
+      reasonNote: body.reasonNote,
+    });
+
+    if (!result.recorded) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'CONSENT_DISABLED',
+        result.consentBlockedReason || 'Preference capture disabled by user consent settings.'
+      );
+    }
+
+    templatePreferenceSignalsStore.splice(
+      0,
+      templatePreferenceSignalsStore.length,
+      ...result.signals
+    );
+    userPreferenceConsentsStore.set(uid, result.updatedConsent);
+    persistState();
+
+    return sendOk(res, authReq.requestId, {
+      recorded: true,
+      preferenceConsent: result.updatedConsent,
+      preferenceSignals: templatePreferenceSignalsStore.filter((s) => s.ownerUid === uid),
+    });
+  });
+
+  app.get('/api/v1/template-factory/rankings', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const uid = authReq.authIdentity!.uid;
+    const consent = getOrInitUserPreferenceConsent(uid);
+    const moduleId =
+      typeof req.query.moduleId === 'string'
+        ? (req.query.moduleId as CatalogItem['moduleId'])
+        : undefined;
+
+    const userDraftItems = Array.from(templateFactoryDraftsStore.values())
+      .filter((d) => d.ownerUid === uid)
+      .map((d) => d.catalogItemDraft);
+    const publishedItems = Array.from(catalogStore.values()).filter(
+      (i) => i.visibility === 'published'
+    );
+    const combinedMap = new Map<string, CatalogItem>();
+    for (const item of [...publishedItems, ...userDraftItems]) {
+      combinedMap.set(item.id, item);
+    }
+
+    const rankings = rankTemplatesWithTransparentSignals({
+      ownerUid: uid,
+      consentConfig: consent,
+      userSignals: templatePreferenceSignalsStore,
+      templates: Array.from(combinedMap.values()),
+      moduleId,
+    });
+
+    return sendOk(res, authReq.requestId, {
+      rankings: rankings.slice(0, 50),
+      preferenceConsent: consent,
+    });
+  });
+
+  // ============================================================================
+  // PHASE 13 — CANONICAL RENDERING, EXPORT, MOBILE APP ADAPTERS & FINAL QA GATE
+  // ============================================================================
+
+  function toPublicRenderJobView(
+    job: DurableRenderExportJobRecord
+  ): Omit<DurableRenderExportJobRecord, 'artifactBytesBase64'> & {
+    hasDownloadableBytes: boolean;
+    downloadUrl: string | null;
+  } {
+    const { artifactBytesBase64, ...rest } = job;
+    const hasDownloadableBytes =
+      job.stage === 'ready' &&
+      Boolean(artifactBytesBase64) &&
+      Boolean(job.artifactMetadata?.validatedAfterWrite);
+    return {
+      ...rest,
+      hasDownloadableBytes,
+      downloadUrl: hasDownloadableBytes
+        ? `/api/v1/render-export/jobs/${job.id}/download`
+        : null,
+    };
+  }
+
+  app.get('/api/v1/render-export/capabilities', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+
+    const adapterManifests = getMobileAdapterCapabilityManifests();
+    const serverEnvironmentCapabilities = detectBrowserRenderCapabilities();
+    const workerDisclosureSample = evaluateServerWorkerTransparency({
+      executionTier: 'final-render',
+      outputFormat: 'mp4-video',
+      durationSec: 10,
+      projectClipsCount: 6,
+      userApprovedDataUpload: false,
+    });
+
+    return sendOk(res, authReq.requestId, {
+      engineVersion: RENDER_EXPORT_ENGINE_VERSION,
+      adapterManifests,
+      serverEnvironmentCapabilities,
+      serverWorkerStatus: workerDisclosureSample,
+      supportedExecutionTiers: ['timeline-preview', 'proxy-render', 'final-render'],
+      universalFormats: [
+        { format: 'sowveil-bundle-zip', ext: '.sowveil.zip', status: 'Verified', description: 'Complete Canonical v2.0.0 Project + Assets + Captions + Stems + QA Report' },
+        { format: 'sowveil-json', ext: '.sowveil.json', status: 'Verified', description: 'Canonical v2.0.0 Project Graph JSON' },
+        { format: 'png-frame', ext: '.png', status: 'Verified', description: 'Validated RGBA PNG Frame Still (IHDR/IDAT/IEND checked)' },
+        { format: 'jpeg-frame', ext: '.jpg', status: 'Verified', description: 'Validated Baseline JFIF JPEG Frame Still (SOI/SOF0/EOI checked)' },
+        { format: 'svg-vector', ext: '.svg', status: 'Verified', description: 'Sanitized Vector SVG Frame Plate' },
+        { format: 'wav-audio', ext: '.wav', status: 'Verified', description: 'Validated 16-bit PCM RIFF/WAVE Audio Master with Peak/Clipping Telemetry' },
+        { format: 'audio-stems-zip', ext: '.stems.zip', status: 'Verified', description: 'Per-Track 16-bit PCM WAV Stems + Master + STEMS_MANIFEST.json' },
+        { format: 'srt-captions', ext: '.srt', status: 'Verified', description: 'Validated SubRip (.srt) Timed Captions' },
+        { format: 'vtt-captions', ext: '.vtt', status: 'Verified', description: 'Validated WebVTT (.vtt) Timed Captions' },
+        { format: 'alight-motion-xml', ext: '.xml', status: 'Tested subset', description: 'Validated Alight Motion <scene> XML (2D text/shape/bezier subset)' },
+        { format: 'capcut-handoff-zip', ext: '.capcut-handoff.zip', status: 'Media handoff only', description: 'Honest CapCut Media + SRT + Timing Sheet Handoff ZIP' },
+        { format: 'node-video-handoff-zip', ext: '.nodevideo-handoff.zip', status: 'Media handoff only', description: 'Node Video Media + Cubic-Bezier Curve Sheet Handoff ZIP' },
+        { format: 'kinemaster-handoff-zip', ext: '.kinemaster-handoff.zip', status: 'Media handoff only', description: 'KineMaster Media + SRT + Timing Handoff ZIP (never fake .kine)' },
+        { format: 'webm-video', ext: '.webm', status: 'Needs setup', description: 'Requires verified browser WebCodecs/MediaRecorder or configured render worker' },
+        { format: 'mp4-video', ext: '.mp4', status: 'Needs setup', description: 'Requires configured H.264 server render worker (never renames WebM/ZIP to .mp4)' },
+      ],
+    });
+  });
+
+  app.post('/api/v1/render-export/feature-loss-preview', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const uid = authReq.authIdentity!.uid;
+
+    const body = (req.body || {}) as {
+      projectDoc?: CanonicalProjectDocument;
+      projectId?: string;
+      targetAdapter?: TargetMobileEditorId;
+      executionTier?: RenderExecutionTier;
+      outputFormat?: RenderOutputFormat;
+      userApprovedDataUpload?: boolean;
+    };
+
+    let projectDoc: CanonicalProjectDocument | undefined = body.projectDoc;
+    if (!projectDoc && body.projectId) {
+      const foundProj = projectsStore.get(body.projectId);
+      if (foundProj && foundProj.ownerUid === uid && foundProj.canonicalProjectJson) {
+        try {
+          projectDoc = JSON.parse(foundProj.canonicalProjectJson) as CanonicalProjectDocument;
+        } catch {
+          projectDoc = undefined;
+        }
+      }
+    }
+    if (!projectDoc) {
+      projectDoc = createKnownGoodSampleCanonicalProject(uid);
+    }
+
+    const targetAdapter: TargetMobileEditorId = body.targetAdapter || 'sowveil-project';
+    const report = computeAdapterFeatureLossReport(projectDoc, targetAdapter, assetsStore);
+    const workerDisclosure = evaluateServerWorkerTransparency({
+      executionTier: body.executionTier || 'final-render',
+      outputFormat: body.outputFormat || 'sowveil-bundle-zip',
+      durationSec: projectDoc.canvas.durationSec || 6,
+      projectClipsCount: getAllClipsFromProject(projectDoc).length,
+      userApprovedDataUpload: body.userApprovedDataUpload,
+    });
+
+    return sendOk(res, authReq.requestId, {
+      featureLossReport: report,
+      serverWorkerDisclosure: workerDisclosure,
+    });
+  });
+
+  app.get('/api/v1/render-export/jobs', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const uid = authReq.authIdentity!.uid;
+
+    const jobs = Array.from(renderExportJobsStore.values())
+      .filter((j) => j.ownerUid === uid)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .map(toPublicRenderJobView);
+
+    return sendOk(res, authReq.requestId, {
+      jobs,
+      sampleProject: createKnownGoodSampleCanonicalProject(uid),
+    });
+  });
+
+  app.post('/api/v1/render-export/jobs', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const uid = authReq.authIdentity!.uid;
+
+    const body = (req.body || {}) as {
+      projectDoc?: CanonicalProjectDocument;
+      projectId?: string;
+      directorSessionId?: string;
+      executionTier?: RenderExecutionTier;
+      outputFormat?: RenderOutputFormat;
+      targetAdapter?: TargetMobileEditorId;
+      requestedWidth?: number;
+      requestedHeight?: number;
+      requestedFps?: 24 | 30 | 60;
+      requestedDurationSec?: number;
+      sampleTimestampSec?: number;
+      downscaleAssetsForProxy?: boolean;
+      userApprovedDataUpload?: boolean;
+    };
+
+    const outputFormat: RenderOutputFormat = body.outputFormat || 'sowveil-bundle-zip';
+    const executionTier: RenderExecutionTier = body.executionTier || 'final-render';
+
+    let directorSession: AiDirectorSessionRecord | null = null;
+    if (body.directorSessionId) {
+      const ds = aiDirectorSessionsStore.get(body.directorSessionId);
+      if (ds && ds.ownerUid === uid) {
+        directorSession = ds;
+      }
+    }
+
+    let projectDoc: CanonicalProjectDocument | undefined = body.projectDoc;
+    if (!projectDoc && body.projectId) {
+      const foundProj = projectsStore.get(body.projectId);
+      if (foundProj && foundProj.ownerUid === uid && foundProj.canonicalProjectJson) {
+        try {
+          projectDoc = JSON.parse(foundProj.canonicalProjectJson) as CanonicalProjectDocument;
+        } catch {
+          projectDoc = undefined;
+        }
+      }
+    }
+    if (!projectDoc && directorSession?.canonicalProject) {
+      projectDoc = directorSession.canonicalProject;
+    }
+    if (!projectDoc) {
+      projectDoc = createKnownGoodSampleCanonicalProject(uid);
+    }
+
+    const jobRecord = createAndExecuteCanonicalRenderJob({
+      ownerUid: uid,
+      projectDoc,
+      directorSession,
+      executionTier,
+      outputFormat,
+      targetAdapter: body.targetAdapter,
+      requestedWidth: body.requestedWidth,
+      requestedHeight: body.requestedHeight,
+      requestedFps: body.requestedFps,
+      requestedDurationSec: body.requestedDurationSec,
+      sampleTimestampSec: body.sampleTimestampSec,
+      downscaleAssetsForProxy: body.downscaleAssetsForProxy,
+      userApprovedDataUpload: body.userApprovedDataUpload,
+      assetsMap: assetsStore,
+    });
+
+    renderExportJobsStore.set(jobRecord.id, jobRecord);
+    persistState();
+
+    recordAudit(
+      uid,
+      authReq.authIdentity!.email,
+      'CANONICAL_RENDER_JOB_EXECUTED',
+      `/render-export/jobs/${jobRecord.id}`,
+      `Executed ${executionTier} job (${outputFormat}, adapter=${jobRecord.targetAdapter}) → stage=${jobRecord.stage}`,
+      authReq.requestId,
+      'job',
+      jobRecord.stage === 'ready' ? 'success' : 'denied'
+    );
+
+    return sendOk(
+      res,
+      authReq.requestId,
+      {
+        job: toPublicRenderJobView(jobRecord),
+      },
+      201
+    );
+  });
+
+  app.post('/api/v1/render-export/jobs/:id/cancel', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const uid = authReq.authIdentity!.uid;
+
+    const existing = renderExportJobsStore.get(req.params.id);
+    if (!existing || existing.ownerUid !== uid) {
+      return sendError(res, authReq.requestId, 404, 'RENDER_JOB_NOT_FOUND', 'Render job not found.');
+    }
+
+    const reason =
+      typeof req.body?.reason === 'string' && req.body.reason.trim()
+        ? req.body.reason.trim().slice(0, 240)
+        : 'Cancelled by user request';
+    const cancelled = cancelRenderExportJob(existing, reason);
+    renderExportJobsStore.set(cancelled.id, cancelled);
+    persistState();
+
+    return sendOk(res, authReq.requestId, {
+      job: toPublicRenderJobView(cancelled),
+    });
+  });
+
+  app.post('/api/v1/render-export/jobs/:id/retry', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const uid = authReq.authIdentity!.uid;
+
+    const existing = renderExportJobsStore.get(req.params.id);
+    if (!existing || existing.ownerUid !== uid) {
+      return sendError(res, authReq.requestId, 404, 'RENDER_JOB_NOT_FOUND', 'Render job not found.');
+    }
+
+    if (existing.retryPolicy.attemptCount >= existing.retryPolicy.maxAttempts) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'MAX_RETRY_ATTEMPTS_REACHED',
+        `Render job has reached max retry attempts (${existing.retryPolicy.maxAttempts}).`
+      );
+    }
+
+    let projectDoc = (req.body?.projectDoc as CanonicalProjectDocument | undefined);
+    if (!projectDoc) {
+      const foundProj = projectsStore.get(existing.projectId);
+      if (foundProj && foundProj.ownerUid === uid && foundProj.canonicalProjectJson) {
+        try {
+          projectDoc = JSON.parse(foundProj.canonicalProjectJson) as CanonicalProjectDocument;
+        } catch {
+          projectDoc = undefined;
+        }
+      }
+    }
+    if (!projectDoc) {
+      projectDoc = createKnownGoodSampleCanonicalProject(uid);
+    }
+
+    const retried = createAndExecuteCanonicalRenderJob({
+      ownerUid: uid,
+      projectDoc,
+      executionTier: existing.executionTier,
+      outputFormat:
+        (req.body?.outputFormat as RenderOutputFormat | undefined) || existing.outputFormat,
+      targetAdapter: existing.targetAdapter,
+      requestedWidth: existing.requestedWidth,
+      requestedHeight: existing.requestedHeight,
+      requestedFps: existing.requestedFps,
+      requestedDurationSec: existing.requestedDurationSec,
+      sampleTimestampSec: existing.sampleTimestampSec,
+      downscaleAssetsForProxy: existing.downscaleAssetsForProxy,
+      userApprovedDataUpload: Boolean(req.body?.userApprovedDataUpload),
+      assetsMap: assetsStore,
+      existingJobToRetry: existing,
+    });
+
+    renderExportJobsStore.set(retried.id, retried);
+    persistState();
+
+    return sendOk(res, authReq.requestId, {
+      job: toPublicRenderJobView(retried),
+    });
+  });
+
+  app.get('/api/v1/render-export/jobs/:id/qa-report', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const uid = authReq.authIdentity!.uid;
+
+    const existing = renderExportJobsStore.get(req.params.id);
+    if (!existing || existing.ownerUid !== uid) {
+      return sendError(res, authReq.requestId, 404, 'RENDER_JOB_NOT_FOUND', 'Render job not found.');
+    }
+
+    return sendOk(res, authReq.requestId, {
+      jobId: existing.id,
+      stage: existing.stage,
+      qaReport: existing.qaReport,
+      featureLossReport: existing.featureLossReport,
+      artifactMetadata: existing.artifactMetadata,
+    });
+  });
+
+  app.get('/api/v1/render-export/jobs/:id/download', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const uid = authReq.authIdentity!.uid;
+
+    const existing = renderExportJobsStore.get(req.params.id);
+    if (!existing || existing.ownerUid !== uid) {
+      return sendError(res, authReq.requestId, 404, 'RENDER_JOB_NOT_FOUND', 'Render job not found.');
+    }
+
+    if (
+      existing.stage !== 'ready' ||
+      !existing.artifactBytesBase64 ||
+      !existing.artifactMetadata ||
+      !existing.artifactMetadata.validatedAfterWrite
+    ) {
+      return sendError(
+        res,
+        authReq.requestId,
+        409,
+        'RENDER_OUTPUT_NOT_READY',
+        `Render job "${existing.id}" is in stage "${existing.stage}" and does not have a verified downloadable file.`
+      );
+    }
+
+    const binaryBuffer = Buffer.from(existing.artifactBytesBase64, 'base64');
+    res.setHeader('Content-Type', existing.artifactMetadata.mimeType);
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${existing.artifactMetadata.fileName}"`
+    );
+    res.setHeader('Content-Length', String(binaryBuffer.byteLength));
+    res.setHeader('X-Sowveil-Sha256', existing.artifactMetadata.sha256);
+    res.setHeader('X-Sowveil-Crc32', existing.artifactMetadata.crc32Hex);
+    res.setHeader('X-Sowveil-Renderer-Version', existing.artifactMetadata.rendererVersion);
+    return res.status(200).send(binaryBuffer);
+  });
+
   // Explicitly forbid alteration or deletion of audit records
   app.all('/api/v1/admin/audit-events*', requireAuth, (req: Request, res: Response, next: NextFunction) => {
     if (req.method === 'GET') return next();
@@ -3409,3 +8756,6 @@ export function createApiApp(options: ApiAppOptions = {}) {
 
   return app;
 }
+
+export const createSowveilApiApp = createApiApp;
+

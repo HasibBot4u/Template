@@ -28,6 +28,7 @@ interface PreviewRendererProps {
   comparisonMode: 'template' | 'edits';
   customValues: Record<string, string | number | boolean>;
   reducedMotion?: boolean;
+  onUpdateCustomValue?: (key: string, value: string | number | boolean) => void;
 }
 
 export const PreviewRenderer: React.FC<PreviewRendererProps> = ({
@@ -35,6 +36,7 @@ export const PreviewRenderer: React.FC<PreviewRendererProps> = ({
   comparisonMode,
   customValues,
   reducedMotion = false,
+  onUpdateCustomValue,
 }) => {
   const [isPlaying, setIsPlaying] = useState<boolean>(!reducedMotion);
   const [tick, setTick] = useState<number>(0);
@@ -506,30 +508,23 @@ export const PreviewRenderer: React.FC<PreviewRendererProps> = ({
         return (
           <div className="relative flex items-center justify-center h-full w-full overflow-hidden select-none">
             <div
-              className="absolute inset-0 opacity-25"
+              className="absolute inset-0 opacity-30"
               style={{
                 backgroundImage:
                   'linear-gradient(to right, #342A24 1px, transparent 1px), linear-gradient(to bottom, #342A24 1px, transparent 1px)',
                 backgroundSize: '24px 24px',
               }}
             />
-            <div className="absolute top-2.5 left-3 right-3 flex items-center justify-between text-[11px] font-mono-tabular text-[#B8AAA0]">
-              <span className="truncate max-w-[65%]">{evalResult.formulaSummary}</span>
-              <span className="text-[#FFC08C]">
-                dx:{evalResult.dx.toFixed(0)} dy:{evalResult.dy.toFixed(0)}
-              </span>
+            <div className="absolute top-2.5 left-3.5 right-3.5 flex items-center justify-between text-[11px] font-mono-tabular text-[#83766D]">
+              <span>LIVE PREVIEW</span>
+              <span className="text-[#B8AAA0]">Position</span>
             </div>
             <div
               style={{
                 transform: `translate(${evalResult.dx.toFixed(1)}px, ${evalResult.dy.toFixed(1)}px) scale(${evalResult.scaleX.toFixed(2)}, ${evalResult.scaleY.toFixed(2)}) rotate(${evalResult.rotationDeg.toFixed(0)}deg)`,
               }}
-              className="w-14 h-14 rounded-xl bg-[#F06424] shadow-[0_0_24px_rgba(240,100,36,0.45)] flex items-center justify-center"
-            >
-              <div className="w-2 h-2 rounded-full bg-[#080707]" />
-            </div>
-            <div className="absolute bottom-2 left-3 right-3 text-[10px] font-mono-tabular text-[#83766D] text-center truncate">
-              Deterministic Math Engine · Exports baked curves (.xml) or .sowveil.json
-            </div>
+              className="w-11 h-11 rounded-lg bg-[#F06424] shadow-[0_0_24px_rgba(240,100,36,0.45)] flex items-center justify-center"
+            />
           </div>
         );
       }
@@ -583,60 +578,34 @@ export const PreviewRenderer: React.FC<PreviewRendererProps> = ({
           ];
         const activeBar = isPlaying || isAudioPlaying ? Math.floor(progress * bars.length) : -1;
         return (
-          <div className="flex flex-col items-center justify-center h-full w-full px-5 select-none">
-            <div className="flex items-center gap-1.5 h-20 w-full max-w-xs justify-center">
-              {bars.map((heightPct, idx) => {
-                const isPassed = idx <= activeBar;
-                return (
-                  <div
-                    key={idx}
-                    style={{ height: `${Math.max(12, heightPct * 0.85)}%` }}
-                    className={`w-1.5 rounded-full transition-colors ${
-                      isPassed ? 'bg-[#F06424]' : 'bg-[#F3EEE8]/70'
-                    }`}
-                  />
-                );
-              })}
-            </div>
-            <div className="mt-3 flex flex-wrap items-center justify-center gap-3 w-full">
+          <div className="flex flex-col justify-center h-full w-full px-5 select-none">
+            <div className="flex items-center gap-4 w-full">
               <button
                 type="button"
                 onClick={handleToggleSfxAudio}
-                className="min-h-[36px] inline-flex items-center gap-1.5 px-3 py-1 rounded-lg bg-[#F06424] hover:bg-[#FF4B24] text-[#080707] font-semibold text-xs transition-colors"
+                aria-label={isAudioPlaying ? 'Stop WAV preview' : 'Play WAV preview'}
+                className="w-10 h-10 rounded-full border border-[#342A24] bg-[#191614] hover:border-[#F06424] text-[#F3EEE8] flex items-center justify-center shrink-0 transition-colors"
               >
                 {isAudioPlaying ? (
-                  <>
-                    <VolumeX className="w-3.5 h-3.5" />
-                    <span>Stop WAV</span>
-                  </>
+                  <Pause className="w-4 h-4 text-[#F06424]" />
                 ) : (
-                  <>
-                    <Volume2 className="w-3.5 h-3.5" />
-                    <span>Play 16-bit WAV ({sfxWavData ? `${(sfxWavData.sizeBytes / 1024).toFixed(1)} KB` : 'PCM'})</span>
-                  </>
+                  <Play className="w-4 h-4 ml-0.5 text-[#F3EEE8]" />
                 )}
               </button>
-              <label className="inline-flex items-center gap-1.5 text-[11px] font-mono-tabular text-[#B8AAA0]">
-                <span>Vol</span>
-                <input
-                  type="range"
-                  min={0}
-                  max={1}
-                  step={0.05}
-                  value={audioVolume}
-                  onChange={(e) => {
-                    const v = Number(e.target.value);
-                    setAudioVolume(v);
-                    if (audioRef.current) audioRef.current.volume = v;
-                  }}
-                  aria-label="SFX preview volume"
-                  className="w-20 accent-[#F06424]"
-                />
-                <span>{Math.round(audioVolume * 100)}%</span>
-              </label>
-            </div>
-            <div className="mt-1.5 text-[10px] font-mono-tabular text-[#55B98B]">
-              PCM Waveform derived from actual synthesized 22.05kHz WAV buffer · {item.licenseType}
+              <div className="flex items-center gap-1 h-20 flex-1 justify-between">
+                {bars.map((heightPct, idx) => {
+                  const isPassed = idx <= activeBar;
+                  return (
+                    <div
+                      key={idx}
+                      style={{ height: `${Math.max(10, heightPct * 0.88)}%` }}
+                      className={`w-1 rounded-full transition-colors ${
+                        isPassed ? 'bg-[#F06424]' : 'bg-[#F3EEE8]/85'
+                      }`}
+                    />
+                  );
+                })}
+              </div>
             </div>
           </div>
         );
@@ -684,14 +653,23 @@ export const PreviewRenderer: React.FC<PreviewRendererProps> = ({
         const count = Math.min(12, Math.max(3, Number(getVal('numberOfCards', 8))));
         const arrangement = String(getVal('arrangement', 'Tilted orbit'));
         const palette = ['#F06464', '#F06424', '#E4B45A', '#55B98B', '#38BDF8', '#818CF8', '#E879F9', '#FB7185'];
+        const arrangements = ['Ring', 'Cover flow', 'Drum', 'Spiral', 'Sphere', 'Tilted orbit'];
         return (
-          <div className="flex flex-col items-center justify-center h-full w-full px-4 select-none">
-            <div className="relative flex items-center justify-center h-28 w-full max-w-xs">
+          <div className="flex flex-col items-center justify-between h-full w-full px-4 py-3 select-none">
+            <div className="relative flex items-center justify-center flex-1 w-full max-w-xs">
               {Array.from({ length: count }).map((_, idx) => {
                 const angle = (idx / count) * Math.PI * 2 + (isPlaying ? progress * Math.PI * 2 : 0.4);
-                const x = Math.sin(angle) * 86;
+                const x =
+                  arrangement === 'Cover flow'
+                    ? (idx - count / 2) * 24
+                    : Math.sin(angle) * 86;
                 const z = Math.cos(angle);
-                const y = arrangement === 'Spiral' ? (idx - count / 2) * 6 : Math.sin(angle * 2) * 6;
+                const y =
+                  arrangement === 'Spiral'
+                    ? (idx - count / 2) * 5
+                    : arrangement === 'Tilted orbit'
+                    ? Math.sin(angle) * 14
+                    : Math.sin(angle * 2) * 4;
                 const scale = 0.68 + (z + 1) * 0.22;
                 const opacity = 0.4 + (z + 1) * 0.3;
                 return (
@@ -703,14 +681,36 @@ export const PreviewRenderer: React.FC<PreviewRendererProps> = ({
                       opacity: opacity.toFixed(2),
                       zIndex: Math.round((z + 2) * 10),
                     }}
-                    className="absolute w-10 h-14 rounded-lg border border-white/25 shadow-md"
+                    className="absolute w-9 h-12 rounded-md border border-white/25 shadow-md"
                   />
                 );
               })}
             </div>
-            <div className="mt-2 text-xs font-mono-tabular text-[#B8AAA0]">
-              {arrangement} · {count} Cards · Camera + 2 Control Nulls
-            </div>
+            {item.previewKind === 'carousel-builder' ? (
+              <div className="flex flex-wrap items-center justify-center gap-1 pt-1 z-20">
+                {arrangements.map((arr) => {
+                  const isSel = arrangement === arr;
+                  return (
+                    <button
+                      key={arr}
+                      type="button"
+                      onClick={() => onUpdateCustomValue?.('arrangement', arr)}
+                      className={`px-2 py-0.5 rounded text-[11px] font-medium transition-colors border ${
+                        isSel
+                          ? 'bg-[#2A1810] text-[#F06424] border-[#F06424]'
+                          : 'bg-[#141210] text-[#B8AAA0] border-[#2A231E] hover:text-[#F3EEE8]'
+                      }`}
+                    >
+                      {arr}
+                    </button>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="mt-1 text-xs font-mono-tabular text-[#B8AAA0]">
+                {arrangement} · {count} Cards · Camera + 2 Control Nulls
+              </div>
+            )}
           </div>
         );
       }
@@ -906,10 +906,10 @@ export const PreviewRenderer: React.FC<PreviewRendererProps> = ({
   return (
     <div className="rounded-xl border border-[#342A24] bg-[#0B0A09] overflow-hidden">
       {/* Top Preview Telemetry Bar */}
-      <div className="flex flex-wrap items-center justify-between gap-2 px-3.5 py-2 border-b border-[#342A24] bg-[#11100F]">
+      <div className="flex flex-wrap items-center justify-between gap-2 px-3.5 py-2 border-b border-[#2A231E] bg-[#11100F]">
         <div className="flex items-center gap-2">
-          <span className="text-[11px] font-semibold tracking-wider text-[#83766D] uppercase">
-            Live Preview {comparisonMode === 'edits' ? '· Your Edits' : '· Template'}
+          <span className="text-[10px] font-semibold tracking-wider text-[#83766D] uppercase">
+            {item.moduleId === 'easing' ? 'CURVE' : 'LIVE PREVIEW'}
           </span>
           <span className="text-[10px] font-mono-tabular px-1.5 py-0.5 rounded bg-[#191614] text-[#B8AAA0] border border-[#342A24]">
             {motionDocument.width}×{motionDocument.height} · {motionDocument.fps}fps ·{' '}

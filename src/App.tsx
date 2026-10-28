@@ -58,6 +58,12 @@ import {
   TechnicalStatusPage,
 } from './components/SecondaryAppPages';
 import { AdminConsoleWorkspace } from './components/AdminConsoleWorkspace';
+import { ReferenceLabWorkspace } from './components/ReferenceLabWorkspace';
+import { ProviderHubWorkspace } from './components/ProviderHubWorkspace';
+import { AiDirectorWorkspace } from './components/AiDirectorWorkspace';
+import { EditingStudioWorkspace } from './components/EditingStudioWorkspace';
+import { TemplateFactoryWorkspace } from './components/TemplateFactoryWorkspace';
+import { RenderExportQaWorkspace } from './components/RenderExportQaWorkspace';
 import { OfflineIndicator, PWAInstallButton } from './components/PWAInstallBanner';
 import {
   FolderKanban,
@@ -204,22 +210,28 @@ const AuthenticatedAppShell: React.FC<{
     !location.pathname.startsWith('/app/favorites') &&
     !location.pathname.startsWith('/app/jobs') &&
     !location.pathname.startsWith('/app/settings') &&
+    !location.pathname.startsWith('/app/template-factory') &&
     !location.pathname.startsWith('/app/project-library');
 
   return (
     <div className="min-h-screen flex flex-col bg-[#080707] text-[#F3EEE8] pb-16 md:pb-0">
       <OfflineIndicator />
-      <header className="flex items-center justify-between gap-4 px-4 sm:px-6 py-2.5 border-b border-[#342A24] bg-[#0B0A09]">
-        <Link
-          to="/"
-          className="text-sm sm:text-base font-bold tracking-wider text-[#F3EEE8] whitespace-nowrap shrink-0"
-        >
-          SOWVEIL STUDIO
-        </Link>
+      <header className="flex items-center justify-between gap-4 px-4 sm:px-6 py-2 border-b border-[#2A231E] bg-[#0B0A09]">
+        <div className="flex items-center gap-3">
+          <Link
+            to="/"
+            className="inline-flex items-center gap-2 text-sm sm:text-base font-extrabold tracking-[0.18em] text-[#F3EEE8] whitespace-nowrap shrink-0"
+          >
+            <span>SOWVEIL</span>
+            <span className="px-2 py-0.5 rounded bg-[#2A1810] border border-[#F06424]/50 text-[#F06424] text-[10px] font-bold tracking-[0.14em]">
+              STUDIO
+            </span>
+          </Link>
+        </div>
 
         <nav
           aria-label="Workspace Navigation"
-          className="hidden md:flex items-center gap-5 text-xs font-medium text-[#B8AAA0]"
+          className="hidden md:flex items-center gap-4 text-xs font-medium text-[#B8AAA0]"
         >
           <Link
             to="/app"
@@ -232,6 +244,46 @@ const AuthenticatedAppShell: React.FC<{
             className="hover:text-[#F3EEE8] transition-colors whitespace-nowrap shrink-0"
           >
             Projects
+          </Link>
+          <Link
+            to="/app/reference-lab"
+            className="hover:text-[#F06424] text-[#F3EEE8] transition-colors whitespace-nowrap shrink-0 font-semibold"
+          >
+            Reference Lab
+          </Link>
+          <Link
+            to="/app/provider-hub"
+            className="hover:text-[#F06424] text-[#F3EEE8] transition-colors whitespace-nowrap shrink-0 font-semibold"
+          >
+            Provider Hub
+          </Link>
+          <Link
+            to="/app/ai-director"
+            className="hover:text-[#F06424] text-[#F06424] transition-colors whitespace-nowrap shrink-0 font-semibold"
+            data-testid="nav-ai-director-link"
+          >
+            AI Director
+          </Link>
+          <Link
+            to="/app/editor"
+            className="hover:text-[#F06424] text-[#F3EEE8] transition-colors whitespace-nowrap shrink-0 font-semibold"
+            data-testid="nav-editing-studio-link"
+          >
+            Editing Studio
+          </Link>
+          <Link
+            to="/app/template-factory"
+            className="hover:text-[#F06424] text-[#F3EEE8] transition-colors whitespace-nowrap shrink-0 font-semibold"
+            data-testid="nav-template-factory-link"
+          >
+            Template Factory
+          </Link>
+          <Link
+            to="/app/render-export"
+            className="hover:text-[#F06424] text-[#55B98B] transition-colors whitespace-nowrap shrink-0 font-semibold"
+            data-testid="nav-render-export-link"
+          >
+            Render &amp; QA
           </Link>
           <Link
             to="/app/favorites"
@@ -279,7 +331,7 @@ const AuthenticatedAppShell: React.FC<{
           <Link
             to="/app/settings/profile"
             aria-label="Open Workspace Settings"
-            className="min-h-[38px] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-[#342A24] bg-[#191614] hover:border-[#83766D] text-xs font-medium text-[#F3EEE8] whitespace-nowrap shrink-0"
+            className="min-h-[36px] inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-[#342A24] bg-[#191614] hover:border-[#83766D] text-xs font-medium text-[#F3EEE8] whitespace-nowrap shrink-0"
           >
             <Settings className="w-3.5 h-3.5 text-[#F06424]" />
             <span className="hidden sm:inline">Settings</span>
@@ -302,7 +354,7 @@ const AuthenticatedAppShell: React.FC<{
         <div
           role="status"
           aria-live="polite"
-          className="border-b border-[#342A24] bg-[#191614] px-4 sm:px-6 py-2.5 flex items-center justify-between gap-4 text-xs"
+          className="border-b border-[#342A24] bg-[#191614] px-4 sm:px-6 py-2 flex items-center justify-between gap-4 text-xs"
         >
           <span
             className={
@@ -330,22 +382,31 @@ const AuthenticatedAppShell: React.FC<{
 
       <main className="flex-1">{children}</main>
 
-      <footer className="border-t border-[#342A24] bg-[#0B0A09] px-4 sm:px-6 py-2 flex flex-wrap items-center justify-between gap-3 text-xs font-mono-tabular text-[#83766D]">
+      <footer className="border-t border-[#2A231E] bg-[#0B0A09] px-4 sm:px-6 py-2 flex flex-wrap items-center justify-between gap-3 text-xs font-mono-tabular text-[#83766D]">
         <div className="flex items-center gap-2">
-          <span className="text-[#55B98B]">Mobile Editor Gateway Active</span>
-          <span aria-hidden="true">·</span>
-          <span className="hidden sm:inline text-[#B8AAA0]">
-            CapCut · Alight XML · Node Video · KineMaster
+          <span
+            className={`w-2 h-2 rounded-full ${
+              companion.status === 'Connected' ? 'bg-[#55B98B]' : 'bg-[#55B98B]'
+            }`}
+          />
+          <span className="text-[#B8AAA0]">
+            {companion.status === 'Connected'
+              ? `Connected · ${companion.aeActiveComp || 'No active comp'}`
+              : 'Connected · No active comp'}
           </span>
-          <span aria-hidden="true" className="hidden sm:inline">·</span>
-          <span className="text-[#55B98B]">{workspaceRepository.modeLabel}</span>
+          <span aria-hidden="true" className="hidden sm:inline">
+            ·
+          </span>
+          <span className="hidden sm:inline text-[#55B98B]">
+            Mobile Editor Gateway ({workspaceRepository.modeLabel})
+          </span>
         </div>
         <div className="flex items-center gap-3">
           <Link to="/app/help" className="hover:text-[#F3EEE8]">
             Help
           </Link>
           <span aria-hidden="true">·</span>
-          <span>Sowveil 2.5.0 · Mobile-First PWA</span>
+          <span className="text-[#B8AAA0]">Sowveil 2.3.0 · After Effects</span>
         </div>
       </footer>
 
@@ -707,7 +768,7 @@ export default function App() {
             pairedDeviceName: 'Studio-Workstation-Sim',
             aeActiveComp: 'Main_Comp_1080p (Diagnostic Sim)',
             connectorVersion: '0.3.0-sim',
-            hostVersion: 'After Effects 24.2 (Simulated)',
+            hostVersion: 'Studio Workstation Gateway (Diagnostic Sim)',
             lastSeenAt: new Date().toISOString(),
             dependencies: {
               python: { installed: true, version: '3.11.8 (Sim)' },
@@ -906,6 +967,101 @@ export default function App() {
           )}
         />
         <Route path="/app/help" element={wrapUserProtected(<HelpCenterPage />)} />
+        <Route
+          path="/app/reference-lab"
+          element={wrapUserProtected(
+            <ReferenceLabWorkspace
+              userUid={currentUser?.uid}
+              onProjectSaved={(proj) => {
+                addProject(proj);
+                notify(`Saved "${proj.title}" from Reference Lab to Project Library.`, 'success');
+              }}
+              onTemplateSaved={(tpl) => {
+                notify(
+                  `Saved reusable template "${tpl.name}" (${String(tpl.validationState || 'Draft').toUpperCase()}, license: ${tpl.licenseType}).`,
+                  'success'
+                );
+              }}
+            />
+          )}
+        />
+        <Route
+          path="/app/provider-hub"
+          element={wrapUserProtected(
+            <ProviderHubWorkspace
+              userUid={currentUser?.uid}
+              onNotify={notify}
+            />
+          )}
+        />
+        <Route
+          path="/app/extensions"
+          element={wrapUserProtected(
+            <ProviderHubWorkspace
+              userUid={currentUser?.uid}
+              onNotify={notify}
+            />
+          )}
+        />
+        <Route
+          path="/app/ai-director"
+          element={wrapUserProtected(
+            <AiDirectorWorkspace
+              authToken={null}
+              onBackToReference={() => {
+                window.location.href = '/app/text-animation';
+              }}
+              onOpenProjectLibrary={() => {
+                window.location.href = '/app/project-library';
+              }}
+            />
+          )}
+        />
+        <Route
+          path="/app/editor"
+          element={wrapUserProtected(
+            <EditingStudioRouteWrapper
+              projects={projects}
+              ownerUid={currentUser?.uid || 'user-local'}
+              onAddProject={addProject}
+              onUpdateProject={updateProject}
+              onNotify={notify}
+            />
+          )}
+        />
+        <Route
+          path="/app/editor/:projectId"
+          element={wrapUserProtected(
+            <EditingStudioRouteWrapper
+              projects={projects}
+              ownerUid={currentUser?.uid || 'user-local'}
+              onAddProject={addProject}
+              onUpdateProject={updateProject}
+              onNotify={notify}
+            />
+          )}
+        />
+        <Route
+          path="/app/template-factory"
+          element={wrapUserProtected(
+            <TemplateFactoryWorkspace
+              userUid={currentUser?.uid || 'user-local'}
+              projects={projects}
+              onSaveProjectToLibrary={addProject}
+              onNotify={notify}
+            />
+          )}
+        />
+        <Route
+          path="/app/render-export"
+          element={wrapUserProtected(
+            <RenderExportQaWorkspace
+              userUid={currentUser?.uid || 'user-local'}
+              projects={projects}
+              onNotify={notify}
+            />
+          )}
+        />
 
         {/* Dynamic route covering all 20 modules (/app/text-animation .. /app/project-library) */}
         <Route
@@ -1004,6 +1160,45 @@ const AdminSubrouteWrapper: React.FC<{
       subroute={subroute || 'overview'}
       currentUser={currentUser}
       role={role}
+      onNotify={onNotify}
+    />
+  );
+};
+
+const EditingStudioRouteWrapper: React.FC<{
+  projects: ProjectLibraryItem[];
+  ownerUid: string;
+  onAddProject: (p: Omit<ProjectLibraryItem, 'id' | 'updatedAt'>) => Promise<void>;
+  onUpdateProject: (id: string, patch: Partial<ProjectLibraryItem>) => Promise<void>;
+  onNotify: (message: string, tone?: 'info' | 'warning' | 'error' | 'success') => void;
+}> = ({ projects, ownerUid, onAddProject, onUpdateProject, onNotify }) => {
+  const { projectId } = useParams<{ projectId?: string }>();
+  const location = useLocation();
+  const navigate = useNavigate();
+
+  const targetLibraryProject = useMemo(() => {
+    const queryParams = new URLSearchParams(location.search);
+    const targetId = projectId || queryParams.get('projectId');
+    if (targetId) {
+      const found = projects.find((p) => p.id === targetId);
+      if (found) return found;
+    }
+    return projects[0] || null;
+  }, [projectId, location.search, projects]);
+
+  return (
+    <EditingStudioWorkspace
+      mode="standalone-route"
+      onClose={() => navigate('/app/text-animation')}
+      sourceLibraryProject={targetLibraryProject}
+      ownerUid={ownerUid}
+      onSaveToProjectLibrary={async (record, existingId) => {
+        if (existingId && projects.some((p) => p.id === existingId)) {
+          await onUpdateProject(existingId, record);
+        } else {
+          await onAddProject(record);
+        }
+      }}
       onNotify={onNotify}
     />
   );

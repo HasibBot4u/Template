@@ -1,36 +1,34 @@
-# Sowveil Studio — Automated Testing Guide (`docs/TESTING.md`)
+# Sowveil Studio — Automated Testing & Verification Guide (`docs/TESTING.md`)
 
-## 1. Test Commands
-- **Run Full Automated Test Suite**:
-  ```bash
-  npm test
-  ```
-- **Validate Firestore Security Rules**:
-  ```bash
-  npm run lint:rules
-  ```
-- **TypeScript Typecheck**:
-  ```bash
-  npm run lint
-  ```
+## 1. Verification Commands
 
-## 2. Test Suites
-1. `src/tests/phase2.test.ts` — Catalog filtering, search, category counts, favorites idempotency, Project Library CRUD, and job state machine transitions.
-2. `src/tests/phase3.security.test.ts` — API authentication, unverified email rejection, self-role escalation prevention, cross-user isolation, draft catalog protection, and one-time owner bootstrap lock.
-3. `src/tests/firestore.rules.test.ts` — Structural and policy verification of `firestore.rules`.
-4. `src/tests/mobileMigration.test.ts` — Mobile-first 20-module verification and baseline export artifact checks.
-5. `src/tests/adminAndDiagnostics.test.ts` — Admin Console RBAC (`/admin/*`), editor compatibility verification guard, module disable confirmation requirement, and `/api/v1/diagnostics/technical` redaction.
-6. `src/tests/editorGatewayPhase5.test.ts` — Phase 5 Mobile Editor Gateway unit & API integration tests:
-   - Adapter capability discovery across all 6 adapters (`capcut`, `alight-motion`, `node-video`, `kinemaster`, `universal-bundle`, `sowveil-project`).
-   - Strategy selection & Alight Motion XML subset classification (`Alight Motion XML — tested subset` vs. `Generic media pack`).
-   - Portable `MotionDocument` v2.0 serialization, validation, and unknown-field passthrough.
-   - Alight Motion XML serializer, fixture verification, and XXE/script rejection.
-   - `.srt`, `.vtt`, and `.captions.json` generation, round-trip parsing, and validation.
-   - PKZIP bundle creation, `AssetBundleManifest` validation, anti-ZIP-bomb limits, path traversal rejection, SVG sanitization, PNG/WAV binary checks, and honest video capability guard.
-   - End-to-end API tests for `/api/v1/editors/:id/capabilities`, `/api/v1/exports/generate`, `/api/v1/exports/jobs/:id/download`, `/api/v1/exports/jobs/:id/retry`, `/api/v1/exports/jobs/:id` DELETE, and cross-user 403 enforcement.
-7. `src/tests/mobileMediaWorkflows.test.ts` — Phase 6 Mobile Media Workflows, Rendering, Captions, Assets & Downloader tests:
-   - Deterministic byte/stage job progress (`computeDeterministicJobProgress`), worker/cost gate (`evaluateMediaJobWorkerGate`), and full media job state machine lifecycle (`draft` → `queued` → `uploading` → `running` → `finalizing` → `ready` / `quota-reached`).
-   - Auto Captions timestamp parsing, overlap & line-length validation, segment split/merge/delete/retime, SRT/VTT round-trip parsing, and downloadable sidecar `.zip` bundle generation (`buildCaptionSidecarZipBundle` & `POST /api/v1/captions/validate-and-bundle`).
-   - Deterministic mathematical evaluation across all 12 Expressions presets (`evaluateExpressionPresetMath`), real 16-bit PCM WAV synthesis & waveform peak extraction (`extractWavWaveformPeaks`), Text Animation font fallback warnings (`getFontFallbackNotice`), glTF 2.0 header validation (`validateGltfOrGlbHeaderBytes`), and Project Library version checkpoints (`createProjectCheckpoint`).
-   - SSRF URL guard (`validateMediaUrlForSsrf` & `POST /api/v1/media/validate-url`), binary magic-byte inspection (`verifyMediaMagicBytes` & `POST /api/v1/media/inspect-bytes`), filename sanitization (`sanitizeMediaFileName`), honest output size estimation (`estimateMediaOutputSize`), and owner-scoped `PATCH /api/v1/jobs/:id` isolation.
+```bash
+npm run lint          # TypeScript static typecheck (tsc --noEmit)
+npm run lint:rules    # Validate Firestore Security Rules (eslint firestore.rules)
+npm test              # Execute all 17 automated test suites (node:test via tsx)
+npm run build         # Production Vite + PWA bundle compilation
+```
 
+---
+
+## 2. Automated Test Suite Matrix (17 Suites, 93 Tests)
+
+| # | Test Suite File | Scope & Invariants Verified |
+|---:|---|---|
+| 1 | `src/tests/phase2.test.ts` | Catalog filtering, search relevance, category counts, favorites idempotency, Project Library CRUD, and job state machine transitions. |
+| 2 | `src/tests/phase3.security.test.ts` | API authentication, unverified email rejection, self-role escalation prevention, cross-user isolation, draft catalog protection, and one-time owner bootstrap lock. |
+| 3 | `src/tests/firestore.rules.test.ts` | Structural and policy verification of `firestore.rules` and `firebase-blueprint.json` across all 21 collections and 12 Dirty Dozen security invariants. |
+| 4 | `src/tests/mobileMigration.test.ts` | Mobile-first 20-module verification (`displayOrder` 1–20, authentic counts 220/12/26/60) and baseline export artifact checks. |
+| 5 | `src/tests/adminAndDiagnostics.test.ts` | Admin Console RBAC (`/admin/*`), editor compatibility verification guard, module disable confirmation requirement, and `/api/v1/diagnostics/technical` redaction. |
+| 6 | `src/tests/editorGatewayPhase5.test.ts` | Mobile Editor Gateway adapters (`capcut`, `alight-motion`, `node-video`, `kinemaster`, `universal-bundle`, `sowveil-project`), Alight Motion XML serializer & XXE guard, PKZIP anti-bomb validation, SVG sanitization, and cross-user 403 export isolation. |
+| 7 | `src/tests/mobileMediaWorkflows.test.ts` | Deterministic byte/stage job progress, Auto Captions cue validation & sidecar `.zip` generation, 12 Expressions math evaluation, 16-bit PCM WAV synthesis, SSRF URL blocker, and binary magic-byte inspection. |
+| 8 | `src/tests/mobileHardeningPhase7.test.ts` | Strict security headers, origin-checked CORS, sliding-window rate limiting, PWA manifest integrity, and durable snapshot persistence across server restarts. |
+| 9 | `src/tests/aiDirectorPhase8.test.ts` | Baseline AES-256-GCM credential vault, SSRF provider endpoint blocker, script segmentation coverage, and timeline checkpoints. |
+| 10 | `src/tests/canonicalProjectSchema.test.ts` | Canonical Project Schema `v2.0.0`, lossless migration from `1.0.0` and `2.4.0-mobile`, 36 typed commands, scene-lock enforcement (`LOCKED_SCENE`), undo/redo stacks, unknown-property preservation, and 7 canonical fixtures. |
+| 11 | `src/tests/referenceLab.test.ts` | Reference Lab Usage Mode gate (`Authorized Reconstruction` vs. `Reference-Inspired`), local-only remote-upload cancellation, shot segmentation, provenance/confidence labels, 7 correction actions, and Draft-to-Validated promotion. |
+| 12 | `src/tests/providerHub.test.ts` | 7 distinct protocol adapters, AES-256-GCM AAD-scoped secret vault, key rotation/revocation, SSRF & redirect-hop blocker, 14-capability verification registry, 8 task routing profiles, untrusted Extensions sandbox & prompt-injection quarantine, and Typed Tool Registry authorization. |
+| 13 | `src/tests/aiDirectorProduction.test.ts` | 7-stage durable AI Director state machine, 4,000-char chunked script segmentation with zero tail truncation, repetition preservation, coverage ledger, question deduplication, 20-field Brief, 22-field Shot Plan, 4-tier asset ranking, per-shot dependency failure isolation, and 10-point Acceptance Gate. |
+| 14 | `src/tests/editingStudioCoEdit.test.ts` | Professional Mobile Editing Studio (`Quick`, `Pro`, `AI Co-Edit` modes), multi-track commands, interactive easing curves, version diff compare, and `AiCoEditTransaction` with selective per-operation accept/reject, locked-scene protection, and 1-click rollback across all 10 prompt archetypes. |
+| 15 | `src/tests/templateFactory.test.ts` | 10-stage Template Factory derivation pipeline, 9-category parameter extraction, `GeneralizationReport`, untouched source verification, content-hash & similarity deduplication, 7-check Quality & Determinism Gate (`<= 0.001`), fork/merge/deprecate lifecycle, and consent-gated preference signals. |
+| 16 | `src/tests/renderExportQa.test.ts` | Canonical render & export tiers (`timeline-preview`, `proxy-render`, `final-render`), real work-unit progress, startup crash recovery (`interrupted-on-restart`), binary/structural validators (`PNG`, `WAV`, `SRT`, `VTT`, `JSON`, `XML`, `ZIP`), audio clipping detection, honest `needs-worker-setup` MP4/WebM gate, 6 adapter feature-loss matrices, and 8-gate Final QA report. |
+| 17 | `src/tests/securityObservabilityReleasePhase14.test.ts` | Cross-account IDOR isolation across all workspaces (`projects`, `reference-lab`, `provider-hub`, `extensions`, `ai-director`, `template-factory`, `render-export`), `Cache-Control: no-store` partitioning, privacy-aware operational telemetry (`logsRawScripts: false`, `logsApiKeysOrTokens: false`), portable JSON data export (`/api/v1/me/data-export`), and full account/project/vault deletion (`DELETE /api/v1/me/account-data`). |

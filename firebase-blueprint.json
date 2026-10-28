@@ -182,7 +182,7 @@
         },
         "visibility": {
           "type": "string",
-          "enum": ["published", "draft", "archived"]
+          "enum": ["published", "public", "community", "private", "draft", "archived"]
         },
         "updatedAt": {
           "type": "string",
@@ -190,6 +190,128 @@
         }
       },
       "required": ["id", "moduleId", "name", "slug", "summary", "description", "categoryId", "packLabel", "visibility", "updatedAt"]
+    },
+    "TemplateVariantRecord": {
+      "title": "TemplateVariantRecord",
+      "description": "User-scoped template variant instance (Your edits) with parameter, asset, timing, and keyframe overrides.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "baseTemplateId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "baseTemplateVersion": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "moduleId": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 2000
+        },
+        "parameterOverrides": {
+          "type": "object"
+        },
+        "assetOverrides": {
+          "type": "object"
+        },
+        "timingOverrides": {
+          "type": "object"
+        },
+        "keyframeOverrides": {
+          "type": "array"
+        },
+        "visibility": {
+          "type": "string",
+          "enum": ["private", "community", "public"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["id", "ownerUid", "baseTemplateId", "baseTemplateVersion", "moduleId", "name", "description", "parameterOverrides", "assetOverrides", "visibility", "createdAt", "updatedAt"]
+    },
+    "AssetRecord": {
+      "title": "AssetRecord",
+      "description": "Owner-scoped or public Asset Library record for video, image, audio, font, SVG, 3D, and generated assets.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "moduleId": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "assetKind": {
+          "type": "string",
+          "enum": ["video", "image", "audio", "font", "svg", "model3d", "generated", "expression", "preset", "template", "caption", "project"]
+        },
+        "licenseType": {
+          "type": "string",
+          "enum": ["Sowveil Original", "Royalty-Free Commercial", "CC0 Public Domain", "Free", "Attribution Required", "Editorial Only", "Custom License", "Unknown"]
+        },
+        "licenseNote": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "sourceNote": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "mimeType": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "status": {
+          "type": "string",
+          "enum": ["metadata-only", "stored", "missing-binary", "archived"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["id", "ownerUid", "title", "moduleId", "assetKind", "licenseType", "licenseNote", "sourceNote", "mimeType", "status", "createdAt", "updatedAt"]
     },
     "FavoriteRecord": {
       "title": "FavoriteRecord",
@@ -254,6 +376,10 @@
         "tags": {
           "type": "array"
         },
+        "checkpoints": {
+          "type": "array",
+          "description": "Bounded project revision checkpoints (max 20)."
+        },
         "createdAt": {
           "type": "string",
           "format": "date-time"
@@ -295,9 +421,28 @@
         },
         "status": {
           "type": "string",
-          "enum": ["queued", "claimed", "running", "ready", "downloaded", "succeeded", "failed", "cancelled", "needs-setup", "expired"]
+          "enum": ["draft", "queued", "claimed", "uploading", "running", "finalizing", "ready", "downloaded", "succeeded", "failed", "cancelled", "needs-setup", "expired", "quota-reached"]
         },
         "attemptCount": {
+          "type": "number"
+        },
+        "processedBytes": {
+          "type": "number"
+        },
+        "totalBytes": {
+          "type": "number"
+        },
+        "completedStageIndex": {
+          "type": "number"
+        },
+        "totalStages": {
+          "type": "number"
+        },
+        "stageLabel": {
+          "type": "string",
+          "maxLength": 240
+        },
+        "progressPercent": {
           "type": "number"
         },
         "idempotencyKey": {
@@ -417,6 +562,316 @@
         }
       },
       "required": ["id", "actorUid", "action", "targetId", "requestId", "createdAt"]
+    },
+    "ReferenceLabSessionRecord": {
+      "title": "ReferenceLabSessionRecord",
+      "description": "Owner-scoped Reference Lab reconstruction session with rights declaration, shots, fidelity report, and canonical project v2.0.0.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "usageMode": {
+          "type": "string",
+          "enum": ["authorized-reconstruction", "reference-inspired"]
+        },
+        "rightsDeclaration": {
+          "type": "object"
+        },
+        "sourceMetadata": {
+          "type": "object"
+        },
+        "fidelityReport": {
+          "type": "object"
+        },
+        "canonicalProjectJson": {
+          "type": "string",
+          "maxLength": 250000
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["id", "ownerUid", "title", "usageMode", "rightsDeclaration", "sourceMetadata", "fidelityReport", "createdAt", "updatedAt"]
+    },
+    "ProviderConnectionRecord": {
+      "title": "ProviderConnectionRecord",
+      "description": "Owner-scoped AI Provider Hub connection with capability registry and redacted credential metadata (raw secret never stored in client-readable fields).",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "protocol": {
+          "type": "string",
+          "enum": ["google-gemini", "openai-chat-completions", "openai-responses", "anthropic-messages", "openai-compatible-variant", "azure-openai", "custom-rest-adapter"]
+        },
+        "baseUrl": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "modelId": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "maskedCredential": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "credentialStatus": {
+          "type": "string",
+          "enum": ["active", "revoked", "unconfigured", "server-managed"]
+        },
+        "capabilities": {
+          "type": "object"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["id", "ownerUid", "label", "protocol", "baseUrl", "modelId", "maskedCredential", "credentialStatus", "capabilities", "createdAt", "updatedAt"]
+    },
+    "ExtensionPackageRecord": {
+      "title": "ExtensionPackageRecord",
+      "description": "Owner-scoped sandboxed skill, repository, website or API tool extension with pinned commit/version and permission diff.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "kind": {
+          "type": "string",
+          "enum": ["github-repo", "zip-package", "skill-folder", "instruction-file", "docs-website", "api-tool"]
+        },
+        "sourceUrl": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "commitOrReleasePin": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "checksumSha256": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "installState": {
+          "type": "string",
+          "enum": ["installed-enabled", "installed-disabled", "quarantined", "uninstalled"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["id", "ownerUid", "name", "kind", "sourceUrl", "commitOrReleasePin", "checksumSha256", "installState", "createdAt", "updatedAt"]
+    },
+    "ToolExecutionAuditRecord": {
+      "title": "ToolExecutionAuditRecord",
+      "description": "Append-only server-enforced AI tool execution audit record.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "toolId": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "status": {
+          "type": "string",
+          "enum": ["allowed", "denied", "error"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["id", "ownerUid", "toolId", "status", "createdAt"]
+    },
+    "AiDirectorSessionRecord": {
+      "title": "AiDirectorSessionRecord",
+      "description": "Owner-scoped AI Director durable production session with immutable script text, exact offset segments, coverage ledger, 20-field brief, 22-field shot plan, canonical project v2.0.0, checkpoints, and acceptance gate.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "state": {
+          "type": "string",
+          "enum": ["intake", "analysis-coverage", "questions-clarification", "brief-shot-plan", "production-execution", "adaptive-refinement", "acceptance-verified"]
+        },
+        "originalScriptSha256": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "coverageLedger": {
+          "type": "object"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["id", "ownerUid", "title", "state", "originalScriptSha256", "coverageLedger", "createdAt", "updatedAt"]
+    },
+    "TemplateFactoryDraftRecord": {
+      "title": "TemplateFactoryDraftRecord",
+      "description": "Owner-scoped Template Factory private draft and published template derivation record with exposed parameters, dependency manifest, and 7-check QA suite.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "sourceMode": {
+          "type": "string",
+          "enum": ["from-scratch", "from-user-project", "from-reference-reconstruction", "from-ai-director-run"]
+        },
+        "visibility": {
+          "type": "string",
+          "enum": ["private", "workspace", "community", "public"]
+        },
+        "lifecycleStatus": {
+          "type": "string",
+          "enum": ["private-draft", "qa-passed-private", "published", "deprecated", "archived"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["id", "ownerUid", "name", "sourceMode", "visibility", "lifecycleStatus", "createdAt", "updatedAt"]
+    },
+    "RenderExportJobRecord": {
+      "title": "RenderExportJobRecord",
+      "description": "Owner-scoped durable canonical render and export job with stage timings, SHA-256/CRC32 artifact metadata, feature-loss matrix, and 8-gate final QA report.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "projectId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "executionTier": {
+          "type": "string",
+          "enum": ["timeline-preview", "proxy-render", "final-render"]
+        },
+        "outputFormat": {
+          "type": "string",
+          "enum": ["png-frame", "wav-audio", "srt-captions", "vtt-captions", "captions-json", "sowveil-project-json", "alight-motion-xml", "sowveil-bundle-zip", "mp4-webm-video"]
+        },
+        "stage": {
+          "type": "string",
+          "enum": ["queued", "validating-project", "resolving-assets", "synthesizing-frames", "mixing-audio", "encoding-packaging", "running-qa-gates", "ready", "failed", "cancelled", "interrupted-on-restart", "needs-worker-setup"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["id", "ownerUid", "projectId", "executionTier", "outputFormat", "stage", "createdAt", "updatedAt"]
     }
   },
   "firestore": {
@@ -444,6 +899,14 @@
       "schema": "CatalogItemRecord",
       "description": "Catalog preset records; only published items are readable by standard users."
     },
+    "/templateVariants/{variantId}": {
+      "schema": "TemplateVariantRecord",
+      "description": "Owner-scoped template variant instances (Your edits)."
+    },
+    "/assets/{assetId}": {
+      "schema": "AssetRecord",
+      "description": "Owner-scoped and public Asset Library metadata records."
+    },
     "/favorites/{uid}/items/{itemId}": {
       "schema": "FavoriteRecord",
       "description": "User-scoped idempotent favorite preset records."
@@ -467,6 +930,35 @@
     "/auditEvents/{eventId}": {
       "schema": "AuditEventRecord",
       "description": "Append-only audit trail; readable only by admins, never client-writable."
+    },
+    "/referenceLabSessions/{sessionId}": {
+      "schema": "ReferenceLabSessionRecord",
+      "description": "Owner-scoped Reference Lab reconstruction sessions."
+    },
+    "/providerConnections/{connectionId}": {
+      "schema": "ProviderConnectionRecord",
+      "description": "Owner-scoped AI Provider Hub connection metadata and capability registry."
+    },
+    "/extensionPackages/{extensionId}": {
+      "schema": "ExtensionPackageRecord",
+      "description": "Owner-scoped sandboxed skills, repositories, and extension packages."
+    },
+    "/toolAuditRecords/{auditId}": {
+      "schema": "ToolExecutionAuditRecord",
+      "description": "Append-only server-enforced AI tool invocation audit records."
+    },
+    "/aiDirectorSessions/{sessionId}": {
+      "schema": "AiDirectorSessionRecord",
+      "description": "Owner-scoped AI Director durable production state machine sessions."
+    },
+    "/templateFactoryDrafts/{draftId}": {
+      "schema": "TemplateFactoryDraftRecord",
+      "description": "Owner-scoped Template Factory private drafts and published template derivations."
+    },
+    "/renderExportJobs/{jobId}": {
+      "schema": "RenderExportJobRecord",
+      "description": "Owner-scoped durable canonical render and export jobs with 8-gate QA reports."
     }
   }
 }
+

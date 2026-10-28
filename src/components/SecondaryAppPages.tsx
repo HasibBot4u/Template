@@ -735,6 +735,92 @@ export const SettingsViewPage: React.FC<{
             </p>
           </div>
 
+          {/* Privacy-Aware Telemetry Opt-In, Account Data Export & Account Deletion */}
+          {currentUser && (
+            <div className="rounded-xl border border-[#342A24] bg-[#11100F] p-5 space-y-4">
+              <div className="text-xs font-mono-tabular text-[#E4B45A]">
+                DATA PORTABILITY, PRIVACY TELEMETRY &amp; ACCOUNT DELETION
+              </div>
+              <p className="text-xs text-[#B8AAA0] leading-relaxed">
+                Sowveil Studio never logs raw scripts, private media, prompts, API keys, or provider request bodies by default. You can export all your owned records as a portable JSON bundle or permanently purge all your workspace records and encrypted provider vault keys.
+              </p>
+              <div className="flex flex-wrap items-center gap-2.5">
+                <button
+                  type="button"
+                  onClick={async () => {
+                    if (!auth.currentUser) return;
+                    try {
+                      const token = await auth.currentUser.getIdToken();
+                      const res = await fetch('/api/v1/me/data-export', {
+                        headers: { Authorization: `Bearer ${token}` },
+                      });
+                      const json = await res.json();
+                      if (!res.ok || !json.ok) {
+                        onNotify(json.error?.message || 'Data export failed', 'error');
+                        return;
+                      }
+                      const blob = new Blob([JSON.stringify(json.data, null, 2)], {
+                        type: 'application/json',
+                      });
+                      const url = URL.createObjectURL(blob);
+                      const a = document.createElement('a');
+                      a.href = url;
+                      a.download = `sowveil-account-export-${currentUser.uid}.json`;
+                      a.click();
+                      URL.revokeObjectURL(url);
+                      onNotify('Account & project data exported as JSON.', 'success');
+                    } catch (err) {
+                      onNotify(
+                        `Export failed: ${err instanceof Error ? err.message : 'Error'}`,
+                        'error'
+                      );
+                    }
+                  }}
+                  className="min-h-[40px] inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg border border-[#342A24] bg-[#191614] hover:border-[#F06424] text-xs font-semibold text-[#F3EEE8]"
+                >
+                  <Download className="w-3.5 h-3.5 text-[#F06424]" />
+                  <span>Export All Account Data (.json)</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={async () => {
+                    if (!auth.currentUser) return;
+                    try {
+                      const token = await auth.currentUser.getIdToken();
+                      const res = await fetch('/api/v1/me/account-data', {
+                        method: 'DELETE',
+                        headers: {
+                          'Content-Type': 'application/json',
+                          Authorization: `Bearer ${token}`,
+                        },
+                        body: JSON.stringify({ confirmDelete: 'DELETE_MY_ACCOUNT_DATA' }),
+                      });
+                      const json = await res.json();
+                      if (!res.ok || !json.ok) {
+                        onNotify(json.error?.message || 'Account data deletion failed', 'error');
+                        return;
+                      }
+                      onNotify(
+                        'All user-scoped projects, sessions, drafts, and encrypted vault keys have been permanently purged.',
+                        'warning'
+                      );
+                    } catch (err) {
+                      onNotify(
+                        `Deletion failed: ${err instanceof Error ? err.message : 'Error'}`,
+                        'error'
+                      );
+                    }
+                  }}
+                  className="min-h-[40px] inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg border border-[#F06464]/50 bg-[#F06464]/10 hover:border-[#F06464] text-xs font-semibold text-[#F06464]"
+                >
+                  <XCircle className="w-3.5 h-3.5" />
+                  <span>Purge All Account &amp; Project Data</span>
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Safe One-Time Owner Bootstrap Panel */}
           {currentUser && role !== 'owner' && (
             <form

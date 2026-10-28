@@ -17,6 +17,8 @@ import {
   PlatformSettingsConfig,
   PreviewRenderKind,
   TargetMobileEditorId,
+  TemplateLicenseType,
+  TemplateVisibility,
   UserRole,
 } from '../types/sowveil';
 import {
@@ -265,8 +267,8 @@ export const AdminConsoleWorkspace: React.FC<AdminConsoleWorkspaceProps> = ({
     capabilityType: CapabilityType;
     assetKind: AssetKind;
     previewKind: PreviewRenderKind;
-    visibility: 'published' | 'draft' | 'archived';
-    licenseType: 'Original Demo Specification' | 'Reference Metadata Only' | 'User Owned';
+    visibility: TemplateVisibility;
+    licenseType: TemplateLicenseType;
     licenseNote: string;
     sourceType: 'original-svg-css' | 'procedural-canvas' | 'reference-seed';
     supportedExportFormats: ExportArtifactFormat[];

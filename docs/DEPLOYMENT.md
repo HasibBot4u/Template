@@ -1,112 +1,86 @@
-# Sowveil Studio — Deployment & Operational Runbook (`docs/DEPLOYMENT.md`)
+# Sowveil Studio — Deployment, Operations & Release Runbook (`docs/DEPLOYMENT.md`)
 
-This guide outlines the production deployment architecture, environment configurations, security controls, backup procedures, rollback plans, and operational verification checklist for Sowveil Studio.
-
----
-
-## 1. System Architecture & Hosting Runtime
-
-- **Runtime Environment**: Node.js 22 LTS on Google Cloud Run (Containerized via Nixpacks / Google Cloud Buildpack).
-- **Web Server**: Express 4 server hosting high-performance REST APIs (`/api/v1/*`) and serving Vite-built static client assets (`dist/`).
-- **Database & Persistence**: Google Cloud Firestore (`ai-studio-411ad70d-501b-4df1-8287-ce21e9091d8d`) initialized in Asia-Southeast1.
-- **Client App**: React 19 SPA with Progressive Web App (PWA) offline capabilities, Workbox service worker caching, and touch-optimized viewport layouts (320px–430px Android portrait primary target).
+This runbook covers environment configuration, model routing recommendations, supported mobile & desktop browsers, database/schema migration procedures, backup & disaster recovery, privacy-aware operational telemetry, and the production release checklist for Sowveil Studio (`v2.4.0-canonical`).
 
 ---
 
-## 2. Environment Variables & Secret Management
+## 1. Runtime Architecture
 
-All environment variables must be declared in `.env.example` without real secret values. In production, variables are injected securely via Cloud Run service configuration or Secret Manager.
+- **Runtime Environment**: Node.js 22 LTS on Google Cloud Run (containerized via Cloud Buildpacks / Nixpacks).
+- **HTTP & API Server**: Express 4 (`server.ts` + `src/server/apiApp.ts`) listening on port `3000`, serving `/api/v1/*` REST routes and static Vite PWA assets (`dist/`).
+- **Durable Storage**:
+  - **Cloud Firestore**: Primary multi-device cloud database (`firebase-applet-config.json`, governed by `firestore.rules` across 21 collections).
+  - **Atomic Server Snapshot (`src/server/durableStore.ts`)**: Crash-safe write-then-rename snapshot file (`.sowveil-data/server-state.json`) with startup recovery for interrupted render jobs (`recoverInterruptedRenderJobsOnStartup`).
+
+---
+
+## 2. Environment Variables & Secrets (`.env.example`)
+
+Never commit real secrets or API keys to source control. Inject secrets via Cloud Run Secret Manager or server environment variables:
 
 | Variable Name | Required | Default / Example | Purpose |
-| :--- | :--- | :--- | :--- |
-| `PORT` | Yes | `3000` | Port for the HTTP dev & production server. |
-| `NODE_ENV` | Yes | `production` | Node runtime environment mode. |
-| `OWNER_BOOTSTRAP_EMAIL` | Recommended | `mdhasibul4u@gmail.com` | Verified Google account email authorized for one-time owner bootstrap. |
-| `OWNER_BOOTSTRAP_SECRET` | Recommended | `<strong-alphanumeric-token>` | Confirmation secret required to claim initial owner role. |
-| `VITE_FIREBASE_API_KEY` | Yes | (Client Config) | Public Firebase web client API key. |
-| `VITE_FIREBASE_AUTH_DOMAIN` | Yes | (Client Config) | Firebase Auth custom domain / firebaseapp domain. |
-| `VITE_FIREBASE_PROJECT_ID` | Yes | `ai-studio-411ad70d-501b-4df1-8287-ce21e9091d8d` | Cloud Project ID. |
-| `VITE_FIREBASE_STORAGE_BUCKET`| Optional | (Configured Bucket) | Firebase Storage bucket for heavy media artifacts. |
-| `CLOUD_STORAGE_ENABLED` | Optional | `false` | Set to `true` when a Cloud Storage bucket is provisioned for binary video storage. |
-
-*Redaction Guarantee*: The server diagnostics endpoint (`/api/v1/diagnostics/technical`) strictly excludes all environment variables, bearer tokens, service-account keys, and database credentials.
-
----
-
-## 3. Security & Access Hardening
-
-1. **HTTP Headers Enforced**:
-   - `X-Content-Type-Options: nosniff`
-   - `X-Frame-Options: SAMEORIGIN`
-   - `Referrer-Policy: strict-origin-when-cross-origin`
-   - `Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=()`
-   - `Cross-Origin-Opener-Policy: same-origin-allow-popups`
-   - `X-Robots-Tag: noindex, nofollow` on all `/api/*`, `/admin/*`, and `/technical` paths.
-2. **Origin-Checked CORS**:
-   - Rejects unlisted third-party origins.
-   - Reflected only for verified production Cloud Run and localhost development domains.
-   - Credentials support (`Access-Control-Allow-Credentials: true`) enabled for authenticated API calls.
-3. **Sliding-Window Rate Limiting**:
-   - `10 requests/minute` for sensitive authentication and owner bootstrap endpoints (`/api/v1/admin/bootstrap-owner`).
-   - `120 requests/minute` per IP for general API endpoints.
-4. **Data Isolation & RBAC**:
-   - Ordinary users have access only to their own jobs (`/api/v1/jobs`), projects (`/api/v1/projects`), and favorites.
-   - Draft and archived catalog items are strictly invisible to ordinary users.
-   - User self-role escalation is blocked at the schema validation layer.
+|---|---|---|---|
+| `PORT` | Yes | `3000` | HTTP server port (must be `3000` in AI Studio runtime). |
+| `NODE_ENV` | Yes | `production` | Runtime environment (`development` or `production`). |
+| `OWNER_BOOTSTRAP_EMAIL` | Recommended | `mdhasibul4u@gmail.com` | Verified Google email authorized for one-time owner role claim. |
+| `OWNER_BOOTSTRAP_SECRET` | Recommended | `<min-16-char-random-secret>` | Secret required by `/api/v1/admin/bootstrap-owner` (fails closed with `503` if unset). |
+| `SOWVEIL_MASTER_VAULT_KEY` | Recommended | `<32-byte-hex-or-base64-key>` | Master key for AES-256-GCM encryption of user provider credentials in Provider Hub. |
+| `GEMINI_API_KEY` | Optional | `<server-managed-gemini-key>` | Server-side key used when a Provider Hub connection uses `authMode: "server-env"`. |
+| `SOWVEIL_RENDER_WORKER_ENABLED` | Optional | `false` | Set to `true` only when a dedicated server-side video muxing worker is provisioned for `.mp4`/`.webm` output. |
+| `CLOUD_STORAGE_ENABLED` | Optional | `false` | Set to `true` when Cloud Object Storage is provisioned for large binary media uploads. |
+| `VITE_FIREBASE_API_KEY` | Yes | (From `firebase-applet-config.json`) | Public Firebase web client API key. |
+| `VITE_FIREBASE_PROJECT_ID` | Yes | `ai-studio-411ad70d-501b-4df1-8287-ce21e9091d8d` | Google Cloud / Firebase project ID. |
 
 ---
 
-## 4. Build & Production Verification Workflow
+## 3. Recommended Model Routing Policy
 
-1. **Run Static Type & Security Rules Linter**:
-   ```bash
-   npm run lint          # Validates TypeScript compilation (tsc --noEmit)
-   npm run lint:rules    # Validates Firestore security rules via eslint-plugin-security-rules
-   ```
+Sowveil Studio separates **AI Studio Builder model selection** from **in-product Provider Hub task routing**:
 
-2. **Execute Full Automated Test Suite**:
-   ```bash
-   npm test
-   ```
-   Ensures all 42+ automated unit and integration tests pass across:
-   - Phase 2: Schema validation and catalog logic
-   - Phase 3: Server security, RBAC, and error sanitization
-   - Phase 4: Firestore security rules offline unit tests
-   - Phase 5: Mobile migration, responsive layouts, and gateway adapters
-   - Phase 6: Media workflows, caption parsers, WAV synthesis, and SSRF prevention
-   - Phase 7: Mobile hardening, security headers, CORS, and PWA manifest integrity
-
-3. **Compile Applet Bundle**:
-   ```bash
-   npm run build
-   ```
-   Ensures Vite bundles `dist/` with PWA service worker and manifest assets.
-
-4. **Start Production Service**:
-   ```bash
-   npm start
-   ```
+- **High-Complexity Architecture, Script Analysis, Shot Planning, Code & Evaluation**:
+  - Primary: **Gemini 4 Argon (`gemini-4-argon`)** with `thinkingLevel: "HIGH"`.
+- **Routine Metadata Tagging, Fast Asset Research & Lightweight Summaries**:
+  - Primary: **Gemini 3.8 Flash (`gemini-3.8-flash`)** with `thinkingLevel: "LOW"`, configured with automatic fallback to `gemini-4-argon`.
+- All 8 task types (`script-analysis`, `planning`, `code`, `asset-research`, `vision`, `voice-transcription`, `evaluation`, `routine-tasks`) can be inspected and customized per workspace in `/app/provider-hub`.
 
 ---
 
-## 5. Backup & Disaster Recovery
+## 4. Supported Browsers & Mobile Device Tiers
 
-- **Cloud Firestore**:
-  - Daily automatic snapshots managed via Google Cloud Firestore Export (`gcloud firestore export gs://[BACKUP_BUCKET]/backups`).
-  - Point-in-time recovery (PITR) supported for transactional collections.
-- **Rollback Strategy**:
-  - Cloud Run supports instant traffic splitting. If an issue is detected post-deployment, route 100% of traffic back to the prior stable revision using:
-    `gcloud run services update-traffic sowveil-studio --to-revisions=[PREVIOUS_REVISION]=100`
+- **Primary Target**: Android Chrome 118+ / Edge / Samsung Internet on Android phones (`320px–430px` portrait and landscape, `44×44px` minimum touch targets, safe-area inset support, installable standalone PWA).
+- **Secondary Targets**: iOS Safari 17+ (iPhone/iPad) and desktop Chrome / Firefox / Safari / Edge.
+- **Low-Memory Mobile Adaptations**:
+  - Paginated API responses and virtualized catalog/timeline rendering.
+  - Proxy preview selector (`ultra-light-360p` and `mobile-proxy-540p` @ `24fps`) in the Editing Studio and Render/Export workspace.
+  - `prefers-reduced-motion` and user-togglable `Reduced Motion Previews` preference.
 
 ---
 
-## 6. Production Deployment Checklist
+## 5. Schema Migration, Backup & Disaster Recovery
 
-- [x] PWA manifest configured with valid maskable and standard icons (`display: standalone`, `scope: /`, `id: /`).
-- [x] Offline fallback with explicit capability breakdown and retry ping.
-- [x] All 20 motion modules accessible via mobile carousel and 20-module bottom sheet drawer.
-- [x] 44×44px minimum touch targets on all mobile portrait controls.
-- [x] Strict security headers and origin-checked CORS active.
-- [x] Public published catalog cached (`max-age=60`), private records `no-store`.
-- [x] Zero obsolete desktop companion or After Effects script references.
-- [x] 42+ automated tests passing with 100% success rate.
+1. **Canonical Project Schema Migration (`v1.0.0` / `v2.4.0-mobile` → `v2.0.0`)**:
+   - Automatic, lossless forward migration via `migrateToCanonicalProject` (`src/services/canonicalProjectEngine.ts`) and `POST /api/v1/projects/migrate`. Unknown future fields are preserved in `unknownProperties` passthrough bags rather than stripped.
+2. **Interrupted Render Job Recovery**:
+   - On server startup, `recoverInterruptedRenderJobsOnStartup` (`src/services/renderExportQaEngine.ts`) inspects all persisted render jobs and transitions any in-flight job (`queued`, `validating-project`, `resolving-assets`, `synthesizing-frames`, `mixing-audio`, `encoding-packaging`, `running-qa-gates`) to `interrupted-on-restart` (`retryable: true`). It never fabricates a completed artifact.
+3. **Firestore & User Data Backup / Recovery**:
+   - Cloud Firestore daily exports (`gcloud firestore export gs://[BACKUP_BUCKET]/backups`).
+   - Users can export a complete portable JSON backup of their workspace at any time via `GET /api/v1/me/data-export` (or the **Export All Account Data (.json)** button in `/app/settings/profile`) and restore individual projects/templates via Project Library import.
+
+---
+
+## 6. Release Verification Checklist
+
+Before cutting a production release, run and verify every check below:
+
+```bash
+npm run lint          # Must exit 0 (0 TypeScript errors)
+npm run lint:rules    # Must exit 0 (0 Firestore security rule errors)
+npm test              # Must pass all 17 test suites (93/93 tests passing)
+npm run build         # Must bundle dist/ and PWA service worker cleanly
+```
+
+- [x] All 20 reference modules present in exact `displayOrder` 1–20 with authentic seed counts (`220`, `12`, `26`, `60`).
+- [x] `Cache-Control: no-store, no-cache, must-revalidate, private` enforced on all authenticated/mutable/admin routes.
+- [x] `firestore.rules` covers all 21 collections in `firebase-blueprint.json` with default-deny catch-all.
+- [x] Operational telemetry (`/api/v1/telemetry/operational`) verified free of scripts, prompts, private media, and API keys.
+- [x] Account data export (`GET /api/v1/me/data-export`) and full account deletion (`DELETE /api/v1/me/account-data`) verified by automated integration tests.

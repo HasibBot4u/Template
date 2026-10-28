@@ -162,14 +162,15 @@ export const ExportOpenInModal: React.FC<ExportOpenInModalProps> = ({
   };
 
   const handleRunExportVerification = () => {
-    setExportStatus('generating');
-    setTimeout(() => {
-      setExportStatus('ready');
-      onNotify(
-        `Verified ${artifact.bundleLabel} (${(artifact.bytes.byteLength / 1024).toFixed(1)} KB · SHA-256 ${artifact.sha256.slice(0, 12)}…).`,
-        'success'
-      );
-    }, 120);
+    if (!artifact.bytes || artifact.bytes.byteLength === 0) {
+      onNotify('Verification failed: artifact payload is empty.', 'error');
+      return;
+    }
+    setExportStatus('ready');
+    onNotify(
+      `Verified ${artifact.bundleLabel} (${(artifact.bytes.byteLength / 1024).toFixed(1)} KB · SHA-256 ${artifact.sha256.slice(0, 12)}… · ${artifact.validationDetails}).`,
+      'success'
+    );
   };
 
   const handleDownloadArtifact = async () => {
@@ -187,7 +188,7 @@ export const ExportOpenInModal: React.FC<ExportOpenInModalProps> = ({
       outputFileName: artifact.fileName,
       outputMimeType: artifact.mimeType,
       outputSizeBytes: artifact.bytes.byteLength,
-      status: 'ready',
+      status: 'downloaded',
       deviceId: 'android-mobile-pwa',
       redactedMessage: `Downloaded ${artifact.fileName} (${(artifact.bytes.byteLength / 1024).toFixed(1)} KB · SHA-256 ${artifact.sha256.slice(0, 12)} · ${artifact.validationDetails}) for ${artifact.adapter.name}.`,
     });
@@ -237,11 +238,11 @@ export const ExportOpenInModal: React.FC<ExportOpenInModalProps> = ({
           outputSizeBytes: artifact.bytes.byteLength,
           status: 'ready',
           deviceId: 'android-share-sheet',
-          redactedMessage: `Shared ${artifact.fileName} via Web Share API to ${artifact.adapter.name}.`,
+          redactedMessage: `Shared ${artifact.fileName} to system share sheet (handoff initiated; target app import requires user confirmation in ${artifact.adapter.shortName}).`,
         });
 
         onNotify(
-          `Shared ${artifact.fileName} via Android / Mobile Share Sheet.`,
+          `Shared ${artifact.fileName} to system share sheet. Pick ${artifact.adapter.shortName} in the sheet to finish import.`,
           'success'
         );
         return;

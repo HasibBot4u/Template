@@ -56,6 +56,8 @@ export const ExportArtifactFormatEnum = z.enum([
 
 export const CapabilityStatusEnum = z.enum([
   'Available',
+  'Implemented',
+  'Experimental',
   'Needs setup',
   'Disconnected',
   'Unsupported',
@@ -67,13 +69,62 @@ export const AssetKindEnum = z.enum([
   'image',
   'video',
   'audio',
-  'ae-project',
-  'ae-template',
+  'font',
   'svg',
   'model3d',
+  'generated',
+  'ae-project',
+  'ae-template',
   'scene-spec',
   'expression',
   'curve',
+]);
+
+export const TemplateLicenseTypeEnum = z.enum([
+  'Unknown',
+  'Original Demo Specification',
+  'Reference Metadata Only',
+  'User Owned',
+  'CC-BY-4.0',
+  'CC0-Public-Domain',
+  'Commercial-Licensed',
+  'Sowveil Original',
+  'Royalty-Free Commercial',
+  'CC0 Public Domain',
+  'Free',
+  'Attribution Required',
+  'Editorial Only',
+  'Custom License',
+]);
+
+export const TemplateValidationStateEnum = z.enum([
+  'Draft',
+  'Needs assets',
+  'Experimental',
+  'Needs target-app test',
+  'Validated',
+  'Deprecated',
+  'Archived',
+]);
+
+export const TemplateVisibilityEnum = z.enum([
+  'published',
+  'public',
+  'community',
+  'private',
+  'draft',
+  'archived',
+]);
+
+export const EditablePropertyCapabilityEnum = z.enum([
+  'text',
+  'color',
+  'timing',
+  'keyframes',
+  'replaceable-media',
+  'audio',
+  'layout',
+  'shader-params',
 ]);
 
 export const CapabilityTypeEnum = z.enum([
@@ -95,6 +146,7 @@ export const CapabilityTypeEnum = z.enum([
   'caption-utility',
   'media-downloader',
   'project-manager',
+  'real-host-execution',
 ]);
 
 export const PreviewRenderKindEnum = z.enum([
@@ -155,6 +207,51 @@ export const EditableTemplateParamSchema = z
     step: z.number().optional(),
     options: z.array(z.string().max(80)).max(20).optional(),
     unit: z.string().max(16).optional(),
+    required: z.boolean().optional(),
+    description: z.string().max(240).optional(),
+  })
+  .strict();
+
+export const ReplaceableMediaSlotSchema = z
+  .object({
+    slotId: z.string().trim().min(1).max(64).regex(/^[a-zA-Z0-9_\-]+$/),
+    label: z.string().trim().min(1).max(80),
+    acceptedKinds: z.array(AssetKindEnum).min(1).max(8),
+    required: z.boolean().default(false),
+    defaultAssetId: z.string().trim().max(128).optional(),
+  })
+  .strict();
+
+export const TemplateMediaRequirementsSchema = z
+  .object({
+    requiredAssetKinds: z.array(AssetKindEnum).max(8).default([]),
+    replaceableSlots: z.array(ReplaceableMediaSlotSchema).max(12).default([]),
+  })
+  .strict();
+
+export const TemplateRendererRequirementsSchema = z
+  .object({
+    engine: z.enum(['browser-svg-css', 'canvas-2d', 'webgl-three', 'hybrid-worker']),
+    minFps: z.number().int().min(12).max(240).default(30),
+    hardwareAccelerationRecommended: z.boolean().default(false),
+  })
+  .strict();
+
+export const TemplateAttributionSchema = z
+  .object({
+    authorName: z.string().trim().min(1).max(120),
+    attributionText: z.string().trim().min(1).max(400),
+    sourceUrl: z.string().trim().max(500).optional(),
+    requiresAttribution: z.boolean().default(false),
+  })
+  .strict();
+
+export const TemplateDeprecationSchema = z
+  .object({
+    isDeprecated: z.boolean().default(false),
+    deprecatedAt: z.string().trim().max(64).optional(),
+    reason: z.string().trim().max(400).optional(),
+    replacementTemplateId: z.string().trim().max(128).optional(),
   })
   .strict();
 
@@ -188,18 +285,16 @@ export const CatalogCreateSchema = z
       .trim()
       .max(300)
       .default('Mobile browser preview & Editor Gateway export ready'),
-    licenseType: z
-      .enum(['Original Demo Specification', 'Reference Metadata Only', 'User Owned'])
-      .default('Original Demo Specification'),
+    licenseType: TemplateLicenseTypeEnum.default('Unknown'),
     licenseNote: z
       .string()
       .trim()
       .max(400)
-      .default('Original procedural specification created in Sowveil Studio.'),
+      .default('Rights status not yet verified (Unknown).'),
     sourceType: z
       .enum(['original-svg-css', 'procedural-canvas', 'reference-seed'])
       .default('original-svg-css'),
-    visibility: z.enum(['published', 'draft', 'archived']).default('published'),
+    visibility: TemplateVisibilityEnum.default('published'),
     supportsTemplateComparison: z.boolean().default(true),
     favoritesCompatible: z.boolean().default(true),
     supportedExportFormats: z
@@ -207,7 +302,28 @@ export const CatalogCreateSchema = z
       .max(6)
       .default(['sowveil-json', 'alight-xml', 'zip-bundle', 'svg-frame']),
     editableParams: z.array(EditableTemplateParamSchema).max(12).optional(),
+    supportedEditableProperties: z.array(EditablePropertyCapabilityEnum).max(8).optional(),
+    mediaRequirements: TemplateMediaRequirementsSchema.optional(),
+    rendererRequirements: TemplateRendererRequirementsSchema.optional(),
+    originUrl: z.string().trim().max(500).optional(),
+    sourceUrl: z.string().trim().max(500).optional(),
+    attribution: TemplateAttributionSchema.optional(),
+    previewFiles: z.array(z.string().trim().max(160)).max(10).optional(),
+    thumbnailSvgDataUri: z.string().max(50000).optional(),
+    validationState: TemplateValidationStateEnum.optional(),
+    deprecationStatus: TemplateDeprecationSchema.optional(),
+    sourceProjectVersion: z.string().trim().max(32).default('2.4.0-mobile'),
+    templateSchemaVersion: z.string().trim().max(32).default('1.2.0'),
+    width: z.number().int().min(16).max(7680).optional(),
+    height: z.number().int().min(16).max(7680).optional(),
+    resolution: z.string().trim().max(64).optional(),
+    durationSec: z.number().min(0.1).max(3600).optional(),
+    fps: z.number().min(1).max(240).optional(),
     version: z.string().trim().min(1).max(32).default('1.0.0'),
+    primaryActionLabel: z.string().trim().max(120).optional(),
+    secondaryActionLabel: z.string().trim().max(120).optional(),
+    selectionRequirement: z.string().trim().max(300).optional(),
+    supportedOperations: z.array(z.string().trim().max(80)).max(20).optional(),
   })
   .strict();
 
@@ -232,19 +348,104 @@ export const CatalogPatchSchema = z
     previewKind: PreviewRenderKindEnum.optional(),
     status: CapabilityStatusEnum.optional(),
     statusReason: z.string().trim().max(300).optional(),
-    licenseType: z
-      .enum(['Original Demo Specification', 'Reference Metadata Only', 'User Owned'])
-      .optional(),
+    licenseType: TemplateLicenseTypeEnum.optional(),
     licenseNote: z.string().trim().max(400).optional(),
     sourceType: z
       .enum(['original-svg-css', 'procedural-canvas', 'reference-seed'])
       .optional(),
-    visibility: z.enum(['published', 'draft', 'archived']).optional(),
+    visibility: TemplateVisibilityEnum.optional(),
     supportsTemplateComparison: z.boolean().optional(),
     favoritesCompatible: z.boolean().optional(),
     supportedExportFormats: z.array(ExportArtifactFormatEnum).max(6).optional(),
     editableParams: z.array(EditableTemplateParamSchema).max(12).optional(),
+    supportedEditableProperties: z.array(EditablePropertyCapabilityEnum).max(8).optional(),
+    mediaRequirements: TemplateMediaRequirementsSchema.optional(),
+    rendererRequirements: TemplateRendererRequirementsSchema.optional(),
+    originUrl: z.string().trim().max(500).optional(),
+    sourceUrl: z.string().trim().max(500).optional(),
+    attribution: TemplateAttributionSchema.optional(),
+    previewFiles: z.array(z.string().trim().max(160)).max(10).optional(),
+    thumbnailSvgDataUri: z.string().max(50000).optional(),
+    validationState: TemplateValidationStateEnum.optional(),
+    deprecationStatus: TemplateDeprecationSchema.optional(),
+    changelog: z.string().trim().max(400).optional(),
     version: z.string().trim().min(1).max(32).optional(),
+  })
+  .strict();
+
+export const TemplateTimingOverridesSchema = z
+  .object({
+    durationSec: z.number().min(0.1).max(600).optional(),
+    fps: z.number().min(1).max(240).optional(),
+    speedMultiplier: z.number().min(0.1).max(10).optional(),
+    startOffsetSec: z.number().min(0).max(600).optional(),
+    easingCurve: z.tuple([z.number(), z.number(), z.number(), z.number()]).optional(),
+  })
+  .strict();
+
+export const TemplateKeyframeOverrideSchema = z
+  .object({
+    property: z.string().trim().min(1).max(64),
+    timeSec: z.number().min(0).max(600),
+    value: z.union([z.number(), z.string().max(240)]),
+    easing: z.string().trim().max(64).optional(),
+  })
+  .strict();
+
+export const TemplateVariantCreateSchema = z
+  .object({
+    baseTemplateId: z.string().trim().min(1).max(128).regex(/^[a-zA-Z0-9_\-]+$/),
+    name: z.string().trim().min(1).max(160).optional(),
+    title: z.string().trim().min(1).max(160).optional(),
+    notes: z.string().trim().max(2000).optional(),
+    description: z.string().trim().max(2000).optional(),
+    visibility: z.enum(['private', 'public']).default('private'),
+    parameterOverrides: z
+      .record(z.string(), z.union([z.string().max(240), z.number(), z.boolean()]))
+      .default({}),
+    assetSwaps: z.record(z.string(), z.string().max(128)).default({}),
+    assetOverrides: z.record(z.string(), z.string().max(128)).optional(),
+    assetSlotBindings: z.record(z.string(), z.string().max(128)).optional(),
+    timingOverrides: TemplateTimingOverridesSchema.optional(),
+    keyframeOverrides: z.array(TemplateKeyframeOverrideSchema).max(50).optional(),
+  })
+  .strict();
+
+export const TemplateVariantPatchSchema = z
+  .object({
+    name: z.string().trim().min(1).max(160).optional(),
+    title: z.string().trim().min(1).max(160).optional(),
+    notes: z.string().trim().max(2000).optional(),
+    description: z.string().trim().max(2000).optional(),
+    visibility: z.enum(['private', 'public']).optional(),
+    parameterOverrides: z
+      .record(z.string(), z.union([z.string().max(240), z.number(), z.boolean()]))
+      .optional(),
+    assetSwaps: z.record(z.string(), z.string().max(128)).optional(),
+    assetOverrides: z.record(z.string(), z.string().max(128)).optional(),
+    assetSlotBindings: z.record(z.string(), z.string().max(128)).optional(),
+    timingOverrides: TemplateTimingOverridesSchema.optional(),
+    keyframeOverrides: z.array(TemplateKeyframeOverrideSchema).max(50).optional(),
+  })
+  .strict();
+
+export const TemplateForkRequestSchema = z
+  .object({
+    variantId: z.string().trim().max(128).optional(),
+    newName: z.string().trim().min(1).max(140).optional(),
+    newTitle: z.string().trim().min(1).max(140).optional(),
+    newSummary: z.string().trim().max(500).optional(),
+    visibility: TemplateVisibilityEnum.default('private'),
+    licenseType: TemplateLicenseTypeEnum.optional(),
+    licenseNote: z.string().trim().max(500).optional(),
+    parameterOverrides: z
+      .record(z.string(), z.union([z.string().max(240), z.number(), z.boolean()]))
+      .optional(),
+    assetSwaps: z.record(z.string(), z.string().max(128)).optional(),
+    assetOverrides: z.record(z.string(), z.string().max(128)).optional(),
+    assetSlotBindings: z.record(z.string(), z.string().max(128)).optional(),
+    timingOverrides: TemplateTimingOverridesSchema.optional(),
+    keyframeOverrides: z.array(TemplateKeyframeOverrideSchema).max(50).optional(),
   })
   .strict();
 
@@ -319,32 +520,122 @@ export const AssetMetadataCreateSchema = z
       .max(128)
       .regex(/^[a-zA-Z0-9_\-]+$/)
       .optional(),
-    title: z.string().trim().min(1).max(160),
-    moduleId: ModuleIdEnum,
-    catalogItemId: z.string().trim().max(128).optional(),
-    assetKind: AssetKindEnum,
-    licenseType: z.enum([
-      'Original Demo Specification',
-      'Reference Metadata Only',
-      'User Owned',
-    ]),
-    licenseNote: z.string().trim().min(1).max(500),
-    sourceNote: z.string().trim().min(1).max(500),
-    mimeType: z.string().trim().min(1).max(80).default('application/json'),
+    title: z.string().trim().min(1).max(160).optional(),
+    name: z.string().trim().min(1).max(160).optional(),
+    labels: z.array(z.string().trim().min(1).max(64)).max(20).optional(),
+    tags: z.array(z.string().trim().min(1).max(64)).max(20).optional(),
+    moduleId: ModuleIdEnum.default('templates'),
+    catalogItemId: z.string().trim().max(128).nullable().optional(),
+    assetKind: AssetKindEnum.optional(),
+    kind: AssetKindEnum.optional(),
+    visibility: z.enum(['private', 'public']).default('private'),
+    dimensions: z
+      .union([
+        z.object({
+          width: z.number().int().min(1).max(16384),
+          height: z.number().int().min(1).max(16384),
+        }),
+        z.string().trim().max(64),
+      ])
+      .nullable()
+      .optional(),
+    durationSec: z.number().min(0).max(7200).nullable().optional(),
+    audioFormat: z
+      .union([
+        z.object({
+          sampleRateHz: z.number().int().min(8000).max(192000).optional(),
+          channels: z.number().int().min(1).max(16).optional(),
+          codec: z.string().trim().max(40).optional(),
+        }),
+        z.string().trim().max(80),
+      ])
+      .nullable()
+      .optional(),
+    base64Content: z.string().max(10_000_000).optional(),
+    svgContent: z.string().max(250_000).optional(),
+    previewDataUri: z.string().max(100_000).nullable().optional(),
+    checksumSha256: z.string().trim().max(128).optional(),
+    provenance: z
+      .union([
+        z.object({
+          originType: z
+            .enum(['user-upload', 'system-seed', 'generated', 'imported-url', 'git-repo'])
+            .default('user-upload'),
+          sourceUrl: z.string().trim().max(500).optional(),
+          importedAt: z.string().trim().max(64).optional(),
+        }),
+        z.string().trim().max(300),
+      ])
+      .optional(),
+    attribution: z.union([TemplateAttributionSchema, z.string().trim().max(300)]).optional(),
+    licenseType: TemplateLicenseTypeEnum.default('Unknown'),
+    licenseNote: z
+      .string()
+      .trim()
+      .min(1)
+      .max(500)
+      .default('Rights not yet declared (Unknown).'),
+    sourceNote: z
+      .string()
+      .trim()
+      .min(1)
+      .max(500)
+      .default('User-uploaded asset record'),
+    mimeType: z.string().trim().min(1).max(80).default('application/octet-stream'),
     sizeBytes: z.number().int().min(0).nullable().default(null),
-    status: z.enum(['metadata-only', 'stored', 'archived']).default('metadata-only'),
+    byteSize: z.number().int().min(0).nullable().optional(),
+    status: z
+      .enum(['metadata-only', 'stored', 'missing-binary', 'archived'])
+      .default('metadata-only'),
+  })
+  .strict();
+
+export const AssetReplaceSchema = z
+  .object({
+    base64Content: z.string().max(10_000_000).optional(),
+    svgContent: z.string().max(250_000).optional(),
+    previewDataUri: z.string().max(100_000).nullable().optional(),
+    checksumSha256: z.string().trim().max(128).optional(),
+    mimeType: z.string().trim().min(1).max(80).optional(),
+    sizeBytes: z.number().int().min(0).optional(),
+    byteSize: z.number().int().min(0).optional(),
+    dimensions: z
+      .union([
+        z.object({
+          width: z.number().int().min(1).max(16384),
+          height: z.number().int().min(1).max(16384),
+        }),
+        z.string().trim().max(64),
+      ])
+      .nullable()
+      .optional(),
+    durationSec: z.number().min(0).max(7200).nullable().optional(),
+    audioFormat: z
+      .union([
+        z.object({
+          sampleRateHz: z.number().int().min(8000).max(192000).optional(),
+          channels: z.number().int().min(1).max(16).optional(),
+          codec: z.string().trim().max(40).optional(),
+        }),
+        z.string().trim().max(80),
+      ])
+      .nullable()
+      .optional(),
+    note: z.string().trim().min(1).max(300).default('Replaced asset binary version'),
   })
   .strict();
 
 export const AssetMetadataPatchSchema = z
   .object({
     title: z.string().trim().min(1).max(160).optional(),
-    licenseType: z
-      .enum(['Original Demo Specification', 'Reference Metadata Only', 'User Owned'])
-      .optional(),
+    labels: z.array(z.string().trim().min(1).max(64)).max(20).optional(),
+    tags: z.array(z.string().trim().min(1).max(64)).max(20).optional(),
+    visibility: z.enum(['private', 'public']).optional(),
+    licenseType: TemplateLicenseTypeEnum.optional(),
     licenseNote: z.string().trim().min(1).max(500).optional(),
     sourceNote: z.string().trim().min(1).max(500).optional(),
-    status: z.enum(['metadata-only', 'stored', 'archived']).optional(),
+    attribution: z.union([TemplateAttributionSchema, z.string().trim().max(300)]).optional(),
+    status: z.enum(['metadata-only', 'stored', 'missing-binary', 'archived']).optional(),
   })
   .strict();
 

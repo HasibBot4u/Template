@@ -10,13 +10,18 @@ import {
   where,
 } from 'firebase/firestore';
 import {
+  AssetMetadataRecord,
+  CatalogItem,
   DeviceRecord,
   JobRecord,
   JobStatus,
   ProjectLibraryItem,
+  TemplateLicenseType,
+  TemplateVariantInstance,
   UserPreferences,
 } from '../types/sowveil';
-import { SEED_PROJECT_LIBRARY } from '../data/catalogSeeds';
+import { SEED_CATALOG_ITEMS, SEED_PROJECT_LIBRARY } from '../data/catalogSeeds';
+import { enrichCatalogItemWithMarketplaceDefaults } from '../services/marketplaceEngine';
 import { transitionJobRecord } from '../services/jobStateMachine';
 import {
   auth,
@@ -50,6 +55,13 @@ export interface IWorkspaceRepository {
         | 'durationLabel'
         | 'fps'
         | 'aeVersion'
+        | 'targetEditor'
+        | 'aspectRatio'
+        | 'sowveilSpecJson'
+        | 'canonicalProjectJson'
+        | 'revision'
+        | 'activeBranch'
+        | 'checkpoints'
         | 'hasExternalFootageWarning'
         | 'archived'
         | 'lastOpenedAt'
@@ -243,6 +255,11 @@ export class FirestoreWorkspaceRepository implements IWorkspaceRepository {
       ...(input.targetEditor ? { targetEditor: input.targetEditor } : {}),
       ...(input.aspectRatio ? { aspectRatio: input.aspectRatio } : {}),
       ...(input.sowveilSpecJson ? { sowveilSpecJson: input.sowveilSpecJson.slice(0, 15000) } : {}),
+      ...(input.canonicalProjectJson
+        ? { canonicalProjectJson: input.canonicalProjectJson.slice(0, 200000) }
+        : {}),
+      ...(input.revision !== undefined ? { revision: input.revision } : {}),
+      ...(input.activeBranch ? { activeBranch: input.activeBranch.slice(0, 64) } : {}),
       ...(input.checkpoints ? { checkpoints: input.checkpoints.slice(0, 20) } : {}),
       hasExternalFootageWarning: Boolean(input.hasExternalFootageWarning),
       archived: Boolean(input.archived),
@@ -291,6 +308,11 @@ export class FirestoreWorkspaceRepository implements IWorkspaceRepository {
       if (patch.aspectRatio !== undefined) updatePayload.aspectRatio = patch.aspectRatio;
       if (patch.sowveilSpecJson !== undefined)
         updatePayload.sowveilSpecJson = patch.sowveilSpecJson.slice(0, 15000);
+      if (patch.canonicalProjectJson !== undefined)
+        updatePayload.canonicalProjectJson = patch.canonicalProjectJson.slice(0, 200000);
+      if (patch.revision !== undefined) updatePayload.revision = patch.revision;
+      if (patch.activeBranch !== undefined)
+        updatePayload.activeBranch = patch.activeBranch.slice(0, 64);
       if (patch.checkpoints !== undefined)
         updatePayload.checkpoints = patch.checkpoints.slice(0, 20);
       if (patch.hasExternalFootageWarning !== undefined)
@@ -672,3 +694,148 @@ export { InMemoryTestWorkspaceRepository as LocalPreviewWorkspaceRepository };
 
 export const firestoreWorkspaceRepository = new FirestoreWorkspaceRepository();
 export const workspaceRepository: IWorkspaceRepository = firestoreWorkspaceRepository;
+
+// --- Durable Client-Side + Server API Sync Helpers for Variants, Recent Items & Asset Library ---
+const LOCAL_VARIANTS_STORAGE_KEY = 'sowveil.marketplace.variants.v1';
+const LOCAL_FORKED_TEMPLATES_STORAGE_KEY = 'sowveil.marketplace.forkedTemplates.v1';
+const LOCAL_RECENT_ITEMS_STORAGE_KEY = 'sowveil.marketplace.recentIds.v1';
+const LOCAL_ASSETS_STORAGE_KEY = 'sowveil.marketplace.assets.v1';
+
+function safeReadLocalJson<T>(key: string, fallback: T): T {
+  if (typeof window === 'undefined' || !window.localStorage) return fallback;
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (!raw) return fallback;
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+function safeWriteLocalJson<T>(key: string, value: T): void {
+  if (typeof window === 'undefined' || !window.localStorage) return;
+  try {
+    window.localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // Ignore quota errors
+  }
+}
+
+export function getSavedTemplateVariants(baseTemplateId?: string): TemplateVariantInstance[] {
+  const all = safeReadLocalJson<TemplateVariantInstance[]>(LOCAL_VARIANTS_STORAGE_KEY, []);
+  if (!baseTemplateId) return all;
+  return all.filter((v) => v.baseTemplateId === baseTemplateId);
+}
+
+export function saveLocalTemplateVariant(
+  variant: Omit<TemplateVariantInstance, 'id' | 'createdAt' | 'updatedAt'> & { id?: string }
+): TemplateVariantInstance[] {
+  const all = safeReadLocalJson<TemplateVariantInstance[]>(LOCAL_VARIANTS_STORAGE_KEY, []);
+  const now = new Date().toISOString();
+  const existingIdx = variant.id ? all.findIndex((v) => v.id === variant.id) : -1;
+  if (existingIdx >= 0) {
+    const updated: TemplateVariantInstance = {
+      ...all[existingIdx],
+      ...variant,
+      id: all[existingIdx].id,
+      createdAt: all[existingIdx].createdAt,
+      updatedAt: now,
+    };
+    all[existingIdx] = updated;
+    safeWriteLocalJson(LOCAL_VARIANTS_STORAGE_KEY, all);
+    return all;
+  }
+  const created: TemplateVariantInstance = {
+    ...variant,
+    id: variant.id || `var_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+    createdAt: now,
+    updatedAt: now,
+  };
+  const next = [created, ...all];
+  safeWriteLocalJson(LOCAL_VARIANTS_STORAGE_KEY, next);
+  return next;
+}
+
+export function deleteLocalTemplateVariant(variantId: string): TemplateVariantInstance[] {
+  const all = safeReadLocalJson<TemplateVariantInstance[]>(LOCAL_VARIANTS_STORAGE_KEY, []);
+  const filtered = all.filter((v) => v.id !== variantId);
+  safeWriteLocalJson(LOCAL_VARIANTS_STORAGE_KEY, filtered);
+  return filtered;
+}
+
+export function getLocalForkedTemplates(): CatalogItem[] {
+  const raw = safeReadLocalJson<CatalogItem[]>(LOCAL_FORKED_TEMPLATES_STORAGE_KEY, []);
+  return raw.map((item) => enrichCatalogItemWithMarketplaceDefaults(item));
+}
+
+export function saveLocalForkedTemplate(item: CatalogItem): CatalogItem[] {
+  const enriched = enrichCatalogItemWithMarketplaceDefaults(item);
+  const all = getLocalForkedTemplates().filter((i) => i.id !== enriched.id);
+  const next = [enriched, ...all];
+  safeWriteLocalJson(LOCAL_FORKED_TEMPLATES_STORAGE_KEY, next);
+  return next;
+}
+
+export function getRecentCatalogItemIds(): string[] {
+  return safeReadLocalJson<string[]>(LOCAL_RECENT_ITEMS_STORAGE_KEY, []);
+}
+
+export function recordRecentCatalogItemId(itemId: string): string[] {
+  const current = getRecentCatalogItemIds();
+  const next = [itemId, ...current.filter((id) => id !== itemId)].slice(0, 40);
+  safeWriteLocalJson(LOCAL_RECENT_ITEMS_STORAGE_KEY, next);
+  return next;
+}
+
+export function getStarterAndUserAssets(): AssetMetadataRecord[] {
+  const stored = safeReadLocalJson<AssetMetadataRecord[] | null>(LOCAL_ASSETS_STORAGE_KEY, null);
+  if (stored && stored.length > 0) return stored;
+  const seeded: AssetMetadataRecord[] = SEED_CATALOG_ITEMS.slice(0, 10).map((item) => ({
+    id: `asset_${item.id}`,
+    title: `${item.name} (${item.packLabel})`,
+    labels: [item.packLabel, item.moduleId],
+    tags: [...item.tags],
+    moduleId: item.moduleId,
+    catalogItemId: item.id,
+    assetKind: item.assetKind,
+    ownerUid: 'system-seed',
+    visibility: 'public',
+    licenseType: item.licenseType as TemplateLicenseType,
+    licenseNote: item.licenseNote,
+    sourceNote: `Procedural ${item.sourceType} preset specification`,
+    provenance: 'Sowveil Studio Core Seed',
+    attribution: 'Sowveil Studio',
+    storageProvider: 'none-configured',
+    storageObjectKey: null,
+    mimeType: item.moduleId === 'sfx' ? 'audio/wav' : 'application/json',
+    sizeBytes: item.metadata.fileSizeBytes ?? null,
+    dimensions: item.metadata.resolution || '1920×1080',
+    durationSec: item.metadata.durationSec ?? 3,
+    audioFormat: item.moduleId === 'sfx' ? 'WAV 48kHz 24-bit' : undefined,
+    checksumSha256: `sha256_seed_${item.id}`,
+    versions: [
+      {
+        version: '1.0.0',
+        checksumSha256: `sha256_seed_${item.id}`,
+        sizeBytes: item.metadata.fileSizeBytes ?? null,
+        mimeType: item.moduleId === 'sfx' ? 'audio/wav' : 'application/json',
+        updatedAt: item.updatedAt,
+        updatedByUid: 'system-seed',
+        note: 'Initial procedural asset specification',
+      },
+    ],
+    missingAssetDetected: false,
+    usedByTemplateIds: [item.id],
+    usedByVariantIds: [],
+    status: 'metadata-only',
+    createdAt: item.createdAt,
+    updatedAt: item.updatedAt,
+  }));
+  safeWriteLocalJson(LOCAL_ASSETS_STORAGE_KEY, seeded);
+  return seeded;
+}
+
+export function saveStarterAndUserAssets(assets: AssetMetadataRecord[]): void {
+  safeWriteLocalJson(LOCAL_ASSETS_STORAGE_KEY, assets);
+}
+

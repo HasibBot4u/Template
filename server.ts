@@ -11,7 +11,10 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 async function startServer() {
-  const app = createApiApp();
+  const persistenceFilePath =
+    process.env.SOWVEIL_STORE_PATH ||
+    path.join(__dirname, '.data', 'sowveil-durable-store.json');
+  const app = createApiApp({ persistenceFilePath });
   const PORT = Number(process.env.PORT || 3000);
 
   if (process.env.NODE_ENV !== 'production') {

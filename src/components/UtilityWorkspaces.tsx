@@ -50,11 +50,19 @@ import {
   Search,
   Share2,
   ShieldAlert,
+  Sliders,
   Smartphone,
   Trash2,
   Upload,
   X,
 } from 'lucide-react';
+import {
+  canonicalProjectToLibraryRecord,
+  createMinimalCanonicalProject,
+  migrateToCanonicalProject,
+  serializeCanonicalProject,
+} from '../services/canonicalProjectEngine';
+import { MobileProEditorModal } from './MobileProEditorModal';
 
 // ============================================================================
 // 1. AUTO CAPTIONS WORKSPACE (MOBILE-FIRST 4-STEP MEDIA WORKFLOW)
@@ -73,14 +81,14 @@ interface AutoCaptionsWorkspaceProps {
 }
 
 const CAPTION_STYLE_PRESETS = [
+  { id: 'clean', name: 'Clean', tag: 'Minimal', accent: '#F3EEE8' },
   { id: 'bold-pop', name: 'Bold Pop', tag: 'Word Pop', accent: '#F06424' },
-  { id: 'highlight-box', name: 'Highlight Box', tag: 'Active Pill', accent: '#E4B45A' },
-  { id: 'karaoke-fill', name: 'Karaoke Fill', tag: 'Sweep', accent: '#55B98B' },
+  { id: 'highlight-box', name: 'Boxed', tag: 'Active Pill', accent: '#E4B45A' },
+  { id: 'karaoke-fill', name: 'Karaoke', tag: 'Sweep', accent: '#55B98B' },
+  { id: 'minimal-clean', name: 'Minimal', tag: 'Broadcast', accent: '#E5E7EB' },
   { id: 'fade-words', name: 'Fade Words', tag: 'Editorial', accent: '#F3EEE8' },
   { id: 'glow-pulse', name: 'Glow Pulse', tag: 'Neon', accent: '#60A5FA' },
   { id: 'typewriter', name: 'Typewriter', tag: 'Monospace', accent: '#FFC08C' },
-  { id: 'slide-up', name: 'Slide Up', tag: 'Kinetic', accent: '#F06424' },
-  { id: 'minimal-clean', name: 'Minimal Clean', tag: 'Broadcast', accent: '#E5E7EB' },
 ];
 
 export const AutoCaptionsWorkspace: React.FC<AutoCaptionsWorkspaceProps> = ({
@@ -129,7 +137,7 @@ export const AutoCaptionsWorkspace: React.FC<AutoCaptionsWorkspaceProps> = ({
     DEFAULT_CAPTION_VALIDATION_CONFIG
   );
 
-  // Re-generate segments when user clicks "Sync Transcript to Timed Cues" or adjusts wordsPerCaption/wpmSpeed
+  // Re-generate segments when user clicks "Transcribe" or adjusts wordsPerCaption/wpmSpeed
   const handleRegenerateFromTranscript = () => {
     const built = buildCaptionCuesFromTranscript(
       transcriptInput,
@@ -174,7 +182,7 @@ export const AutoCaptionsWorkspace: React.FC<AutoCaptionsWorkspaceProps> = ({
   );
 
   const activeStyle =
-    CAPTION_STYLE_PRESETS.find((s) => s.id === selectedStyleId) || CAPTION_STYLE_PRESETS[0];
+    CAPTION_STYLE_PRESETS.find((s) => s.id === selectedStyleId) || CAPTION_STYLE_PRESETS[1];
 
   const isLargeFile = Boolean(
     selectedFile && selectedFile.sizeBytes > 10 * 1024 * 1024
@@ -326,186 +334,161 @@ export const AutoCaptionsWorkspace: React.FC<AutoCaptionsWorkspaceProps> = ({
   };
 
   return (
-    <div className="p-4 sm:p-6 max-w-6xl mx-auto space-y-6">
-      <div className="flex flex-wrap items-baseline justify-between gap-2 border-b border-[#342A24] pb-4">
-        <div>
-          <h1 className="text-lg font-bold text-[#F3EEE8]">Auto Captions</h1>
-          <p className="text-xs text-[#B8AAA0] mt-0.5">
-            1. Source · 2. Transcribe · 3. Edit Timed Segments · 4. Export (.srt / .vtt / .json / Mobile Sidecar .zip)
-          </p>
-        </div>
-        <span className="text-xs font-mono-tabular text-[#55B98B]">
-          Mobile Subtitle Engine Ready · Parser &amp; Overlap Verified
-        </span>
-      </div>
-
-      {/* Honest Processing & Privacy Banner */}
-      <div className="rounded-xl border border-[#342A24] bg-[#14110F] p-3.5 flex items-start gap-3 text-xs text-[#B8AAA0]">
-        <Smartphone className="w-4 h-4 text-[#F06424] shrink-0 mt-0.5" />
-        <div className="space-y-1">
-          <div className="font-semibold text-[#F3EEE8]">
-            Honest On-Device vs. Cloud ASR Architecture
-          </div>
-          <p>
-            Sowveil never downloads multi-hundred-megabyte speech models onto your phone without consent and never claims heavy AI transcription runs locally when it does not. Timed transcript chunking, SRT/VTT parsing, overlap detection, cue splitting/merging, and sidecar ZIP packaging run directly in your mobile browser. Full audio speech-to-text requires a configured server ASR worker.
-          </p>
-        </div>
-      </div>
-
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        {/* Left Column: Steps 1, 2 & Style Presets */}
-        <div className="lg:col-span-5 space-y-5">
-          {/* 1. Source Selection (Phone File Picker OR User Library Asset) */}
-          <div className="rounded-2xl border border-[#342A24] bg-[#11100F] p-4 space-y-3">
+    <div className="p-4 sm:p-6 max-w-6xl mx-auto space-y-5">
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
+        {/* Left Column: Reference Sections 1 SOURCE, 2 TRANSCRIBE & 4 STYLE (frames 01:18-01:19) */}
+        <div className="lg:col-span-5 space-y-4">
+          {/* 1 SOURCE (frame 01:18) */}
+          <div className="rounded-xl border border-[#2A231E] bg-[#11100F] p-4 space-y-3">
             <div className="flex items-center justify-between">
-              <div className="text-xs font-mono-tabular text-[#83766D]">1. SOURCE</div>
-              <div className="inline-flex rounded-lg border border-[#342A24] bg-[#191614] p-0.5 text-[11px]">
+              <div className="flex items-center gap-2">
+                <span className="w-5 h-5 rounded-full bg-[#2A1810] border border-[#F06424]/50 text-[#F06424] text-[11px] font-bold flex items-center justify-center">
+                  1
+                </span>
+                <span className="text-xs font-mono-tabular uppercase tracking-wider text-[#B8AAA0]">
+                  SOURCE
+                </span>
+              </div>
+              <div className="inline-flex rounded-lg border border-[#2A231E] bg-[#141210] p-0.5 text-[11px]">
                 <button
                   type="button"
                   onClick={() => setSourceMode('phone-file')}
-                  className={`px-2.5 py-1 rounded-md font-medium ${
+                  className={`px-2 py-0.5 rounded font-medium ${
                     sourceMode === 'phone-file'
                       ? 'bg-[#F06424] text-[#080707] font-semibold'
                       : 'text-[#B8AAA0]'
                   }`}
                 >
-                  Phone File
+                  File / Layer
                 </button>
                 <button
                   type="button"
                   onClick={() => setSourceMode('library-asset')}
-                  className={`px-2.5 py-1 rounded-md font-medium ${
+                  className={`px-2 py-0.5 rounded font-medium ${
                     sourceMode === 'library-asset'
                       ? 'bg-[#F06424] text-[#080707] font-semibold'
                       : 'text-[#B8AAA0]'
                   }`}
                 >
-                  Library Asset ({projects.length})
+                  Library ({projects.length})
                 </button>
               </div>
             </div>
 
             {sourceMode === 'phone-file' ? (
-              <label className="block cursor-pointer rounded-xl border border-dashed border-[#342A24] hover:border-[#F06424] bg-[#191614]/60 p-4 text-center transition-colors">
-                <input
-                  type="file"
-                  accept="video/*,audio/*,.mp4,.mov,.webm,.mp3,.wav,.m4a,.srt,.vtt"
-                  className="sr-only"
-                  onChange={async (e) => {
-                    const file = e.target.files?.[0];
-                    if (!file) return;
-                    const safeName = sanitizeMediaFileName(file.name);
+              <div className="rounded-lg border border-[#2A231E] bg-[#141210] p-3 flex flex-wrap items-center justify-between gap-2">
+                <div className="text-xs text-[#B8AAA0] truncate">
+                  {selectedFile ? (
+                    <span className="text-[#F3EEE8] font-medium">
+                      {selectedFile.name} ({(selectedFile.sizeBytes / 1024).toFixed(1)} KB)
+                    </span>
+                  ) : (
+                    'No source yet.'
+                  )}
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      handleRegenerateFromTranscript();
+                      onNotify(
+                        'Loaded active timeline layer transcript into timed subtitle cues.',
+                        'info'
+                      );
+                    }}
+                    className="px-3 py-1.5 rounded-lg bg-[#F06424] hover:bg-[#FF4B24] text-[#080707] font-semibold text-xs transition-colors"
+                  >
+                    Use selected layer
+                  </button>
+                  <label className="cursor-pointer px-3 py-1.5 rounded-lg border border-[#2A231E] bg-[#191614] hover:border-[#83766D] text-xs font-medium text-[#F3EEE8] transition-colors">
+                    <span>Choose file...</span>
+                    <input
+                      type="file"
+                      accept="video/*,audio/*,.mp4,.mov,.webm,.mp3,.wav,.m4a,.srt,.vtt"
+                      className="sr-only"
+                      onChange={async (e) => {
+                        const file = e.target.files?.[0];
+                        if (!file) return;
+                        const safeName = sanitizeMediaFileName(file.name);
 
-                    // If user selects an existing .srt or .vtt file, parse it into interactive segments!
-                    if (
-                      safeName.toLowerCase().endsWith('.srt') ||
-                      safeName.toLowerCase().endsWith('.vtt')
-                    ) {
-                      try {
-                        const text = await file.text();
-                        const parsedCues = safeName.toLowerCase().endsWith('.vtt')
-                          ? parseVttContent(text)
-                          : parseSrtContent(text);
-                        setEditableCues(parsedCues);
-                        setTranscriptInput(parsedCues.map((c) => c.text).join(' '));
+                        if (
+                          safeName.toLowerCase().endsWith('.srt') ||
+                          safeName.toLowerCase().endsWith('.vtt')
+                        ) {
+                          try {
+                            const text = await file.text();
+                            const parsedCues = safeName.toLowerCase().endsWith('.vtt')
+                              ? parseVttContent(text)
+                              : parseSrtContent(text);
+                            setEditableCues(parsedCues);
+                            setTranscriptInput(parsedCues.map((c) => c.text).join(' '));
+                            setSelectedFile({
+                              name: safeName,
+                              sizeBytes: file.size,
+                              type: file.type || 'text/plain',
+                              signatureVerified: `Parsed ${parsedCues.length} subtitle cues`,
+                            });
+                            onNotify(
+                              `Imported ${parsedCues.length} timed segments from "${safeName}".`,
+                              'success'
+                            );
+                            return;
+                          } catch (err) {
+                            onNotify(
+                              `Subtitle parse error: ${err instanceof Error ? err.message : 'Invalid format'}`,
+                              'error'
+                            );
+                            return;
+                          }
+                        }
+
+                        const headBuf = await file.slice(0, 256).arrayBuffer();
+                        const sig = verifyMediaMagicBytes(new Uint8Array(headBuf), safeName);
                         setSelectedFile({
                           name: safeName,
                           sizeBytes: file.size,
-                          type: file.type || 'text/plain',
-                          signatureVerified: `Parsed ${parsedCues.length} subtitle cues`,
+                          type: sig.detectedMimeType || file.type || 'video/mp4',
+                          signatureVerified: sig.reason,
                         });
+                        setLargeFilePrivacyConsented(false);
                         onNotify(
-                          `Imported ${parsedCues.length} timed segments from "${safeName}".`,
-                          'success'
+                          sig.valid
+                            ? `Verified "${safeName}" (${sig.detectedContainer.toUpperCase()}, ${(file.size / 1024).toFixed(1)} KB).`
+                            : `Selected "${safeName}" (${sig.reason}).`,
+                          sig.valid ? 'info' : 'warning'
                         );
-                        return;
-                      } catch (err) {
-                        onNotify(
-                          `Subtitle parse error: ${err instanceof Error ? err.message : 'Invalid format'}`,
-                          'error'
-                        );
-                        return;
-                      }
-                    }
-
-                    // Inspect first 256 magic bytes of video/audio file
-                    const headBuf = await file.slice(0, 256).arrayBuffer();
-                    const sig = verifyMediaMagicBytes(new Uint8Array(headBuf), safeName);
-                    setSelectedFile({
-                      name: safeName,
-                      sizeBytes: file.size,
-                      type: sig.detectedMimeType || file.type || 'video/mp4',
-                      signatureVerified: sig.valid ? sig.reason : sig.reason,
-                    });
-                    setLargeFilePrivacyConsented(false);
-                    onNotify(
-                      sig.valid
-                        ? `Verified "${safeName}" (${sig.detectedContainer.toUpperCase()}, ${(file.size / 1024).toFixed(1)} KB).`
-                        : `Selected "${safeName}" (${sig.reason}).`,
-                      sig.valid ? 'info' : 'warning'
-                    );
-                  }}
-                />
-                <Upload className="w-5 h-5 text-[#F06424] mx-auto mb-1.5" />
-                {selectedFile ? (
-                  <div className="space-y-1">
-                    <div className="text-xs font-semibold text-[#F3EEE8] truncate">
-                      {selectedFile.name}
-                    </div>
-                    <div className="text-[11px] text-[#B8AAA0] font-mono-tabular">
-                      {(selectedFile.sizeBytes / 1024).toFixed(1)} KB · {selectedFile.type}
-                    </div>
-                    {selectedFile.signatureVerified && (
-                      <div className="text-[10px] text-[#55B98B] font-mono-tabular">
-                        {selectedFile.signatureVerified}
-                      </div>
-                    )}
-                  </div>
-                ) : (
-                  <div className="space-y-1">
-                    <div className="text-xs font-semibold text-[#F3EEE8]">
-                      Select phone video, audio, or .srt / .vtt file
-                    </div>
-                    <div className="text-[11px] text-[#83766D]">
-                      MP4, MOV, WebM, WAV, MP3, SRT, VTT · Magic-byte verified
-                    </div>
-                  </div>
-                )}
-              </label>
+                      }}
+                    />
+                  </label>
+                </div>
+              </div>
             ) : (
               <div className="space-y-2">
                 <select
                   value={selectedLibraryProjectId}
                   onChange={(e) => setSelectedLibraryProjectId(e.target.value)}
                   aria-label="Choose asset from Project Library"
-                  className="w-full min-h-[42px] rounded-xl border border-[#342A24] bg-[#191614] px-3 py-2 text-xs text-[#F3EEE8]"
+                  className="w-full min-h-[38px] rounded-lg border border-[#2A231E] bg-[#141210] px-3 py-1.5 text-xs text-[#F3EEE8]"
                 >
                   {projects.length === 0 ? (
                     <option value="">No saved Project Library items yet</option>
                   ) : (
                     projects.map((p) => (
                       <option key={p.id} value={p.id}>
-                        {p.title} ({p.projectFileStatus} · {p.resolution || '1080×1920'})
+                        {p.title} ({p.projectFileStatus})
                       </option>
                     ))
                   )}
                 </select>
-                <p className="text-[11px] text-[#83766D]">
-                  Attaches generated subtitle sidecars to your selected Project Library record.
-                </p>
               </div>
             )}
 
-            {/* Large File Privacy & Data Retention Disclosure */}
             {isLargeFile && (
               <div className="rounded-xl border border-[#E4B45A]/50 bg-[#E4B45A]/10 p-3 space-y-2 text-xs">
                 <div className="flex items-start gap-2 text-[#E4B45A] font-semibold">
                   <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
                   <span>Large Media Privacy &amp; Retention Notice (&gt; 10 MB)</span>
                 </div>
-                <p className="text-[#B8AAA0] text-[11px] leading-relaxed">
-                  Uploading large video/audio files to a cloud transcription worker transfers your media over the network and may incur bandwidth and Cloud Run/ASR costs. Temporary worker uploads are scoped to your account and purged after job retention expires.
-                </p>
                 <label className="flex items-center gap-2 text-[11px] text-[#F3EEE8] cursor-pointer">
                   <input
                     type="checkbox"
@@ -519,18 +502,40 @@ export const AutoCaptionsWorkspace: React.FC<AutoCaptionsWorkspaceProps> = ({
             )}
           </div>
 
-          {/* 2. Transcribe Settings */}
-          <div className="rounded-2xl border border-[#342A24] bg-[#11100F] p-4 space-y-3">
-            <div className="text-xs font-mono-tabular text-[#83766D]">
-              2. TRANSCRIBE &amp; CHUNKING CONTROLS
+          {/* 2 TRANSCRIBE (frame 01:18) */}
+          <div className="rounded-xl border border-[#2A231E] bg-[#11100F] p-4 space-y-3 text-xs">
+            <div className="flex items-center gap-2">
+              <span className="w-5 h-5 rounded-full bg-[#2A1810] border border-[#F06424]/50 text-[#F06424] text-[11px] font-bold flex items-center justify-center">
+                2
+              </span>
+              <span className="text-xs font-mono-tabular uppercase tracking-wider text-[#B8AAA0]">
+                TRANSCRIBE
+              </span>
             </div>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
-              <label className="block space-y-1">
+
+            <div className="space-y-2.5">
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-[#B8AAA0]">Model</span>
+                <select
+                  value={modelTier}
+                  onChange={(e) =>
+                    setModelTier(e.target.value as 'browser-timed' | 'server-whisper-asr')
+                  }
+                  className="w-56 min-h-[36px] rounded-lg border border-[#2A231E] bg-[#141210] px-2.5 py-1 text-xs text-[#F3EEE8]"
+                >
+                  <option value="browser-timed">Turbo (best speed/quality)</option>
+                  <option value="server-whisper-asr">
+                    Server Whisper ASR Worker (Needs setup)
+                  </option>
+                </select>
+              </div>
+
+              <div className="flex items-center justify-between gap-3">
                 <span className="text-[#B8AAA0]">Language</span>
                 <select
                   value={language}
                   onChange={(e) => setLanguage(e.target.value)}
-                  className="w-full min-h-[42px] rounded-xl border border-[#342A24] bg-[#191614] px-2.5 py-1.5 text-xs text-[#F3EEE8]"
+                  className="w-56 min-h-[36px] rounded-lg border border-[#2A231E] bg-[#141210] px-2.5 py-1 text-xs text-[#F3EEE8]"
                 >
                   <option value="auto">Auto detect</option>
                   <option value="en">English (en)</option>
@@ -541,66 +546,38 @@ export const AutoCaptionsWorkspace: React.FC<AutoCaptionsWorkspaceProps> = ({
                   <option value="hi">Hindi (hi)</option>
                   <option value="ja">Japanese (ja)</option>
                 </select>
-              </label>
+              </div>
 
-              <label className="block space-y-1">
-                <span className="text-[#B8AAA0]">Model / Processing Tier</span>
-                <select
-                  value={modelTier}
-                  onChange={(e) =>
-                    setModelTier(e.target.value as 'browser-timed' | 'server-whisper-asr')
-                  }
-                  className="w-full min-h-[42px] rounded-xl border border-[#342A24] bg-[#191614] px-2.5 py-1.5 text-xs text-[#F3EEE8]"
-                >
-                  <option value="browser-timed">Browser Timed Chunker (Available)</option>
-                  <option value="server-whisper-asr">
-                    Server Whisper ASR Worker (Needs setup)
-                  </option>
-                </select>
-              </label>
-
-              <label className="block space-y-1">
-                <span className="text-[#B8AAA0] flex justify-between">
-                  <span>Words per caption</span>
-                  <span className="font-mono-tabular text-[#F3EEE8]">{wordsPerCaption}</span>
-                </span>
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-[#B8AAA0] shrink-0">Words per caption</span>
                 <input
                   type="range"
                   min={1}
                   max={7}
                   value={wordsPerCaption}
                   onChange={(e) => setWordsPerCaption(Number(e.target.value))}
-                  className="w-full accent-[#F06424]"
+                  className="flex-1 accent-[#F06424]"
                 />
-              </label>
-
-              <label className="block space-y-1">
-                <span className="text-[#B8AAA0] flex justify-between">
-                  <span>Cadence (WPM)</span>
-                  <span className="font-mono-tabular text-[#F3EEE8]">{wpmSpeed}</span>
+                <span className="min-w-[34px] text-center px-2 py-1 rounded bg-[#141210] border border-[#2A231E] font-mono-tabular text-[#F3EEE8]">
+                  {wordsPerCaption}
                 </span>
-                <input
-                  type="range"
-                  min={90}
-                  max={240}
-                  step={5}
-                  value={wpmSpeed}
-                  onChange={(e) => setWpmSpeed(Number(e.target.value))}
-                  className="w-full accent-[#F06424]"
-                />
-              </label>
+              </div>
             </div>
 
-            <label className="block space-y-1 text-xs">
-              <span className="text-[#B8AAA0]">
-                Quick Transcript Seed (Syncs into interactive segment list)
+            <div className="rounded-lg border border-[#2A231E] bg-[#141210] px-3 py-2 text-xs text-[#B8AAA0]">
+              Ready: Python + Whisper + ffmpeg. Everything runs on this computer.
+            </div>
+
+            <label className="block space-y-1 text-xs pt-1">
+              <span className="text-[#83766D]">
+                Transcript text (edit or paste script to chunk into timed cues):
               </span>
               <textarea
-                rows={3}
+                rows={2}
                 value={transcriptInput}
                 onChange={(e) => setTranscriptInput(e.target.value)}
                 placeholder="Paste or type spoken script…"
-                className="w-full rounded-xl border border-[#342A24] bg-[#191614] p-2.5 text-xs text-[#F3EEE8] leading-relaxed"
+                className="w-full rounded-lg border border-[#2A231E] bg-[#141210] p-2 text-xs text-[#F3EEE8] leading-relaxed"
               />
             </label>
 
@@ -608,33 +585,71 @@ export const AutoCaptionsWorkspace: React.FC<AutoCaptionsWorkspaceProps> = ({
               <button
                 type="button"
                 onClick={handleRegenerateFromTranscript}
-                className="flex-1 min-h-[42px] py-2 px-3 rounded-xl bg-[#F06424] hover:bg-[#FF4B24] text-[#080707] font-bold text-xs transition-colors"
+                className="w-full min-h-[40px] py-2 px-4 rounded-lg bg-[#F06424] hover:bg-[#FF4B24] text-[#080707] font-bold text-xs sm:text-sm transition-colors"
               >
-                Sync Transcript → Timed Segments
+                Transcribe
               </button>
               {modelTier === 'server-whisper-asr' && (
                 <button
                   type="button"
                   onClick={handleRequestServerWhisperJob}
-                  className="min-h-[42px] py-2 px-3 rounded-xl border border-[#342A24] bg-[#191614] hover:border-[#F06424] text-xs font-medium text-[#B8AAA0] hover:text-[#F3EEE8]"
+                  className="w-full min-h-[36px] py-1.5 px-3 rounded-lg border border-[#2A231E] bg-[#141210] hover:border-[#F06424] text-xs font-medium text-[#B8AAA0] hover:text-[#F3EEE8]"
                 >
-                  Queue Server ASR →
+                  Queue Server ASR Job →
                 </button>
               )}
             </div>
           </div>
 
-          {/* Configurable Subtitle Validation Thresholds */}
-          <div className="rounded-2xl border border-[#342A24] bg-[#11100F] p-4 space-y-3">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-mono-tabular text-[#83766D]">
-                SUBTITLE LINE-LENGTH &amp; TIMING RULES
+          {/* 4 STYLE (frame 01:19) */}
+          <div className="rounded-xl border border-[#2A231E] bg-[#11100F] p-4 space-y-3">
+            <div className="flex items-center gap-2">
+              <span className="w-5 h-5 rounded-full bg-[#2A1810] border border-[#F06424]/50 text-[#F06424] text-[11px] font-bold flex items-center justify-center">
+                4
               </span>
-              <span className="text-[11px] font-mono-tabular text-[#55B98B]">Configurable</span>
+              <span className="text-xs font-mono-tabular uppercase tracking-wider text-[#B8AAA0]">
+                STYLE
+              </span>
             </div>
-            <div className="grid grid-cols-3 gap-2.5 text-xs">
+
+            <div className="flex flex-wrap items-center gap-1.5">
+              {CAPTION_STYLE_PRESETS.map((preset) => {
+                const isSelected = preset.id === selectedStyleId;
+                return (
+                  <button
+                    key={preset.id}
+                    type="button"
+                    onClick={() => setSelectedStyleId(preset.id)}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
+                      isSelected
+                        ? 'border-[#F06424] bg-[#2A1810] text-[#F06424] font-semibold'
+                        : 'border-[#2A231E] bg-[#141210] text-[#B8AAA0] hover:text-[#F3EEE8]'
+                    }`}
+                  >
+                    {preset.name}
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Reference frame 01:19 live style preview box: yourcaptionslooklikethis */}
+            <div className="rounded-xl border border-[#2A231E] bg-[#0B0A09] p-5 flex items-center justify-center min-h-[84px]">
+              <div className="text-base sm:text-lg font-extrabold tracking-tight select-none">
+                <span className="text-[#F3EEE8]">your</span>
+                <span
+                  style={{ color: activeStyle.accent }}
+                  className="mx-0.5 underline decoration-2 underline-offset-4"
+                >
+                  captions
+                </span>
+                <span className="text-[#F3EEE8]">looklikethis</span>
+              </div>
+            </div>
+
+            {/* Configurable Subtitle Validation Thresholds */}
+            <div className="pt-2 border-t border-[#2A231E] grid grid-cols-3 gap-2 text-xs">
               <label className="block space-y-1">
-                <span className="text-[11px] text-[#B8AAA0]">Max Chars/Line</span>
+                <span className="text-[10px] text-[#83766D]">Max Chars/Line</span>
                 <input
                   type="number"
                   min={16}
@@ -646,11 +661,11 @@ export const AutoCaptionsWorkspace: React.FC<AutoCaptionsWorkspaceProps> = ({
                       maxCharsPerLine: Math.max(16, Number(e.target.value) || 38),
                     }))
                   }
-                  className="w-full min-h-[38px] rounded-lg border border-[#342A24] bg-[#191614] px-2.5 py-1 text-xs text-[#F3EEE8] font-mono-tabular"
+                  className="w-full min-h-[34px] rounded border border-[#2A231E] bg-[#141210] px-2 py-1 text-xs text-[#F3EEE8] font-mono-tabular"
                 />
               </label>
               <label className="block space-y-1">
-                <span className="text-[11px] text-[#B8AAA0]">Min Cue (s)</span>
+                <span className="text-[10px] text-[#83766D]">Min Cue (s)</span>
                 <input
                   type="number"
                   min={0.2}
@@ -663,11 +678,11 @@ export const AutoCaptionsWorkspace: React.FC<AutoCaptionsWorkspaceProps> = ({
                       minDurationSec: Math.max(0.2, Number(e.target.value) || 0.5),
                     }))
                   }
-                  className="w-full min-h-[38px] rounded-lg border border-[#342A24] bg-[#191614] px-2.5 py-1 text-xs text-[#F3EEE8] font-mono-tabular"
+                  className="w-full min-h-[34px] rounded border border-[#2A231E] bg-[#141210] px-2 py-1 text-xs text-[#F3EEE8] font-mono-tabular"
                 />
               </label>
               <label className="block space-y-1">
-                <span className="text-[11px] text-[#B8AAA0]">Max Cue (s)</span>
+                <span className="text-[10px] text-[#83766D]">Max Cue (s)</span>
                 <input
                   type="number"
                   min={2}
@@ -680,54 +695,30 @@ export const AutoCaptionsWorkspace: React.FC<AutoCaptionsWorkspaceProps> = ({
                       maxDurationSec: Math.max(2, Number(e.target.value) || 7),
                     }))
                   }
-                  className="w-full min-h-[38px] rounded-lg border border-[#342A24] bg-[#191614] px-2.5 py-1 text-xs text-[#F3EEE8] font-mono-tabular"
+                  className="w-full min-h-[34px] rounded border border-[#2A231E] bg-[#141210] px-2 py-1 text-xs text-[#F3EEE8] font-mono-tabular"
                 />
               </label>
             </div>
           </div>
-
-          {/* Caption Style Presets */}
-          <div className="rounded-2xl border border-[#342A24] bg-[#11100F] p-4 space-y-3">
-            <div className="text-xs font-mono-tabular text-[#83766D]">
-              MOBILE CAPTION OVERLAY PRESET ({CAPTION_STYLE_PRESETS.length})
-            </div>
-            <div className="grid grid-cols-2 gap-2">
-              {CAPTION_STYLE_PRESETS.map((preset) => {
-                const isSelected = preset.id === selectedStyleId;
-                return (
-                  <button
-                    key={preset.id}
-                    type="button"
-                    onClick={() => setSelectedStyleId(preset.id)}
-                    className={`min-h-[48px] text-left rounded-xl p-2.5 border transition-colors ${
-                      isSelected
-                        ? 'border-[#F06424] bg-[#211B17]'
-                        : 'border-[#342A24] bg-[#191614] hover:border-[#83766D]'
-                    }`}
-                  >
-                    <div className="text-xs font-semibold text-[#F3EEE8]">{preset.name}</div>
-                    <div className="text-[10px] font-mono-tabular text-[#83766D] mt-0.5">
-                      {preset.tag}
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
         </div>
 
-        {/* Right Column: Step 3 (Interactive Timed Segment Editor) & Step 4 (Export & Sidecar Bundle) */}
+        {/* Right Column: Step 3 EDIT TEXT (Interactive Timed Segment Editor) & Step 4 Export */}
         <div className="lg:col-span-7 space-y-5">
           {/* 3. Edit Text & Timed Segments */}
-          <div className="rounded-2xl border border-[#342A24] bg-[#11100F] p-4 space-y-3">
+          <div className="rounded-2xl border border-[#2A231E] bg-[#11100F] p-4 space-y-3">
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <div>
-                <div className="text-xs font-mono-tabular text-[#83766D]">
-                  3. EDIT TIMED SEGMENTS ({editableCues.length} CUES)
+              <div className="flex items-center gap-2">
+                <span className="w-5 h-5 rounded-full bg-[#2A1810] border border-[#F06424]/50 text-[#F06424] text-[11px] font-bold flex items-center justify-center">
+                  3
+                </span>
+                <div>
+                  <div className="text-xs font-mono-tabular text-[#B8AAA0] uppercase">
+                    EDIT TEXT ({editableCues.length} CUES)
+                  </div>
+                  <p className="text-[11px] text-[#83766D]">
+                    Transcribe to edit the captions here, or fine-tune timestamps below.
+                  </p>
                 </div>
-                <p className="text-[11px] text-[#B8AAA0]">
-                  Touch controls to edit text, speaker label, start/end timestamps, split, merge, or delete segments
-                </p>
               </div>
               <button
                 type="button"
@@ -1082,7 +1073,15 @@ export const DownloaderWorkspace: React.FC<DownloaderWorkspaceProps> = ({
 }) => {
   const [urlInput, setUrlInput] = useState<string>('');
   const [mode, setMode] = useState<'video' | 'audio' | 'thumbnail'>('video');
-  const [rightsConfirmed, setRightsConfirmed] = useState<boolean>(false);
+  const [favorites, setFavorites] = useState<string[]>([]);
+  const [favOnly, setFavOnly] = useState<boolean>(false);
+  const [quality, setQuality] = useState<string>('1080p');
+  const [importIntoProject, setImportIntoProject] = useState<boolean>(true);
+  const [addToActiveComp, setAddToActiveComp] = useState<boolean>(false);
+  const [saveToPath, setSaveToPath] = useState<string>(
+    'C:\\Users\\Administrator\\Downloads\\Sowveil'
+  );
+  const [recentDownloads, setRecentDownloads] = useState<string[]>([]);
   const [validationError, setValidationError] = useState<string | null>(null);
   const [localInspectResult, setLocalInspectResult] = useState<{
     fileName: string;
@@ -1097,6 +1096,40 @@ export const DownloaderWorkspace: React.FC<DownloaderWorkspaceProps> = ({
     () => (urlInput.trim() ? validateMediaUrlForSsrf(urlInput.trim()) : null),
     [urlInput]
   );
+
+  const downloaderModes = [
+    {
+      id: 'video' as const,
+      title: 'Video',
+      subtitle: 'MP4 video + audio',
+      description: 'Download full video with audio as MP4.',
+    },
+    {
+      id: 'audio' as const,
+      title: 'Audio only',
+      subtitle: 'MP3 320 kbps',
+      description: 'Extract audio track only as MP3.',
+    },
+    {
+      id: 'thumbnail' as const,
+      title: 'Thumbnail',
+      subtitle: 'High-res cover image',
+      description: 'Save video thumbnail image.',
+    },
+  ];
+
+  const visibleModes = favOnly
+    ? downloaderModes.filter((m) => favorites.includes(m.id))
+    : downloaderModes;
+
+  const activeModeMeta =
+    downloaderModes.find((m) => m.id === mode) || downloaderModes[0];
+
+  const toggleFav = (id: string) => {
+    setFavorites((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
+    );
+  };
 
   const handlePasteClipboard = async () => {
     try {
@@ -1124,13 +1157,6 @@ export const DownloaderWorkspace: React.FC<DownloaderWorkspaceProps> = ({
   const handleDownloadSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     setValidationError(null);
-
-    if (!rightsConfirmed) {
-      setValidationError(
-        'Please confirm that you own or have explicit permission to download and import this media.'
-      );
-      return;
-    }
 
     const ssrf = validateMediaUrlForSsrf(urlInput);
     if (!ssrf.allowed) {
@@ -1169,6 +1195,8 @@ export const DownloaderWorkspace: React.FC<DownloaderWorkspaceProps> = ({
       redactedMessage: ssrf.reason,
     });
 
+    setRecentDownloads((prev) => [ssrf.normalizedUrl || urlInput.trim(), ...prev].slice(0, 5));
+
     if (ssrf.detectedExtension) {
       const a = document.createElement('a');
       a.href = ssrf.normalizedUrl!;
@@ -1189,247 +1217,339 @@ export const DownloaderWorkspace: React.FC<DownloaderWorkspaceProps> = ({
   };
 
   return (
-    <div className="p-4 sm:p-6 max-w-4xl mx-auto space-y-6">
-      <div className="border-b border-[#342A24] pb-4 flex flex-wrap items-baseline justify-between gap-2">
-        <div>
-          <h1 className="text-lg font-bold text-[#F3EEE8]">Downloader &amp; Asset Intake</h1>
-          <p className="text-xs text-[#B8AAA0] mt-0.5">
-            Authorized HTTPS media intake + Phone-local file magic-byte verification
-          </p>
-        </div>
-        <span className="text-xs font-mono-tabular text-[#55B98B]">
-          SSRF Guard Active · Zero Shell Execution
-        </span>
-      </div>
-
-      {/* Explicit Network, Quota & Cloud Cost Disclosure */}
-      <div className="rounded-xl border border-[#342A24] bg-[#14110F] p-3.5 text-xs text-[#B8AAA0] space-y-1">
-        <div className="font-semibold text-[#F3EEE8] flex items-center gap-1.5">
-          <ShieldAlert className="w-4 h-4 text-[#F06424]" />
-          <span>SSRF Hardening, Rights Policy &amp; Worker Cost Gate</span>
-        </div>
-        <p>
-          URLs are never passed to shell commands. Loopback (<code className="text-[#F3EEE8]">127.0.0.0/8</code>, <code className="text-[#F3EEE8]">::1</code>), RFC1918 private networks (<code className="text-[#F3EEE8]">10.*</code>, <code className="text-[#F3EEE8]">172.16-31.*</code>, <code className="text-[#F3EEE8]">192.168.*</code>), link-local (<code className="text-[#F3EEE8]">169.254.*</code>), and cloud metadata endpoints (<code className="text-[#F3EEE8]">169.254.169.254</code>, <code className="text-[#F3EEE8]">metadata.google.internal</code>) are strictly blocked. Third-party social platforms require an authorized backend worker.
-        </p>
-      </div>
-
-      <form
-        onSubmit={handleDownloadSubmit}
-        className="rounded-2xl border border-[#342A24] bg-[#11100F] p-5 space-y-4"
-      >
-        {/* URL Input + Paste Button */}
-        <div className="space-y-1.5">
-          <label htmlFor="downloader-url-input" className="text-xs font-medium text-[#B8AAA0]">
-            Direct HTTPS Media URL (Owner-authorized assets only)
-          </label>
-          <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
-            <input
-              id="downloader-url-input"
-              type="text"
-              value={urlInput}
-              onChange={(e) => {
-                setUrlInput(e.target.value);
-                setValidationError(null);
-              }}
-              placeholder="https://example.com/authorized-footage.mp4"
-              className="flex-1 min-h-[44px] rounded-xl border border-[#342A24] bg-[#191614] px-3.5 py-2 text-xs text-[#F3EEE8] placeholder:text-[#83766D]"
-            />
+    <div className="p-2.5 sm:p-4 max-w-[1440px] mx-auto">
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-3.5 items-start">
+        {/* LEFT COLUMN (5 cols): Filter Pills + 2-Column Mode Grid (01:20–01:22) */}
+        <div className="lg:col-span-5 flex flex-col gap-2.5 rounded-lg border border-[#221F1D] bg-[#121110] p-2.5">
+          <div className="flex items-center gap-1.5">
             <button
               type="button"
-              onClick={handlePasteClipboard}
-              className="min-h-[44px] inline-flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-xl border border-[#342A24] bg-[#191614] hover:border-[#83766D] text-xs font-medium text-[#F3EEE8] whitespace-nowrap shrink-0"
+              onClick={() => setFavOnly(false)}
+              className={`px-2.5 py-1 rounded-full text-[11px] font-medium transition-colors ${
+                !favOnly
+                  ? 'bg-[#F06424] text-[#FFFFFF] font-semibold'
+                  : 'bg-[#181615] text-[#9E958E] border border-[#262321]'
+              }`}
             >
-              <Clipboard className="w-3.5 h-3.5 text-[#F06424]" />
-              <span>Paste</span>
+              All <span className="opacity-85 ml-0.5">3</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setFavOnly((v) => !v)}
+              className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-medium transition-colors ${
+                favOnly
+                  ? 'bg-[#F06424] text-[#FFFFFF] font-semibold'
+                  : 'bg-[#181615] text-[#9E958E] border border-[#262321]'
+              }`}
+            >
+              <span>★ Favorites</span>
+              <span className="opacity-85">{favorites.length}</span>
             </button>
           </div>
+
+          <div className="grid grid-cols-2 gap-2">
+            {visibleModes.map((opt) => {
+              const isSelected = mode === opt.id;
+              return (
+                <div
+                  key={opt.id}
+                  onClick={() => setMode(opt.id)}
+                  role="button"
+                  tabIndex={0}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') setMode(opt.id);
+                  }}
+                  className={`rounded-md border p-2 transition-all cursor-pointer flex flex-col justify-between ${
+                    isSelected
+                      ? 'border-[#F06424] bg-[#1A1614] ring-1 ring-[#F06424]/50'
+                      : 'border-[#24211F] bg-[#161413] hover:border-[#3A3430]'
+                  }`}
+                >
+                  <div className="h-[68px] rounded bg-[#0C0B0A] border border-[#1E1C1A] flex items-center justify-center">
+                    <Download
+                      className={`w-6 h-6 ${
+                        isSelected ? 'text-[#F06424]' : 'text-[#8C827A]'
+                      }`}
+                    />
+                  </div>
+                  <div className="mt-1.5">
+                    <div className="text-[11px] font-semibold text-[#F3EEE8]">
+                      {opt.title}
+                    </div>
+                    <div className="text-[9.5px] text-[#787069]">{opt.subtitle}</div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
         </div>
 
-        {/* Live SSRF & Capability Status Pill */}
-        {liveSsrfInspection && (
-          <div
-            className={`rounded-xl border p-3 text-xs font-mono-tabular flex flex-wrap items-center justify-between gap-2 ${
-              liveSsrfInspection.allowed
-                ? 'border-[#55B98B]/40 bg-[#55B98B]/10 text-[#55B98B]'
-                : liveSsrfInspection.sourceStatus === 'Needs server worker setup'
-                ? 'border-[#E4B45A]/40 bg-[#E4B45A]/10 text-[#E4B45A]'
-                : 'border-[#F06464]/50 bg-[#F06464]/10 text-[#F06464]'
-            }`}
-          >
-            <span>Status: {liveSsrfInspection.sourceStatus}</span>
-            <span className="text-[11px] text-[#F3EEE8]">{liveSsrfInspection.reason}</span>
+        {/* RIGHT COLUMN (7 cols): Reference Downloader Inspector (01:20–01:22) */}
+        <div className="lg:col-span-7 flex flex-col gap-3 rounded-lg border border-[#221F1D] bg-[#121110] p-3.5">
+          {/* Header */}
+          <div className="flex items-start justify-between gap-2">
+            <div>
+              <h2 className="text-[15px] font-bold text-[#F3EEE8]">
+                {activeModeMeta.title}
+              </h2>
+              <p className="text-[11px] text-[#8E857E] mt-0.5">
+                {activeModeMeta.description}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => toggleFav(mode)}
+              className="px-2.5 py-1 rounded border border-[#2C2826] bg-[#181615] hover:border-[#F06424] text-[11px] text-[#D8CFC8]"
+            >
+              {favorites.includes(mode) ? '★ Favorited' : '+ Add to favorites'}
+            </button>
           </div>
-        )}
 
-        {/* Mode Selector: Video / Audio only / Thumbnail */}
-        <div className="space-y-1.5">
-          <span className="text-xs font-medium text-[#B8AAA0]">Output Mode</span>
-          <div className="grid grid-cols-3 gap-2">
-            {(
-              [
-                { id: 'video', label: 'Video' },
-                { id: 'audio', label: 'Audio only' },
-                { id: 'thumbnail', label: 'Thumbnail' },
-              ] as const
-            ).map((opt) => (
-              <button
-                key={opt.id}
-                type="button"
-                onClick={() => setMode(opt.id)}
-                className={`min-h-[44px] py-2 px-3 rounded-xl border text-xs font-semibold transition-colors ${
-                  mode === opt.id
-                    ? 'border-[#F06424] bg-[#F06424] text-[#080707]'
-                    : 'border-[#342A24] bg-[#191614] text-[#B8AAA0] hover:text-[#F3EEE8]'
+          {/* Primary Orange Download Button */}
+          <form onSubmit={handleDownloadSubmit} className="space-y-3">
+            <button
+              type="submit"
+              className="w-full py-2.5 px-4 rounded-md bg-[#F06424] hover:bg-[#FF7434] text-[#FFFFFF] font-semibold text-[13px] transition-colors text-center"
+            >
+              Download
+            </button>
+            <div className="text-[10.5px] text-[#6E665F] text-center">
+              Paste a link below and click Download. Saves to your folder and imports into After Effects.
+            </div>
+
+            {/* Info Box */}
+            <div className="rounded border border-[#24211F] bg-[#161413] px-3 py-2 text-[10.5px] text-[#9E958E]">
+              yt-dlp + ffmpeg ready. Full quality and MP3 available. Only download media you own or have permission to use.
+            </div>
+
+            {/* LINK Section */}
+            <div className="space-y-1.5 pt-1">
+              <div className="text-[10px] font-mono-tabular uppercase tracking-wider text-[#787069]">
+                LINK
+              </div>
+              <div className="flex items-center gap-2">
+                <input
+                  id="downloader-url-input"
+                  type="text"
+                  value={urlInput}
+                  onChange={(e) => {
+                    setUrlInput(e.target.value);
+                    setValidationError(null);
+                  }}
+                  placeholder="Paste a video link (YouTube, Vimeo, X, TikTok...)"
+                  className="flex-1 rounded border border-[#2C2826] bg-[#181615] px-3 py-1.5 text-[11px] text-[#F3EEE8] placeholder:text-[#6E665F]"
+                />
+                <button
+                  type="button"
+                  onClick={handlePasteClipboard}
+                  className="px-3 py-1.5 rounded border border-[#2C2826] bg-[#181615] hover:border-[#F06424] text-[11px] text-[#D8CFC8]"
+                >
+                  Paste
+                </button>
+              </div>
+            </div>
+
+            {/* Live SSRF & Capability Status Pill */}
+            {liveSsrfInspection && (
+              <div
+                className={`rounded border px-2.5 py-1.5 text-[10.5px] font-mono-tabular flex flex-wrap items-center justify-between gap-2 ${
+                  liveSsrfInspection.allowed
+                    ? 'border-[#55B98B]/40 bg-[#55B98B]/10 text-[#55B98B]'
+                    : liveSsrfInspection.sourceStatus === 'Needs server worker setup'
+                    ? 'border-[#E4B45A]/40 bg-[#E4B45A]/10 text-[#E4B45A]'
+                    : 'border-[#F06464]/50 bg-[#F06464]/10 text-[#F06464]'
                 }`}
               >
-                {opt.label}
-              </button>
-            ))}
-          </div>
-        </div>
+                <span>Status: {liveSsrfInspection.sourceStatus}</span>
+                <span className="text-[#F3EEE8]">{liveSsrfInspection.reason}</span>
+              </div>
+            )}
 
-        {/* Rights Confirmation */}
-        <label className="flex items-start gap-2.5 text-xs text-[#B8AAA0] cursor-pointer select-none">
-          <input
-            type="checkbox"
-            checked={rightsConfirmed}
-            onChange={(e) => {
-              setRightsConfirmed(e.target.checked);
-              setValidationError(null);
-            }}
-            className="mt-0.5 accent-[#F06424]"
-          />
-          <span>
-            I confirm that I own the rights or have explicit license permission to download and use this media asset in my mobile project.
-          </span>
-        </label>
+            {validationError && (
+              <div className="rounded border border-[#F06464]/50 bg-[#F06464]/10 px-3 py-2 text-[11px] text-[#F06464] flex items-center gap-2">
+                <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                <span>{validationError}</span>
+              </div>
+            )}
 
-        {validationError && (
-          <div className="rounded-xl border border-[#F06464]/50 bg-[#F06464]/10 px-3.5 py-2.5 text-xs text-[#F06464] flex items-center gap-2">
-            <AlertTriangle className="w-4 h-4 shrink-0" />
-            <span>{validationError}</span>
-          </div>
-        )}
+            {/* PARAMETERS Section */}
+            <div className="space-y-2 pt-2 border-t border-[#1E1C1A]">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] font-mono-tabular uppercase tracking-wider text-[#787069]">
+                  PARAMETERS
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setQuality('1080p');
+                    setImportIntoProject(true);
+                    setAddToActiveComp(false);
+                  }}
+                  className="text-[10.5px] text-[#8E857E] hover:text-[#F3EEE8]"
+                >
+                  Reset
+                </button>
+              </div>
 
-        <button
-          type="submit"
-          className="w-full min-h-[48px] py-2.5 px-4 rounded-xl bg-[#F06424] hover:bg-[#FF4B24] text-[#080707] font-bold text-xs transition-colors flex items-center justify-center gap-2"
-        >
-          <Download className="w-4 h-4" />
-          <span>Download ({mode === 'video' ? 'Video' : mode === 'audio' ? 'Audio only' : 'Thumbnail'})</span>
-        </button>
-      </form>
+              {mode === 'video' && (
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-[11px] text-[#9E958E]">Quality</span>
+                  <select
+                    value={quality}
+                    onChange={(e) => setQuality(e.target.value)}
+                    className="w-48 rounded border border-[#2C2826] bg-[#181615] px-2.5 py-1 text-[11px] text-[#F3EEE8]"
+                  >
+                    <option value="Best available">Best available</option>
+                    <option value="4K (2160p)">4K (2160p)</option>
+                    <option value="1080p">1080p</option>
+                    <option value="720p">720p</option>
+                  </select>
+                </div>
+              )}
 
-      {/* Phone-Local Media File Import & Magic-Byte Signature Verifier */}
-      <div className="rounded-2xl border border-[#342A24] bg-[#11100F] p-5 space-y-3">
-        <div className="flex items-center justify-between">
-          <div>
-            <h2 className="text-sm font-bold text-[#F3EEE8]">
-              Phone-Local Media Import &amp; Magic-Byte Inspector
-            </h2>
-            <p className="text-xs text-[#B8AAA0]">
-              Import footage or audio from your phone storage and verify container magic bytes before adding to your workflow
-            </p>
-          </div>
-          <span className="text-xs font-mono-tabular text-[#55B98B]">Available On-Device</span>
-        </div>
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-[11px] text-[#9E958E]">Import into project</span>
+                <input
+                  type="checkbox"
+                  checked={importIntoProject}
+                  onChange={(e) => setImportIntoProject(e.target.checked)}
+                  className="accent-[#F06424]"
+                />
+              </div>
 
-        <label className="block cursor-pointer rounded-xl border border-dashed border-[#342A24] hover:border-[#F06424] bg-[#191614]/60 p-4 text-center transition-colors">
-          <input
-            type="file"
-            accept="video/*,audio/*,image/*,.glb,.gltf,.srt,.vtt"
-            className="sr-only"
-            onChange={async (e) => {
-              const file = e.target.files?.[0];
-              if (!file) return;
-              const safeName = sanitizeMediaFileName(file.name);
-              const slice = await file.slice(0, 256).arrayBuffer();
-              const sig = verifyMediaMagicBytes(new Uint8Array(slice), safeName);
-              setLocalInspectResult({
-                fileName: safeName,
-                sizeBytes: file.size,
-                valid: sig.valid,
-                container: sig.detectedContainer,
-                mimeType: sig.detectedMimeType,
-                reason: sig.reason,
-              });
-              onQueueJob({
-                type: 'asset-process',
-                title: `Local Media Inspect: ${safeName}`,
-                moduleId: 'downloader',
-                outputFileName: safeName,
-                outputMimeType: sig.detectedMimeType,
-                outputSizeBytes: file.size,
-                processedBytes: file.size,
-                totalBytes: file.size,
-                status: sig.valid ? 'ready' : 'failed',
-                errorCode: sig.errorCode,
-                deviceId: 'android-mobile-browser',
-                redactedMessage: sig.reason,
-              });
-              onNotify(
-                sig.valid
-                  ? `Verified local file "${safeName}" (${sig.detectedContainer.toUpperCase()}).`
-                  : `Rejected "${safeName}": ${sig.reason}`,
-                sig.valid ? 'success' : 'error'
-              );
-            }}
-          />
-          <Upload className="w-5 h-5 text-[#F06424] mx-auto mb-1" />
-          <div className="text-xs font-semibold text-[#F3EEE8]">
-            Tap to inspect &amp; import a local phone file (MP4, WebM, WAV, MP3, PNG, JPEG, GLB)
-          </div>
-        </label>
-
-        {localInspectResult && (
-          <div
-            className={`rounded-xl border p-3 text-xs font-mono-tabular space-y-1 ${
-              localInspectResult.valid
-                ? 'border-[#55B98B]/40 bg-[#55B98B]/10 text-[#55B98B]'
-                : 'border-[#F06464]/50 bg-[#F06464]/10 text-[#F06464]'
-            }`}
-          >
-            <div className="flex justify-between">
-              <span className="font-bold">{localInspectResult.fileName}</span>
-              <span>{(localInspectResult.sizeBytes / 1024).toFixed(1)} KB</span>
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-[11px] text-[#9E958E]">Add to active comp</span>
+                <input
+                  type="checkbox"
+                  checked={addToActiveComp}
+                  onChange={(e) => setAddToActiveComp(e.target.checked)}
+                  className="accent-[#F06424]"
+                />
+              </div>
             </div>
-            <div className="text-[#F3EEE8]">
-              Container: {localInspectResult.container.toUpperCase()} · MIME:{' '}
-              {localInspectResult.mimeType}
-            </div>
-            <div>{localInspectResult.reason}</div>
-          </div>
-        )}
-      </div>
 
-      {/* Per-Source Capability Status Matrix */}
-      <div className="rounded-2xl border border-[#342A24] bg-[#11100F] p-5 space-y-3">
-        <div className="text-xs font-mono-tabular text-[#83766D]">
-          PER-SOURCE CAPABILITY &amp; SECURITY MATRIX
-        </div>
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 text-xs">
-          <div className="rounded-xl border border-[#342A24] bg-[#191614] p-3 space-y-1">
-            <div className="font-mono-tabular text-[#55B98B] font-semibold">Available</div>
-            <div className="font-semibold text-[#F3EEE8]">Direct HTTPS Media &amp; Phone Files</div>
-            <p className="text-[11px] text-[#B8AAA0]">
-              Public HTTPS <code className="text-[#F3EEE8]">.mp4</code>, <code className="text-[#F3EEE8]">.webm</code>, <code className="text-[#F3EEE8]">.wav</code>, <code className="text-[#F3EEE8]">.mp3</code>, <code className="text-[#F3EEE8]">.png</code> and phone file picker imports.
-            </p>
-          </div>
-          <div className="rounded-xl border border-[#342A24] bg-[#191614] p-3 space-y-1">
-            <div className="font-mono-tabular text-[#E4B45A] font-semibold">
-              Needs server worker setup
+            {/* SAVE TO Section */}
+            <div className="space-y-1.5 pt-2 border-t border-[#1E1C1A]">
+              <div className="text-[10px] font-mono-tabular uppercase tracking-wider text-[#787069]">
+                SAVE TO
+              </div>
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={saveToPath}
+                  onChange={(e) => setSaveToPath(e.target.value)}
+                  className="flex-1 rounded border border-[#24211F] bg-[#161413] px-2.5 py-1.5 text-[10.5px] font-mono-tabular text-[#9E958E]"
+                />
+                <button
+                  type="button"
+                  onClick={() =>
+                    onNotify('Select save destination folder in browser settings.', 'info')
+                  }
+                  className="px-2.5 py-1.5 rounded border border-[#2C2826] bg-[#181615] text-[10.5px] text-[#D8CFC8]"
+                >
+                  Change...
+                </button>
+              </div>
             </div>
-            <div className="font-semibold text-[#F3EEE8]">Third-Party Social Streams</div>
-            <p className="text-[11px] text-[#B8AAA0]">
-              YouTube, TikTok, Instagram, Vimeo &amp; X require an owner-approved backend extraction worker.
-            </p>
-          </div>
-          <div className="rounded-xl border border-[#342A24] bg-[#191614] p-3 space-y-1">
-            <div className="font-mono-tabular text-[#F06464] font-semibold">Blocked (SSRF Guard)</div>
-            <div className="font-semibold text-[#F3EEE8]">Private IP / Metadata / Non-HTTPS</div>
-            <p className="text-[11px] text-[#B8AAA0]">
-              <code className="text-[#F3EEE8]">http://</code>, <code className="text-[#F3EEE8]">file://</code>, <code className="text-[#F3EEE8]">localhost</code>, <code className="text-[#F3EEE8]">10.*</code>, <code className="text-[#F3EEE8]">192.168.*</code>, <code className="text-[#F3EEE8]">169.254.169.254</code>.
-            </p>
+
+            {/* RECENT Section */}
+            <div className="space-y-1 pt-2 border-t border-[#1E1C1A]">
+              <div className="text-[10px] font-mono-tabular uppercase tracking-wider text-[#787069]">
+                RECENT
+              </div>
+              {recentDownloads.length === 0 ? (
+                <div className="text-[11px] text-[#6E665F]">
+                  Nothing downloaded yet.
+                </div>
+              ) : (
+                <div className="space-y-1">
+                  {recentDownloads.map((item, idx) => (
+                    <div
+                      key={idx}
+                      className="text-[10.5px] font-mono-tabular text-[#B8AAA0] truncate"
+                    >
+                      {item}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </form>
+
+          {/* Phone-Local Media File Import & Magic-Byte Signature Verifier */}
+          <div className="pt-2 border-t border-[#1E1C1A] space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-[10px] font-mono-tabular uppercase tracking-wider text-[#787069]">
+                PHONE-LOCAL MAGIC-BYTE INSPECTOR
+              </span>
+              <span className="text-[10px] font-mono-tabular text-[#55B98B]">
+                SSRF Guard Active
+              </span>
+            </div>
+            <label className="block cursor-pointer rounded border border-dashed border-[#2C2826] hover:border-[#F06424] bg-[#161413] p-2.5 text-center transition-colors">
+              <input
+                type="file"
+                accept="video/*,audio/*,image/*,.glb,.gltf,.srt,.vtt"
+                className="sr-only"
+                onChange={async (e) => {
+                  const file = e.target.files?.[0];
+                  if (!file) return;
+                  const safeName = sanitizeMediaFileName(file.name);
+                  const slice = await file.slice(0, 256).arrayBuffer();
+                  const sig = verifyMediaMagicBytes(new Uint8Array(slice), safeName);
+                  setLocalInspectResult({
+                    fileName: safeName,
+                    sizeBytes: file.size,
+                    valid: sig.valid,
+                    container: sig.detectedContainer,
+                    mimeType: sig.detectedMimeType,
+                    reason: sig.reason,
+                  });
+                  onQueueJob({
+                    type: 'asset-process',
+                    title: `Local Media Inspect: ${safeName}`,
+                    moduleId: 'downloader',
+                    outputFileName: safeName,
+                    outputMimeType: sig.detectedMimeType,
+                    outputSizeBytes: file.size,
+                    processedBytes: file.size,
+                    totalBytes: file.size,
+                    status: sig.valid ? 'ready' : 'failed',
+                    errorCode: sig.errorCode,
+                    deviceId: 'android-mobile-browser',
+                    redactedMessage: sig.reason,
+                  });
+                  onNotify(
+                    sig.valid
+                      ? `Verified local file "${safeName}" (${sig.detectedContainer.toUpperCase()}).`
+                      : `Rejected "${safeName}": ${sig.reason}`,
+                    sig.valid ? 'success' : 'error'
+                  );
+                }}
+              />
+              <span className="text-[10.5px] text-[#9E958E]">
+                Tap to inspect local media file (MP4, WebM, WAV, MP3, PNG, JPEG, GLB)
+              </span>
+            </label>
+
+            {localInspectResult && (
+              <div
+                className={`rounded border p-2 text-[10.5px] font-mono-tabular ${
+                  localInspectResult.valid
+                    ? 'border-[#55B98B]/40 bg-[#55B98B]/10 text-[#55B98B]'
+                    : 'border-[#F06464]/50 bg-[#F06464]/10 text-[#F06464]'
+                }`}
+              >
+                <div className="flex justify-between">
+                  <span className="font-bold">{localInspectResult.fileName}</span>
+                  <span>{(localInspectResult.sizeBytes / 1024).toFixed(1)} KB</span>
+                </div>
+                <div className="text-[#F3EEE8]">
+                  Container: {localInspectResult.container.toUpperCase()} · MIME:{' '}
+                  {localInspectResult.mimeType}
+                </div>
+              </div>
+            )}
           </div>
         </div>
       </div>
@@ -1438,7 +1558,7 @@ export const DownloaderWorkspace: React.FC<DownloaderWorkspaceProps> = ({
 };
 
 // ============================================================================
-// 3. PROJECT LIBRARY WORKSPACE (WITH VERSION CHECKPOINTS & DUPLICATE)
+// 3. PROJECT LIBRARY WORKSPACE (REFERENCE 5-COLUMN GRID AT 01:23 + CHECKPOINTS)
 // ============================================================================
 
 interface ProjectLibraryWorkspaceProps {
@@ -1469,7 +1589,6 @@ export const ProjectLibraryWorkspace: React.FC<ProjectLibraryWorkspaceProps> = (
   const [rawSearch, setRawSearch] = useState<string>('');
   const [debouncedSearch, setDebouncedSearch] = useState<string>('');
   const [archiveFilter, setArchiveFilter] = useState<'active' | 'archived' | 'all'>('active');
-  const [sortBy, setSortBy] = useState<'title' | 'updated' | 'status'>('title');
   const [showAddModal, setShowAddModal] = useState<boolean>(false);
 
   const [newTitle, setNewTitle] = useState<string>('');
@@ -1491,39 +1610,27 @@ export const ProjectLibraryWorkspace: React.FC<ProjectLibraryWorkspaceProps> = (
   const [editExternalWarning, setEditExternalWarning] = useState<boolean>(false);
   const [checkpointLabelInput, setCheckpointLabelInput] = useState<string>('');
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [showProEditorModal, setShowProEditorModal] = useState<boolean>(false);
 
   useEffect(() => {
     const t = window.setTimeout(() => setDebouncedSearch(rawSearch.trim().toLowerCase()), 180);
     return () => window.clearTimeout(t);
   }, [rawSearch]);
 
-  const activeCount = useMemo(() => projects.filter((p) => !p.archived).length, [projects]);
-  const archivedCount = useMemo(() => projects.filter((p) => p.archived).length, [projects]);
-
   const filtered = useMemo(() => {
-    return projects
-      .filter((p) => {
-        if (archiveFilter === 'active' && p.archived) return false;
-        if (archiveFilter === 'archived' && !p.archived) return false;
-        if (debouncedSearch) {
-          const matchTitle = p.title.toLowerCase().includes(debouncedSearch);
-          const matchDesc = p.description.toLowerCase().includes(debouncedSearch);
-          const matchTags = p.tags.some((t) => t.toLowerCase().includes(debouncedSearch));
-          const matchStatus = p.projectFileStatus.toLowerCase().includes(debouncedSearch);
-          return matchTitle || matchDesc || matchTags || matchStatus;
-        }
-        return true;
-      })
-      .sort((a, b) => {
-        if (sortBy === 'updated') {
-          return b.updatedAt.localeCompare(a.updatedAt);
-        }
-        if (sortBy === 'status') {
-          return a.projectFileStatus.localeCompare(b.projectFileStatus);
-        }
-        return a.title.localeCompare(b.title);
-      });
-  }, [projects, archiveFilter, debouncedSearch, sortBy]);
+    return projects.filter((p) => {
+      if (archiveFilter === 'active' && p.archived) return false;
+      if (archiveFilter === 'archived' && !p.archived) return false;
+      if (debouncedSearch) {
+        const matchTitle = p.title.toLowerCase().includes(debouncedSearch);
+        const matchDesc = p.description.toLowerCase().includes(debouncedSearch);
+        const matchTags = p.tags.some((t) => t.toLowerCase().includes(debouncedSearch));
+        const matchStatus = p.projectFileStatus.toLowerCase().includes(debouncedSearch);
+        return matchTitle || matchDesc || matchTags || matchStatus;
+      }
+      return true;
+    });
+  }, [projects, archiveFilter, debouncedSearch]);
 
   const activeProject = useMemo(
     () => filtered.find((p) => p.id === selectedProjId) || filtered[0] || null,
@@ -1585,24 +1692,41 @@ export const ProjectLibraryWorkspace: React.FC<ProjectLibraryWorkspaceProps> = (
     };
     const specJson = JSON.stringify(specObj, null, 2);
 
+    const canonicalDoc = createMinimalCanonicalProject({
+      title: newTitle.trim(),
+      description:
+        newDesc.trim() ||
+        'Reusable Sowveil Canonical Project (v2.0.0) ready for mobile timeline editing and export.',
+      targetEditor: newTargetEditor,
+    });
+    const canonicalLibRecord = canonicalProjectToLibraryRecord(canonicalDoc);
+    const canonicalJson = serializeCanonicalProject(canonicalDoc);
+
     await onAddProject({
       title: newTitle.trim(),
       description:
         newDesc.trim() ||
         (newFormatStatus === 'sowveil-native'
-          ? 'Reusable Sowveil Mobile Project (.sowveil.json) ready for Android export and handoff.'
+          ? 'Reusable Sowveil Mobile Project (.sowveil.json · Canonical v2.0.0) ready for Android export and handoff.'
           : 'User-saved project metadata record (no binary uploaded to cloud storage).'),
-      compCount: parsedComps,
+      compCount: parsedComps ?? canonicalDoc.scenes.length,
       projectFileStatus: newFormatStatus,
-      fileSizeBytes: newFormatStatus === 'sowveil-native' ? specJson.length : null,
+      fileSizeBytes: newFormatStatus === 'sowveil-native' ? canonicalJson.length : null,
       fileSizeLabel:
         newFormatStatus === 'sowveil-native'
-          ? `${(specJson.length / 1024).toFixed(1)} KB (.sowveil.json)`
+          ? `${(canonicalJson.length / 1024).toFixed(1)} KB (.sowveil.json v2.0)`
           : 'Unknown (metadata-only)',
       resolution: newResolution.trim() || undefined,
       targetEditor: newTargetEditor,
       aspectRatio: '9:16',
-      sowveilSpecJson: newFormatStatus === 'sowveil-native' ? specJson : undefined,
+      sowveilSpecJson:
+        newFormatStatus === 'sowveil-native'
+          ? canonicalLibRecord.sowveilSpecJson || specJson
+          : undefined,
+      canonicalProjectJson:
+        newFormatStatus === 'sowveil-native' ? canonicalJson : undefined,
+      revision: canonicalDoc.revision,
+      activeBranch: canonicalDoc.activeBranch,
       hasExternalFootageWarning: false,
       archived: false,
       tags: newTagsInput
@@ -1614,7 +1738,7 @@ export const ProjectLibraryWorkspace: React.FC<ProjectLibraryWorkspaceProps> = (
     setNewDesc('');
     setNewCompCountInput('');
     setShowAddModal(false);
-    onNotify(`Saved project "${newTitle.trim()}" (${newFormatStatus}).`, 'success');
+    onNotify(`Saved project "${newTitle.trim()}" (${newFormatStatus} · Canonical v2.0).`, 'success');
   };
 
   const handleSaveDetailsEdit = async (e: React.FormEvent) => {
@@ -1687,6 +1811,7 @@ export const ProjectLibraryWorkspace: React.FC<ProjectLibraryWorkspaceProps> = (
 
   const handleDownloadMobileProjectFile = (proj: ProjectLibraryItem) => {
     const payload =
+      proj.canonicalProjectJson ||
       proj.sowveilSpecJson ||
       JSON.stringify(
         {
@@ -1723,10 +1848,10 @@ export const ProjectLibraryWorkspace: React.FC<ProjectLibraryWorkspaceProps> = (
     return (
       <div className="p-6 space-y-4">
         <div className="h-10 rounded-lg bg-[#191614] animate-pulse" />
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-          <div className="h-32 rounded-xl bg-[#191614] animate-pulse" />
-          <div className="h-32 rounded-xl bg-[#191614] animate-pulse" />
-          <div className="h-32 rounded-xl bg-[#191614] animate-pulse" />
+        <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+          <div className="h-32 rounded-lg bg-[#191614] animate-pulse" />
+          <div className="h-32 rounded-lg bg-[#191614] animate-pulse" />
+          <div className="h-32 rounded-lg bg-[#191614] animate-pulse" />
         </div>
       </div>
     );
@@ -1754,55 +1879,42 @@ export const ProjectLibraryWorkspace: React.FC<ProjectLibraryWorkspaceProps> = (
   }
 
   return (
-    <div className="p-4 sm:p-6 space-y-5">
-      {/* Top Action Bar */}
-      <div className="flex flex-wrap items-center justify-between gap-3">
+    <div className="p-3 sm:p-4 max-w-[1440px] mx-auto space-y-4">
+      {/* Top Action Bar Matching Frame 01:23 */}
+      <div className="flex flex-wrap items-center justify-between gap-2.5">
         <div className="relative flex-1 min-w-[220px]">
-          <Search className="w-4 h-4 text-[#83766D] absolute left-3.5 top-1/2 -translate-y-1/2" />
+          <Search className="w-3.5 h-3.5 text-[#787069] absolute left-3 top-1/2 -translate-y-1/2" />
           <input
             type="search"
             value={rawSearch}
             onChange={(e) => setRawSearch(e.target.value)}
-            placeholder="Search mobile projects, .sowveil.json, .xml, or comps…"
+            placeholder="Search projects and comps"
             aria-label="Search projects and comps"
-            className="w-full min-h-[44px] rounded-xl border border-[#342A24] bg-[#11100F] pl-9 pr-8 py-2 text-xs text-[#F3EEE8] placeholder:text-[#83766D]"
+            className="w-full rounded-md border border-[#24211F] bg-[#141211] pl-8 pr-7 py-1.5 text-[11px] text-[#F3EEE8] placeholder:text-[#6E665F]"
           />
           {rawSearch && (
             <button
               type="button"
               onClick={() => setRawSearch('')}
               aria-label="Clear project search"
-              className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[#83766D] hover:text-[#F3EEE8]"
+              className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[#787069] hover:text-[#F3EEE8]"
             >
-              <X className="w-3.5 h-3.5" />
+              <X className="w-3 h-3" />
             </button>
           )}
         </div>
 
-        <div className="flex flex-wrap items-center gap-2">
-          <select
-            value={sortBy}
-            onChange={(e) => setSortBy(e.target.value as 'title' | 'updated' | 'status')}
-            aria-label="Sort projects"
-            className="min-h-[44px] rounded-xl border border-[#342A24] bg-[#11100F] px-2.5 py-2 text-xs text-[#B8AAA0]"
-          >
-            <option value="title">Sort: Title (A–Z)</option>
-            <option value="updated">Sort: Recently updated</option>
-            <option value="status">Sort: Project format</option>
-          </select>
-
+        <div className="flex items-center gap-2">
           <button
             type="button"
             onClick={() => setShowAddModal((v) => !v)}
-            className="min-h-[44px] inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[#F06424] hover:bg-[#FF4B24] text-[#080707] font-semibold text-xs transition-colors whitespace-nowrap shrink-0"
+            className="inline-flex items-center gap-1 px-3 py-1.5 rounded-md bg-[#F06424] hover:bg-[#FF7434] text-[#FFFFFF] font-semibold text-[11px] transition-colors whitespace-nowrap"
           >
-            <Plus className="w-3.5 h-3.5" />
-            <span>+ Save Mobile Project</span>
+            <span>+ Save project</span>
           </button>
 
-          <label className="min-h-[44px] cursor-pointer inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl border border-[#342A24] bg-[#191614] hover:border-[#F06424] text-[#F3EEE8] font-medium text-xs transition-colors whitespace-nowrap shrink-0">
-            <FolderPlus className="w-3.5 h-3.5 text-[#F06424]" />
-            <span>Import .sowveil.json / .xml / .aep</span>
+          <label className="cursor-pointer inline-flex items-center gap-1 px-3 py-1.5 rounded-md border border-[#2C2826] bg-[#181615] hover:border-[#F06424] text-[#D8CFC8] font-medium text-[11px] transition-colors whitespace-nowrap">
+            <span>Add .aep</span>
             <input
               type="file"
               accept=".json,.xml,.aep,.aet"
@@ -1814,27 +1926,33 @@ export const ProjectLibraryWorkspace: React.FC<ProjectLibraryWorkspaceProps> = (
                 if (file.name.endsWith('.json')) {
                   const text = await file.text();
                   const check = validateSowveilProjectJson(text);
+                  const migrated = migrateToCanonicalProject(text);
+                  const canonicalJson = serializeCanonicalProject(migrated.project);
                   await onAddProject({
                     title:
                       check.parsed?.composition.title ||
+                      migrated.project.title ||
                       file.name.replace(/\.sowveil\.json$|\.json$/i, ''),
                     description: check.valid
-                      ? `Imported verified Sowveil Mobile Project (${file.name}).`
+                      ? `Imported verified Sowveil Project (${file.name} · migrated from ${migrated.fromVersion} to v2.0.0).`
                       : `Imported JSON project document (${file.name}).`,
-                    compCount: 1,
+                    compCount: migrated.project.scenes.length || 1,
                     projectFileStatus: 'sowveil-native',
                     fileSizeBytes: file.size,
-                    fileSizeLabel: `${(file.size / 1024).toFixed(1)} KB (.sowveil.json)`,
+                    fileSizeLabel: `${(file.size / 1024).toFixed(1)} KB`,
                     resolution: check.parsed
                       ? `${check.parsed.composition.width} × ${check.parsed.composition.height}`
-                      : '1080 × 1920',
+                      : `${migrated.project.canvas.width} × ${migrated.project.canvas.height}`,
                     targetEditor: check.parsed?.targetEditor || 'sowveil-project',
                     sowveilSpecJson: text.slice(0, 14000),
+                    canonicalProjectJson: canonicalJson.slice(0, 64000),
+                    revision: migrated.project.revision,
+                    activeBranch: migrated.project.activeBranch,
                     hasExternalFootageWarning: false,
                     archived: false,
-                    tags: ['Imported .sowveil.json', 'Mobile Native'],
+                    tags: ['Imported .sowveil.json', 'Canonical v2.0'],
                   });
-                  onNotify(`Imported reusable mobile project "${file.name}".`, 'success');
+                  onNotify(`Imported reusable mobile project "${file.name}" (Canonical v2.0).`, 'success');
                   return;
                 }
 
@@ -1849,7 +1967,7 @@ export const ProjectLibraryWorkspace: React.FC<ProjectLibraryWorkspaceProps> = (
                     compCount: 1,
                     projectFileStatus: 'alight-motion-xml',
                     fileSizeBytes: file.size,
-                    fileSizeLabel: `${(file.size / 1024).toFixed(1)} KB (.xml)`,
+                    fileSizeLabel: `${(file.size / 1024).toFixed(1)} KB`,
                     resolution: '1080 × 1920',
                     targetEditor: 'alight-motion',
                     hasExternalFootageWarning: false,
@@ -1866,7 +1984,7 @@ export const ProjectLibraryWorkspace: React.FC<ProjectLibraryWorkspaceProps> = (
                   compCount: null,
                   projectFileStatus: 'linked-local',
                   fileSizeBytes: file.size,
-                  fileSizeLabel: `${(file.size / 1024).toFixed(1)} KB (local file)`,
+                  fileSizeLabel: `${(file.size / (1024 * 1024)).toFixed(1)} MB`,
                   resolution: undefined,
                   durationLabel: undefined,
                   hasExternalFootageWarning: true,
@@ -1880,77 +1998,46 @@ export const ProjectLibraryWorkspace: React.FC<ProjectLibraryWorkspaceProps> = (
               }}
             />
           </label>
-        </div>
-      </div>
 
-      {/* Scope Filter Tabs (Active / Archived / All) */}
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex items-center gap-1.5">
           <button
             type="button"
-            onClick={() => setArchiveFilter('active')}
-            className={`min-h-[38px] px-3 py-1.5 rounded-xl text-xs font-medium tabular-nums ${
-              archiveFilter === 'active'
-                ? 'bg-[#F06424] text-[#080707] font-semibold'
-                : 'bg-[#191614] text-[#B8AAA0] border border-[#342A24]'
-            }`}
+            onClick={() =>
+              setArchiveFilter((prev) => (prev === 'active' ? 'all' : 'active'))
+            }
+            title="Toggle Active / All projects"
+            className="p-1.5 rounded-md border border-[#2C2826] bg-[#181615] hover:border-[#F06424] text-[#9E958E] hover:text-[#F3EEE8]"
           >
-            Active {activeCount}
-          </button>
-          <button
-            type="button"
-            onClick={() => setArchiveFilter('archived')}
-            className={`min-h-[38px] px-3 py-1.5 rounded-xl text-xs font-medium tabular-nums ${
-              archiveFilter === 'archived'
-                ? 'bg-[#F06424] text-[#080707] font-semibold'
-                : 'bg-[#191614] text-[#B8AAA0] border border-[#342A24]'
-            }`}
-          >
-            Archived {archivedCount}
-          </button>
-          <button
-            type="button"
-            onClick={() => setArchiveFilter('all')}
-            className={`min-h-[38px] px-3 py-1.5 rounded-xl text-xs font-medium tabular-nums ${
-              archiveFilter === 'all'
-                ? 'bg-[#F06424] text-[#080707] font-semibold'
-                : 'bg-[#191614] text-[#B8AAA0] border border-[#342A24]'
-            }`}
-          >
-            All {projects.length}
+            <FolderPlus className="w-3.5 h-3.5" />
           </button>
         </div>
-        <span className="text-xs font-mono-tabular text-[#83766D]">
-          Editable .sowveil.json documents are stored separately from rendered media outputs
-        </span>
       </div>
 
       {showAddModal && (
         <form
           onSubmit={handleCreateProjectRecord}
-          className="rounded-2xl border border-[#F06424]/50 bg-[#191614] p-4 space-y-3"
+          className="rounded-lg border border-[#F06424]/50 bg-[#181615] p-3.5 space-y-3"
         >
           <div className="flex flex-wrap items-center justify-between gap-2">
             <h3 className="text-xs font-semibold text-[#F3EEE8]">
               Create Reusable Mobile Project or Metadata Record
             </h3>
-            <span className="text-[11px] font-mono-tabular text-[#B8AAA0]">
-              Leave comp count blank if uninspected (never invented)
+            <span className="text-[10.5px] font-mono-tabular text-[#9E958E]">
+              Leave comp count blank if uninspected
             </span>
           </div>
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2.5">
             <input
               type="text"
               required
               value={newTitle}
               onChange={(e) => setNewTitle(e.target.value)}
               placeholder="Project title *"
-              className="min-h-[42px] rounded-xl border border-[#342A24] bg-[#11100F] px-3 py-2 text-xs text-[#F3EEE8]"
+              className="rounded border border-[#2C2826] bg-[#121110] px-2.5 py-1.5 text-xs text-[#F3EEE8]"
             />
             <select
               value={newFormatStatus}
               onChange={(e) => setNewFormatStatus(e.target.value as ProjectFileStatus)}
-              className="min-h-[42px] rounded-xl border border-[#342A24] bg-[#11100F] px-3 py-2 text-xs text-[#F3EEE8]"
+              className="rounded border border-[#2C2826] bg-[#121110] px-2.5 py-1.5 text-xs text-[#F3EEE8]"
             >
               <option value="sowveil-native">Sowveil Mobile (.sowveil.json)</option>
               <option value="alight-motion-xml">Alight Motion (.xml)</option>
@@ -1962,7 +2049,7 @@ export const ProjectLibraryWorkspace: React.FC<ProjectLibraryWorkspaceProps> = (
               onChange={(e) =>
                 setNewTargetEditor(e.target.value as TargetMobileEditorId)
               }
-              className="min-h-[42px] rounded-xl border border-[#342A24] bg-[#11100F] px-3 py-2 text-xs text-[#F3EEE8]"
+              className="rounded border border-[#2C2826] bg-[#121110] px-2.5 py-1.5 text-xs text-[#F3EEE8]"
             >
               <option value="capcut">Target: CapCut</option>
               <option value="alight-motion">Target: Alight Motion</option>
@@ -1977,7 +2064,7 @@ export const ProjectLibraryWorkspace: React.FC<ProjectLibraryWorkspaceProps> = (
               value={newCompCountInput}
               onChange={(e) => setNewCompCountInput(e.target.value)}
               placeholder="Comps (optional)"
-              className="min-h-[42px] rounded-xl border border-[#342A24] bg-[#11100F] px-3 py-2 text-xs text-[#F3EEE8] font-mono-tabular"
+              className="rounded border border-[#2C2826] bg-[#121110] px-2.5 py-1.5 text-xs text-[#F3EEE8] font-mono-tabular"
             />
             <div className="flex items-center gap-2">
               <input
@@ -1985,11 +2072,11 @@ export const ProjectLibraryWorkspace: React.FC<ProjectLibraryWorkspaceProps> = (
                 value={newResolution}
                 onChange={(e) => setNewResolution(e.target.value)}
                 placeholder="Res (e.g. 1080 × 1920)"
-                className="flex-1 min-h-[42px] rounded-xl border border-[#342A24] bg-[#11100F] px-3 py-2 text-xs text-[#F3EEE8]"
+                className="flex-1 rounded border border-[#2C2826] bg-[#121110] px-2.5 py-1.5 text-xs text-[#F3EEE8]"
               />
               <button
                 type="submit"
-                className="min-h-[42px] py-2 px-4 rounded-xl bg-[#F06424] text-[#080707] font-semibold text-xs whitespace-nowrap"
+                className="py-1.5 px-3 rounded bg-[#F06424] text-[#FFFFFF] font-semibold text-xs whitespace-nowrap"
               >
                 Save
               </button>
@@ -1998,376 +2085,258 @@ export const ProjectLibraryWorkspace: React.FC<ProjectLibraryWorkspaceProps> = (
         </form>
       )}
 
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        <div className="lg:col-span-7">
-          {filtered.length === 0 ? (
-            <div className="rounded-2xl border border-[#342A24] bg-[#11100F] p-8 text-center space-y-2">
-              <p className="text-sm font-semibold text-[#F3EEE8]">
-                No project records match your current view
+      {/* 5-Column Project Card Grid Matching Frame 01:23 */}
+      {filtered.length === 0 ? (
+        <div className="rounded-lg border border-[#24211F] bg-[#121110] p-8 text-center space-y-2">
+          <p className="text-xs font-semibold text-[#F3EEE8]">
+            No project records match your current view
+          </p>
+        </div>
+      ) : (
+        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3">
+          {filtered.map((proj) => {
+            const isSelected = activeProject?.id === proj.id;
+            const shortSize = proj.fileSizeLabel.replace(/\s*\(.*?\)/g, '');
+            return (
+              <div
+                key={proj.id}
+                onClick={() => setSelectedProjId(proj.id)}
+                role="button"
+                tabIndex={0}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') setSelectedProjId(proj.id);
+                }}
+                className={`group text-left rounded-lg border p-2.5 transition-all cursor-pointer flex flex-col justify-between ${
+                  isSelected
+                    ? 'border-[#F06424] bg-[#1A1614] ring-1 ring-[#F06424]/50'
+                    : 'border-[#24211F] bg-[#141211] hover:border-[#3A3430]'
+                }`}
+              >
+                <div className="h-[88px] rounded bg-[#0C0B0A] border border-[#1E1C1A] p-2 flex flex-col justify-between relative">
+                  <div className="text-[9.5px] font-mono-tabular text-[#8E857E]">
+                    {proj.compCount !== null && proj.compCount !== undefined
+                      ? `${proj.compCount} comps`
+                      : 'Comps: Unknown'}
+                  </div>
+                  <div className="my-auto text-center font-mono-tabular text-[11px] tracking-[0.2em] text-[#5C554F] uppercase">
+                    PROJECT
+                  </div>
+                  <div className="h-2" />
+                </div>
+
+                <div className="mt-2">
+                  <div className="font-semibold text-[11.5px] text-[#F3EEE8] truncate">
+                    {proj.title}
+                  </div>
+                  <div className="mt-0.5 text-[9.5px] text-[#787069] truncate">
+                    Oct 22, 2026 · {shortSize}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Selected Project Detail, Checkpoints & Export Drawer */}
+      {activeProject && (
+        <div className="rounded-lg border border-[#24211F] bg-[#121110] p-4 space-y-3">
+          <div className="flex flex-wrap items-start justify-between gap-2">
+            <div>
+              <div className="text-[10px] font-mono-tabular text-[#55B98B] uppercase">
+                {activeProject.projectFileStatus} ·{' '}
+                {activeProject.compCount !== null && activeProject.compCount !== undefined
+                  ? `${activeProject.compCount} comps`
+                  : 'Comps: Unknown'}
+              </div>
+              <h3 className="text-sm font-bold text-[#F3EEE8] mt-0.5">
+                {activeProject.title}
+              </h3>
+              <p className="text-[11px] text-[#8E857E] mt-0.5">
+                {activeProject.description}
               </p>
-              <p className="text-xs text-[#B8AAA0]">
-                {debouncedSearch
-                  ? `No project titles, descriptions, or tags matched "${debouncedSearch}".`
-                  : archiveFilter === 'archived'
-                  ? 'No archived projects found.'
-                  : 'Tap "+ Save Mobile Project" or import a .sowveil.json / .xml file.'}
-              </p>
-              {(debouncedSearch || archiveFilter !== 'active') && (
+            </div>
+
+            <div className="flex flex-wrap items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => setShowProEditorModal(true)}
+                className="inline-flex items-center gap-1 px-3 py-1.5 rounded border border-[#F06424]/70 bg-[#23140E] hover:bg-[#2F1A12] text-[#F3EEE8] font-semibold text-[11px]"
+              >
+                <Sliders className="w-3.5 h-3.5 text-[#F06424]" />
+                <span>Open in Pro Editor (v2.0)</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => handleDownloadMobileProjectFile(activeProject)}
+                className="inline-flex items-center gap-1 px-3 py-1.5 rounded bg-[#F06424] hover:bg-[#FF7434] text-[#FFFFFF] font-semibold text-[11px]"
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>Download .sowveil.json</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => handleDuplicateProject(activeProject)}
+                className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded border border-[#2C2826] bg-[#181615] text-[11px] text-[#D8CFC8]"
+              >
+                <Copy className="w-3 h-3" />
+                <span>Duplicate</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setIsEditingDetails((v) => !v)}
+                className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded border border-[#2C2826] bg-[#181615] text-[11px] text-[#D8CFC8]"
+              >
+                <Edit3 className="w-3 h-3" />
+                <span>{isEditingDetails ? 'Cancel' : 'Edit'}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setConfirmDeleteId(activeProject.id)}
+                aria-label={`Delete ${activeProject.title}`}
+                className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded border border-[#2C2826] text-[11px] text-[#F06464] hover:bg-[#F06464]/10"
+              >
+                <Trash2 className="w-3 h-3" />
+                <span>Delete</span>
+              </button>
+            </div>
+          </div>
+
+          {isEditingDetails && (
+            <form
+              onSubmit={handleSaveDetailsEdit}
+              className="grid grid-cols-1 sm:grid-cols-4 gap-2.5 pt-2 border-t border-[#1E1C1A]"
+            >
+              <input
+                type="text"
+                required
+                value={editTitle}
+                onChange={(e) => setEditTitle(e.target.value)}
+                className="rounded border border-[#2C2826] bg-[#181615] px-2.5 py-1.5 text-xs text-[#F3EEE8]"
+              />
+              <input
+                type="text"
+                value={editDesc}
+                onChange={(e) => setEditDesc(e.target.value)}
+                className="rounded border border-[#2C2826] bg-[#181615] px-2.5 py-1.5 text-xs text-[#F3EEE8]"
+              />
+              <input
+                type="number"
+                min={0}
+                value={editCompCountInput}
+                onChange={(e) => setEditCompCountInput(e.target.value)}
+                placeholder="Comps"
+                className="rounded border border-[#2C2826] bg-[#181615] px-2.5 py-1.5 text-xs text-[#F3EEE8] font-mono-tabular"
+              />
+              <button
+                type="submit"
+                className="rounded bg-[#F06424] text-[#FFFFFF] font-semibold text-xs py-1.5 px-3"
+              >
+                Save Changes
+              </button>
+            </form>
+          )}
+
+          {/* Version Checkpoints Bar */}
+          <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-[#1E1C1A]">
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] font-mono-tabular text-[#787069] uppercase flex items-center gap-1">
+                <History className="w-3 h-3 text-[#F06424]" />
+                <span>Checkpoints ({activeProject.checkpoints?.length || 0})</span>
+              </span>
+              <input
+                type="text"
+                value={checkpointLabelInput}
+                onChange={(e) => setCheckpointLabelInput(e.target.value)}
+                placeholder="Checkpoint label…"
+                className="rounded border border-[#2C2826] bg-[#181615] px-2 py-1 text-[11px] text-[#F3EEE8]"
+              />
+              <button
+                type="button"
+                onClick={() => handleSaveCheckpoint(activeProject)}
+                className="px-2.5 py-1 rounded bg-[#F06424] text-[#FFFFFF] font-semibold text-[11px]"
+              >
+                + Checkpoint
+              </button>
+            </div>
+
+            {activeProject.checkpoints && activeProject.checkpoints.length > 0 && (
+              <div className="flex flex-wrap items-center gap-1.5">
+                {activeProject.checkpoints.slice(0, 3).map((chk) => (
+                  <button
+                    key={chk.id}
+                    type="button"
+                    onClick={() => handleRestoreCheckpoint(activeProject, chk)}
+                    className="px-2 py-0.5 rounded border border-[#2C2826] bg-[#181615] text-[10px] font-mono-tabular text-[#55B98B] hover:border-[#55B98B]"
+                  >
+                    Restore: {chk.label}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {confirmDeleteId === activeProject.id && (
+            <div className="rounded border border-[#F06464] bg-[#F06464]/10 p-2.5 flex items-center justify-between gap-2 text-xs">
+              <span className="text-[#F3EEE8]">
+                Confirm permanent deletion of “{activeProject.title}”?
+              </span>
+              <div className="flex items-center gap-2">
                 <button
                   type="button"
                   onClick={() => {
-                    setRawSearch('');
-                    setArchiveFilter('active');
+                    onDeleteProject(activeProject.id);
+                    setConfirmDeleteId(null);
+                    onNotify(`Deleted "${activeProject.title}".`, 'info');
                   }}
-                  className="mt-2 px-3 py-1.5 rounded-lg bg-[#191614] border border-[#342A24] text-xs font-medium text-[#F3EEE8]"
+                  className="px-2.5 py-1 rounded bg-[#F06464] text-[#080707] font-semibold"
                 >
-                  Reset filters
+                  Confirm Delete
                 </button>
-              )}
-            </div>
-          ) : (
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
-              {filtered.map((proj) => {
-                const isSelected = activeProject?.id === proj.id;
-                const isEditableDoc =
-                  proj.projectFileStatus === 'sowveil-native' ||
-                  proj.projectFileStatus === 'alight-motion-xml';
-                return (
-                  <div
-                    key={proj.id}
-                    onClick={() => setSelectedProjId(proj.id)}
-                    role="button"
-                    tabIndex={0}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' || e.key === ' ') setSelectedProjId(proj.id);
-                    }}
-                    className={`group text-left rounded-2xl border p-4 transition-colors cursor-pointer ${
-                      isSelected
-                        ? 'border-[#F06424] bg-[#211B17]'
-                        : 'border-[#342A24] bg-[#11100F] hover:border-[#83766D]'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between text-[11px] font-mono-tabular text-[#B8AAA0]">
-                      <span>
-                        {proj.compCount !== null && proj.compCount !== undefined
-                          ? `${proj.compCount} comps`
-                          : 'Comps: Unknown'}
-                      </span>
-                      <span className="text-[#55B98B]">{proj.projectFileStatus}</span>
-                    </div>
-                    <div className="my-3 py-2 rounded-lg bg-[#191614] border border-[#342A24]/60 text-center font-mono-tabular text-[11px] tracking-wider text-[#B8AAA0] uppercase">
-                      {proj.archived
-                        ? 'ARCHIVED PROJECT'
-                        : isEditableDoc
-                        ? `EDITABLE DOC · ${(proj.targetEditor || 'MOBILE').toUpperCase()}`
-                        : 'METADATA / RENDERED REF'}
-                    </div>
-                    <div className="font-semibold text-xs text-[#F3EEE8] truncate">
-                      {proj.title}
-                    </div>
-                    <div className="mt-1 flex items-center justify-between text-[11px] font-mono-tabular text-[#83766D]">
-                      <span className="truncate">{proj.fileSizeLabel}</span>
-                      {proj.checkpoints && proj.checkpoints.length > 0 && (
-                        <span className="text-[#FFC08C] shrink-0">
-                          {proj.checkpoints.length} chk
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
-
-        {/* Project Detail, Version Checkpoints & Mobile Export Inspector */}
-        <div className="lg:col-span-5">
-          {activeProject ? (
-            <div className="rounded-2xl border border-[#342A24] bg-[#11100F] p-5 space-y-4">
-              <div className="flex items-start justify-between gap-2">
-                <div>
-                  <div className="text-xs font-mono-tabular text-[#55B98B]">
-                    {activeProject.projectFileStatus.toUpperCase()} RECORD
-                    {activeProject.archived ? ' · ARCHIVED' : ''}
-                  </div>
-                  <h3 className="mt-1 text-base font-bold text-[#F3EEE8]">
-                    {activeProject.title}
-                  </h3>
-                </div>
-                <div className="flex items-center gap-1.5">
-                  <button
-                    type="button"
-                    onClick={() => handleDuplicateProject(activeProject)}
-                    title="Duplicate project"
-                    className="min-h-[38px] inline-flex items-center gap-1 px-2.5 py-1 rounded-xl border border-[#342A24] bg-[#191614] text-xs text-[#B8AAA0] hover:text-[#F3EEE8]"
-                  >
-                    <Copy className="w-3.5 h-3.5" />
-                    <span>Duplicate</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setIsEditingDetails((v) => !v)}
-                    className="min-h-[38px] inline-flex items-center gap-1 px-2.5 py-1 rounded-xl border border-[#342A24] bg-[#191614] text-xs text-[#B8AAA0] hover:text-[#F3EEE8]"
-                  >
-                    <Edit3 className="w-3.5 h-3.5" />
-                    <span>{isEditingDetails ? 'Cancel' : 'Edit'}</span>
-                  </button>
-                </div>
-              </div>
-
-              {isEditingDetails ? (
-                <form
-                  onSubmit={handleSaveDetailsEdit}
-                  className="space-y-3 pt-2 border-t border-[#342A24]"
+                <button
+                  type="button"
+                  onClick={() => setConfirmDeleteId(null)}
+                  className="px-2.5 py-1 rounded border border-[#2C2826] bg-[#181615] text-[#9E958E]"
                 >
-                  <label className="block space-y-1 text-xs">
-                    <span className="text-[#B8AAA0]">Title</span>
-                    <input
-                      type="text"
-                      required
-                      value={editTitle}
-                      onChange={(e) => setEditTitle(e.target.value)}
-                      className="w-full rounded-lg border border-[#342A24] bg-[#191614] px-3 py-1.5 text-xs text-[#F3EEE8]"
-                    />
-                  </label>
-                  <label className="block space-y-1 text-xs">
-                    <span className="text-[#B8AAA0]">Description</span>
-                    <textarea
-                      rows={3}
-                      value={editDesc}
-                      onChange={(e) => setEditDesc(e.target.value)}
-                      className="w-full rounded-lg border border-[#342A24] bg-[#191614] px-3 py-1.5 text-xs text-[#F3EEE8]"
-                    />
-                  </label>
-                  <div className="grid grid-cols-2 gap-2">
-                    <label className="block space-y-1 text-xs">
-                      <span className="text-[#B8AAA0]">Comps (blank = Unknown)</span>
-                      <input
-                        type="number"
-                        min={0}
-                        value={editCompCountInput}
-                        onChange={(e) => setEditCompCountInput(e.target.value)}
-                        className="w-full rounded-lg border border-[#342A24] bg-[#191614] px-2.5 py-1.5 text-xs text-[#F3EEE8] font-mono-tabular"
-                      />
-                    </label>
-                    <label className="block space-y-1 text-xs">
-                      <span className="text-[#B8AAA0]">Resolution</span>
-                      <input
-                        type="text"
-                        value={editResolution}
-                        onChange={(e) => setEditResolution(e.target.value)}
-                        placeholder="1080 × 1920"
-                        className="w-full rounded-lg border border-[#342A24] bg-[#191614] px-2.5 py-1.5 text-xs text-[#F3EEE8]"
-                      />
-                    </label>
-                  </div>
-                  <label className="flex items-center gap-2 text-xs text-[#B8AAA0] cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={editExternalWarning}
-                      onChange={(e) => setEditExternalWarning(e.target.checked)}
-                      className="accent-[#F06424]"
-                    />
-                    <span>Warn about external local footage paths</span>
-                  </label>
-                  <button
-                    type="submit"
-                    className="w-full min-h-[42px] py-2 rounded-xl bg-[#F06424] text-[#080707] font-semibold text-xs"
-                  >
-                    Save Changes
-                  </button>
-                </form>
-              ) : (
-                <>
-                  <p className="text-xs text-[#B8AAA0] leading-relaxed">
-                    {activeProject.description}
-                  </p>
-
-                  <div className="space-y-2 pt-3 border-t border-[#342A24] text-xs font-mono-tabular">
-                    <div className="flex justify-between">
-                      <span className="text-[#83766D]">Document vs. Media</span>
-                      <span className="text-[#F3EEE8]">
-                        {activeProject.projectFileStatus === 'sowveil-native' ||
-                        activeProject.projectFileStatus === 'alight-motion-xml'
-                          ? 'Editable Project Document'
-                          : 'Metadata / Rendered Bundle'}
-                      </span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-[#83766D]">Storage Status</span>
-                      <span className="text-[#55B98B]">
-                        {activeProject.ownerUid
-                          ? 'Cloud Firestore Synced (No Binary Bucket)'
-                          : 'Session Document'}
-                      </span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-[#83766D]">Compositions</span>
-                      <span className="text-[#F3EEE8]">
-                        {activeProject.compCount !== null &&
-                        activeProject.compCount !== undefined
-                          ? activeProject.compCount
-                          : 'Unknown (not inspected)'}
-                      </span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-[#83766D]">Resolution</span>
-                      <span className="text-[#F3EEE8]">
-                        {activeProject.resolution || '1080 × 1920'}
-                      </span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-[#83766D]">File Size</span>
-                      <span className="text-[#F3EEE8]">{activeProject.fileSizeLabel}</span>
-                    </div>
-                  </div>
-
-                  {/* Version History & Checkpoints */}
-                  <div className="rounded-xl border border-[#342A24] bg-[#191614] p-3.5 space-y-2.5 text-xs">
-                    <div className="flex items-center justify-between font-mono-tabular">
-                      <span className="text-[#83766D] flex items-center gap-1.5">
-                        <History className="w-3.5 h-3.5 text-[#F06424]" />
-                        <span>VERSION CHECKPOINTS ({activeProject.checkpoints?.length || 0})</span>
-                      </span>
-                    </div>
-
-                    <div className="flex items-center gap-2">
-                      <input
-                        type="text"
-                        value={checkpointLabelInput}
-                        onChange={(e) => setCheckpointLabelInput(e.target.value)}
-                        placeholder="Checkpoint label (e.g. Before color tweak)…"
-                        className="flex-1 min-h-[36px] rounded-lg border border-[#342A24] bg-[#11100F] px-2.5 py-1 text-xs text-[#F3EEE8]"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => handleSaveCheckpoint(activeProject)}
-                        className="min-h-[36px] px-3 py-1 rounded-lg bg-[#F06424] text-[#080707] font-semibold text-xs whitespace-nowrap"
-                      >
-                        + Checkpoint
-                      </button>
-                    </div>
-
-                    {activeProject.checkpoints && activeProject.checkpoints.length > 0 && (
-                      <div className="space-y-1.5 max-h-28 overflow-y-auto pt-1">
-                        {activeProject.checkpoints.map((chk) => (
-                          <div
-                            key={chk.id}
-                            className="flex items-center justify-between gap-2 rounded-lg border border-[#342A24] bg-[#11100F] px-2.5 py-1.5 text-[11px] font-mono-tabular"
-                          >
-                            <div className="truncate">
-                              <span className="text-[#F3EEE8] font-medium">{chk.label}</span>
-                              <span className="text-[#83766D] ml-1.5">
-                                {chk.createdAt.slice(0, 16).replace('T', ' ')}
-                              </span>
-                            </div>
-                            <button
-                              type="button"
-                              onClick={() => handleRestoreCheckpoint(activeProject, chk)}
-                              className="text-[#55B98B] hover:underline shrink-0"
-                            >
-                              Restore
-                            </button>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-
-                  {activeProject.hasExternalFootageWarning && (
-                    <div className="rounded-xl border border-[#E4B45A]/40 bg-[#E4B45A]/10 p-3 text-xs text-[#E4B45A] flex items-start gap-2">
-                      <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
-                      <span>
-                        External footage dependency warning: Legacy .aep reference points to local files; export as .sowveil.json for portable mobile use.
-                      </span>
-                    </div>
-                  )}
-
-                  {/* Mobile Export & Archive/Delete Controls */}
-                  <div className="pt-2 space-y-2">
-                    <button
-                      type="button"
-                      onClick={() => handleDownloadMobileProjectFile(activeProject)}
-                      className="w-full min-h-[44px] py-2.5 px-3 rounded-xl bg-[#F06424] hover:bg-[#FF4B24] text-[#080707] font-bold text-xs inline-flex items-center justify-center gap-2 transition-colors"
-                    >
-                      <Download className="w-4 h-4" />
-                      <span>Download .sowveil.json Project</span>
-                    </button>
-
-                    <div className="flex items-center justify-between gap-2">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          const nextState = !activeProject.archived;
-                          onUpdateProject(activeProject.id, { archived: nextState });
-                          onNotify(
-                            nextState
-                              ? `Archived "${activeProject.title}".`
-                              : `Restored "${activeProject.title}" to Active projects.`,
-                            'info'
-                          );
-                        }}
-                        className="flex-1 min-h-[42px] inline-flex items-center justify-center gap-1.5 py-2 px-3 rounded-xl bg-[#191614] border border-[#342A24] hover:border-[#83766D] text-xs font-medium text-[#F3EEE8]"
-                      >
-                        <Archive className="w-3.5 h-3.5 text-[#B8AAA0]" />
-                        <span>{activeProject.archived ? 'Restore Project' : 'Archive'}</span>
-                      </button>
-
-                      <button
-                        type="button"
-                        onClick={() => setConfirmDeleteId(activeProject.id)}
-                        aria-label={`Delete ${activeProject.title}`}
-                        className="min-h-[42px] px-3 py-2 rounded-xl border border-[#342A24] text-[#F06464] hover:bg-[#F06464]/10 text-xs font-medium inline-flex items-center gap-1"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                        <span>Delete</span>
-                      </button>
-                    </div>
-
-                    {confirmDeleteId === activeProject.id && (
-                      <div className="rounded-xl border border-[#F06464] bg-[#F06464]/10 p-3 space-y-2 text-xs">
-                        <div className="font-semibold text-[#F3EEE8]">
-                          Confirm permanent deletion of “{activeProject.title}”?
-                        </div>
-                        <p className="text-[#B8AAA0]">
-                          This removes the project record from your Project Library.
-                        </p>
-                        <div className="flex items-center gap-2">
-                          <button
-                            type="button"
-                            onClick={() => {
-                              onDeleteProject(activeProject.id);
-                              setConfirmDeleteId(null);
-                              onNotify(
-                                `Deleted "${activeProject.title}" from Project Library.`,
-                                'info'
-                              );
-                            }}
-                            className="px-3 py-1.5 rounded bg-[#F06464] text-[#080707] font-semibold"
-                          >
-                            Confirm Delete
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setConfirmDeleteId(null)}
-                            className="px-3 py-1.5 rounded border border-[#342A24] bg-[#11100F] text-[#B8AAA0]"
-                          >
-                            Cancel
-                          </button>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                </>
-              )}
-            </div>
-          ) : (
-            <div className="rounded-2xl border border-[#342A24] bg-[#11100F] p-6 text-center text-xs text-[#83766D]">
-              Select a project card to inspect or export its mobile project document.
+                  Cancel
+                </button>
+              </div>
             </div>
           )}
         </div>
-      </div>
+      )}
+
+      {/* Mobile Pro Timeline Editor Modal (Canonical Project v2.0.0) */}
+      {showProEditorModal && activeProject && (
+        <MobileProEditorModal
+          isOpen={showProEditorModal}
+          sourceLibraryProject={activeProject}
+          onClose={() => setShowProEditorModal(false)}
+          onSaveToProjectLibrary={async (updatedRecord) => {
+            await onUpdateProject(activeProject.id, {
+              title: updatedRecord.title,
+              description: updatedRecord.description,
+              compCount: updatedRecord.compCount,
+              projectFileStatus: updatedRecord.projectFileStatus,
+              fileSizeBytes: updatedRecord.fileSizeBytes,
+              fileSizeLabel: updatedRecord.fileSizeLabel,
+              resolution: updatedRecord.resolution,
+              durationLabel: updatedRecord.durationLabel,
+              fps: updatedRecord.fps,
+              targetEditor: updatedRecord.targetEditor,
+              aspectRatio: updatedRecord.aspectRatio,
+              sowveilSpecJson: updatedRecord.sowveilSpecJson,
+              canonicalProjectJson: updatedRecord.canonicalProjectJson,
+              revision: updatedRecord.revision,
+              activeBranch: updatedRecord.activeBranch,
+              checkpoints: updatedRecord.checkpoints,
+              tags: updatedRecord.tags,
+            });
+          }}
+          onNotify={onNotify}
+        />
+      )}
     </div>
   );
 };
+

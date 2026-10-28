@@ -31,6 +31,8 @@ export type AuthErrorState =
 
 export type CapabilityStatus =
   | 'Available'
+  | 'Implemented'
+  | 'Experimental'
   | 'Needs setup'
   | 'Disconnected'
   | 'Unsupported'
@@ -77,19 +79,124 @@ export type CapabilityType =
   | 'saas-effect'
   | 'caption-utility'
   | 'media-downloader'
-  | 'project-manager';
+  | 'project-manager'
+  | 'real-host-execution';
 
 export type AssetKind =
   | 'image'
   | 'video'
   | 'audio'
-  | 'ae-project'
-  | 'ae-template'
+  | 'font'
   | 'svg'
   | 'model3d'
+  | 'generated'
+  | 'ae-project'
+  | 'ae-template'
   | 'scene-spec'
   | 'expression'
   | 'curve';
+
+export type TemplateLicenseType =
+  | 'Unknown'
+  | 'Original Demo Specification'
+  | 'Reference Metadata Only'
+  | 'User Owned'
+  | 'CC-BY-4.0'
+  | 'CC0-Public-Domain'
+  | 'Commercial-Licensed'
+  | 'Sowveil Original'
+  | 'Royalty-Free Commercial'
+  | 'CC0 Public Domain'
+  | 'Free'
+  | 'Attribution Required'
+  | 'Editorial Only'
+  | 'Custom License';
+
+export type TemplateValidationState =
+  | 'Draft'
+  | 'Needs assets'
+  | 'Experimental'
+  | 'Needs target-app test'
+  | 'Validated'
+  | 'Deprecated'
+  | 'Archived';
+
+export type TemplateVisibility =
+  | 'published'
+  | 'public'
+  | 'community'
+  | 'private'
+  | 'draft'
+  | 'archived';
+
+export type EditablePropertyCapability =
+  | 'text'
+  | 'color'
+  | 'timing'
+  | 'keyframes'
+  | 'replaceable-media'
+  | 'audio'
+  | 'layout'
+  | 'shader-params';
+
+export interface ReplaceableMediaSlot {
+  slotId: string;
+  label: string;
+  acceptedKinds: AssetKind[];
+  required: boolean;
+  defaultAssetId?: string;
+  boundAssetId?: string;
+}
+
+export interface TemplateMediaRequirements {
+  requiredAssetKinds: AssetKind[];
+  replaceableSlots: ReplaceableMediaSlot[];
+}
+
+export interface TemplateRendererRequirements {
+  engine: 'browser-svg-css' | 'canvas-2d' | 'webgl-three' | 'hybrid-worker';
+  minFps: number;
+  hardwareAccelerationRecommended: boolean;
+}
+
+export interface TemplateAttribution {
+  authorName: string;
+  attributionText: string;
+  sourceUrl?: string;
+  requiresAttribution: boolean;
+}
+
+export interface TemplateVersionEntry {
+  version: string;
+  updatedAt: string;
+  updatedByUid: string;
+  changelog: string;
+  snapshotHash: string;
+}
+
+export interface TemplateDeprecationInfo {
+  isDeprecated: boolean;
+  deprecatedAt?: string;
+  reason?: string;
+  replacementTemplateId?: string;
+}
+
+export interface TemplateValidationEvidence {
+  jobId: string;
+  validationJobId?: string;
+  validatedAt: string;
+  validatedByUid: string;
+  passed: boolean;
+  resultingState: TemplateValidationState;
+  checksRun: {
+    schemaValid: boolean;
+    paramsWithinBounds: boolean;
+    requiredAssetsPresent: boolean;
+    svgPreviewSafe: boolean;
+    exportRoundTripVerified: boolean;
+  };
+  summary: string;
+}
 
 export type HostOperationName =
   | 'getHostStatus'
@@ -195,6 +302,8 @@ export interface EditableTemplateParam {
   step?: number;
   options?: string[];
   unit?: string;
+  required?: boolean;
+  description?: string;
 }
 
 export type TargetMobileEditorId =
@@ -240,9 +349,27 @@ export interface CatalogItem {
   assetKind: AssetKind;
   capabilityType: CapabilityType;
   previewKind: PreviewRenderKind;
+  creatorUid?: string;
+  ownerUid?: string;
+  sourceProjectVersion?: string;
+  templateSchemaVersion?: string;
+  supportedEditableProperties?: EditablePropertyCapability[];
+  mediaRequirements?: TemplateMediaRequirements;
+  rendererRequirements?: TemplateRendererRequirements;
+  originUrl?: string;
+  sourceUrl?: string;
+  attribution?: TemplateAttribution;
+  previewFiles?: string[];
+  thumbnailSvgDataUri?: string;
+  validationState?: TemplateValidationState;
+  lastValidationRecord?: TemplateValidationEvidence;
+  versionHistory?: TemplateVersionEntry[];
+  deprecationStatus?: TemplateDeprecationInfo;
+  forkedFromTemplateId?: string;
   metadata: {
     width?: number;
     height?: number;
+    resolution?: string;
     durationSec?: number;
     durationLabel?: string;
     fps?: number;
@@ -264,12 +391,48 @@ export interface CatalogItem {
   selectionRequirement: string;
   status: CapabilityStatus;
   statusReason: string;
-  licenseType: 'Original Demo Specification' | 'Reference Metadata Only' | 'User Owned';
+  licenseType: TemplateLicenseType;
   licenseNote: string;
   sourceType: 'original-svg-css' | 'procedural-canvas' | 'reference-seed';
-  visibility: 'published' | 'draft' | 'archived';
+  visibility: TemplateVisibility;
   supportsTemplateComparison: boolean;
   editableParams?: EditableTemplateParam[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TemplateTimingOverrides {
+  durationSec?: number;
+  fps?: number;
+  speedMultiplier?: number;
+  startOffsetSec?: number;
+  easingCurve?: [number, number, number, number];
+}
+
+export interface TemplateKeyframeOverride {
+  property: string;
+  timeSec: number;
+  value: number | string;
+  easing?: string;
+}
+
+export interface TemplateVariantInstance {
+  id: string;
+  ownerUid: string;
+  baseTemplateId: string;
+  baseTemplateVersion: string;
+  moduleId?: ModuleId;
+  name?: string;
+  title?: string;
+  notes?: string;
+  description?: string;
+  parameterOverrides: Record<string, string | number | boolean>;
+  assetSwaps?: Record<string, string>;
+  assetOverrides?: Record<string, string>;
+  assetSlotBindings?: Record<string, string>;
+  timingOverrides?: TemplateTimingOverrides;
+  keyframeOverrides?: TemplateKeyframeOverride[];
+  visibility?: 'private' | 'public';
   createdAt: string;
   updatedAt: string;
 }
@@ -304,21 +467,58 @@ export interface MobileEditorAdapterDescriptor {
   importSteps: string[];
 }
 
+export interface AssetVersionEntry {
+  versionId?: string;
+  version?: string;
+  checksumSha256: string;
+  sizeBytes: number | null;
+  mimeType: string;
+  createdAt?: string;
+  updatedAt?: string;
+  updatedByUid?: string;
+  note: string;
+}
+
+export interface AssetProvenanceInfo {
+  originType: 'user-upload' | 'system-seed' | 'generated' | 'imported-url' | 'git-repo';
+  sourceUrl?: string;
+  importedAt: string;
+}
+
 export interface AssetMetadataRecord {
   id: string;
   title: string;
+  name?: string;
+  labels?: string[];
+  tags?: string[];
   moduleId: ModuleId;
-  catalogItemId?: string;
+  catalogItemId?: string | null;
   assetKind: AssetKind;
   ownerUid: string;
-  licenseType: 'Original Demo Specification' | 'Reference Metadata Only' | 'User Owned';
+  visibility?: 'private' | 'public';
+  dimensions?: { width: number; height: number } | string | null;
+  durationSec?: number | null;
+  audioFormat?: { sampleRateHz?: number; channels?: number; codec?: string } | string | null;
+  checksumSha256?: string | null;
+  previewDataUri?: string | null;
+  provenance?: AssetProvenanceInfo | string;
+  attribution?: TemplateAttribution | string;
+  licenseType: TemplateLicenseType;
   licenseNote: string;
   sourceNote: string;
-  storageProvider: 'none-configured' | 'cloud-storage';
+  storageProvider: 'none-configured' | 'cloud-storage' | 'durable-local-store' | 'inline-svg';
   storageObjectKey: string | null;
+  deduplicatedFromAssetId?: string | null;
   mimeType: string;
   sizeBytes: number | null;
-  status: 'metadata-only' | 'stored' | 'archived';
+  byteSize?: number | null;
+  version?: number;
+  versions?: AssetVersionEntry[];
+  versionHistory?: AssetVersionEntry[];
+  missingAssetDetected?: boolean;
+  usedByTemplateIds?: string[];
+  usedByVariantIds?: string[];
+  status: 'metadata-only' | 'stored' | 'missing-binary' | 'archived';
   createdAt: string;
   updatedAt: string;
 }
@@ -364,6 +564,9 @@ export interface ProjectLibraryItem {
   targetEditor?: TargetMobileEditorId;
   aspectRatio?: MobileAspectRatio;
   sowveilSpecJson?: string;
+  canonicalProjectJson?: string;
+  revision?: number;
+  activeBranch?: string;
   checkpoints?: ProjectCheckpointRecord[];
   hasExternalFootageWarning: boolean;
   archived?: boolean;

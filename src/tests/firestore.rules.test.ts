@@ -24,17 +24,26 @@ test('Firestore Rules Audit: Every collection in firebase-blueprint.json is secu
     'match /modules/{moduleId}',
     'match /categories/{categoryId}',
     'match /catalogItems/{itemId}',
+    'match /templateVariants/{variantId}',
+    'match /assets/{assetId}',
     'match /favorites/{uid}/items/{itemId}',
     'match /projects/{projectId}',
     'match /jobs/{jobId}',
     'match /devices/{deviceId}',
     'match /devicePairingTokens/{tokenId}',
     'match /auditEvents/{eventId}',
+    'match /referenceLabSessions/{sessionId}',
+    'match /providerConnections/{connectionId}',
+    'match /extensionPackages/{extensionId}',
+    'match /toolAuditRecords/{auditId}',
+    'match /aiDirectorSessions/{sessionId}',
+    'match /templateFactoryDrafts/{draftId}',
+    'match /renderExportJobs/{jobId}',
   ];
   for (const block of requiredMatchBlocks) {
     assert.ok(rulesText.includes(block), `Missing match block in firestore.rules: ${block}`);
   }
-  assert.equal(Object.keys(blueprint.firestore).length, 12);
+  assert.equal(Object.keys(blueprint.firestore).length, 21);
 
   // 3. Verify Dirty Dozen Defenses:
   // Payload 1 & 2: Self-role escalation blocked on create (incoming().role == 'user' || isAdmin()) and update (incoming().role == existing().role)

@@ -232,6 +232,45 @@ export function validateSowveilProjectJson(rawJson: string): {
 } {
   try {
     const raw = JSON.parse(rawJson);
+    if (
+      raw.format === 'sowveil-canonical-project' &&
+      raw.schemaVersion === '2.0.0' &&
+      raw.canvas &&
+      raw.canvas.width > 0 &&
+      raw.canvas.height > 0 &&
+      Array.isArray(raw.tracks)
+    ) {
+      const clipCount = raw.tracks.reduce(
+        (acc: number, t: { clips?: unknown[] }) =>
+          acc + (Array.isArray(t.clips) ? t.clips.length : 0),
+        0
+      );
+      return {
+        valid: true,
+        reason: `Verified Sowveil Canonical v2.0.0 project (${raw.canvas.width}×${raw.canvas.height} @ ${raw.canvas.fps}fps, ${raw.tracks.length} track(s), ${clipCount} clip(s))`,
+        parsed: {
+          format: 'sowveil-mobile-project',
+          schemaVersion: '2.0.0',
+          generator: 'Sowveil Studio Mobile Motion Engine',
+          exportedAt: raw.updatedAt || new Date().toISOString(),
+          targetEditor: raw.targetEditor || 'sowveil-project',
+          composition: {
+            id: raw.id || 'proj_canonical',
+            title: raw.title || 'Canonical Project',
+            moduleId: raw.moduleId || 'text-animation',
+            aspectRatio: raw.canvas.aspectRatio || '9:16',
+            width: raw.canvas.width,
+            height: raw.canvas.height,
+            fps: raw.canvas.fps || 60,
+            durationSec: raw.canvas.durationSec || 4,
+          },
+          parameters: { revision: raw.revision || 1 },
+          easing: { cubicBezier: [0.22, 1, 0.36, 1] },
+          layers: [],
+        },
+      };
+    }
+
     const v2Check = parsePortableMotionDocument(raw);
     if (v2Check.valid && v2Check.document) {
       return {
