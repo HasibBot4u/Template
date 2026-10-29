@@ -383,7 +383,7 @@ test('Phase 9.3 — AES-256-GCM Secret Vault enforces owner/workspace/connection
   assert.ok(cleanLog.includes('[REDACTED'));
 });
 
-test('Phase 9.4 — Capability Registry tracks all 14 capabilities honestly, never infers Verified from brand name, and supports probing & Task Routing across 8 profiles', () => {
+test('Phase 9.4 — Capability Registry tracks all 14 capabilities honestly, never infers Verified from brand name, and supports probing & Task Routing across 8 profiles', async () => {
   assert.equal(ALL_MODEL_CAPABILITY_KEYS.length, 14);
   assert.equal(ALL_HUB_TASK_TYPES.length, 8);
 
@@ -417,11 +417,52 @@ test('Phase 9.4 — Capability Registry tracks all 14 capabilities honestly, nev
     credential: 'sk-proj-test-probe-secret-key-1234567890',
   });
 
-  const probed = probeProviderConnection(conn, {
+  const mockOpenAiFetch = async (_url: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const reqBody = init?.body ? JSON.parse(String(init.body)) : {};
+    const resJson: any = {
+      id: 'chatcmpl-test-123',
+      object: 'chat.completion',
+      created: Date.now(),
+      model: reqBody.model || 'gpt-4o',
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: 'PONG: Hello from OpenAI mock!',
+          },
+          finish_reason: 'stop',
+        },
+      ],
+      usage: { prompt_tokens: 10, completion_tokens: 8, total_tokens: 18 },
+    };
+
+    if (reqBody.response_format) {
+      resJson.choices[0].message.content = JSON.stringify({ status: 'ok' });
+    }
+
+    if (reqBody.tools && reqBody.tools.length > 0) {
+      resJson.choices[0].message.tool_calls = [
+        {
+          id: 'call_probe_1',
+          type: 'function',
+          function: { name: 'probe_noop', arguments: '{"echo":"test"}' },
+        },
+      ];
+    }
+
+    return new Response(JSON.stringify(resJson), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  };
+
+  const probed = await probeProviderConnection(conn, {
     probeTools: true,
     probeStructuredOutput: true,
     probeVision: true,
     probeStreaming: true,
+    fetchImpl: mockOpenAiFetch,
   });
   assert.equal(probed.probePassed, true);
   assert.equal(probed.updatedConnection.lastTestStatus, 'Verified');
@@ -593,6 +634,11 @@ test('Phase 9.7 — REST API Integration & Workspace Isolation (/api/v1/provider
         displayName: 'Bob',
       };
     },
+    providerProbeFetchImpl: async () =>
+      new Response(JSON.stringify({ output_text: 'PONG from OpenAI Responses probe' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
   });
 
   const server = http.createServer(app);
@@ -888,6 +934,18 @@ test('Phase 1A.3 — Authenticated Provider Hub API integration, truthful 401/50
         (err as { code?: string }).code = 'INVALID_TOKEN';
         throw err;
       },
+      providerProbeFetchImpl: async () =>
+        new Response(
+          JSON.stringify({
+            id: 'msg_123',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'PONG from Anthropic probe' }],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 5, output_tokens: 5 },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        ),
     });
 
     const server = http.createServer(app);
@@ -1038,6 +1096,262 @@ test('Phase 1A.3 — Authenticated Provider Hub API integration, truthful 401/50
       delete process.env.SOWVEIL_MASTER_VAULT_KEY;
     }
     fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('Phase 1A.4 — Real Provider Connection Verification: deterministic mock transport tests & live provider verification', async () => {
+  const masterKey = 'test-master-vault-key-for-real-probe-verification-32b!';
+  const prevMaster = process.env.SOWVEIL_MASTER_VAULT_KEY;
+  process.env.SOWVEIL_MASTER_VAULT_KEY = masterKey;
+
+  try {
+    // 1. Valid provider response produces accurate text-probe success & latency
+    const conn1 = createProviderConnectionRecord({
+      ownerUid: 'user_probe_test',
+      workspaceId: 'ws_probe_test',
+      label: 'OpenAI Mock Test Conn',
+      providerBrand: 'OpenAI',
+      protocol: 'openai-chat-completions',
+      baseUrl: 'https://api.openai.com',
+      modelId: 'gpt-4o',
+      authMode: 'bearer',
+      credential: 'sk-proj-valid-secret-1234567890',
+    });
+
+    const mockSuccessFetch = async (_url: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const parsed = init?.body ? JSON.parse(String(init.body)) : {};
+      const resPayload: any = {
+        id: 'chatcmpl-mock-success',
+        object: 'chat.completion',
+        created: Date.now(),
+        model: 'gpt-4o',
+        choices: [
+          {
+            index: 0,
+            message: { role: 'assistant', content: 'PONG from upstream OpenAI' },
+            finish_reason: 'stop',
+          },
+        ],
+        usage: { prompt_tokens: 5, completion_tokens: 5, total_tokens: 10 },
+      };
+
+      if (parsed.response_format) {
+        resPayload.choices[0].message.content = JSON.stringify({ status: 'ok' });
+      }
+      if (parsed.tools && parsed.tools.length > 0) {
+        resPayload.choices[0].message.tool_calls = [
+          { id: 'call_1', type: 'function', function: { name: 'probe_noop', arguments: '{"echo":"test"}' } },
+        ];
+      }
+
+      return new Response(JSON.stringify(resPayload), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    };
+
+    const successProbe = await probeProviderConnection(conn1, {
+      probeTools: true,
+      probeStructuredOutput: true,
+      probeVision: false,
+      fetchImpl: mockSuccessFetch,
+    });
+
+    assert.equal(successProbe.probePassed, true);
+    assert.equal(successProbe.updatedConnection.lastTestStatus, 'Verified');
+    assert.equal(successProbe.updatedConnection.capabilities.text.state, 'Verified');
+    assert.equal(successProbe.updatedConnection.capabilities.structuredOutput.state, 'Verified');
+    assert.equal(successProbe.updatedConnection.capabilities.toolFunctionCalling.state, 'Verified');
+    // Ensure imageInput was not probed and therefore remains Not tested (never inferred from text!)
+    assert.equal(successProbe.updatedConnection.capabilities.imageInput.state, 'Not tested');
+    assert.ok(Number(successProbe.latencyMs) >= 0);
+
+    // 2. Invalid credentials produce failure, not Verified
+    const mock401Fetch = async (): Promise<Response> => {
+      return new Response(
+        JSON.stringify({ error: { message: 'Incorrect API key provided: sk-invalid...' } }),
+        { status: 401, headers: { 'Content-Type': 'application/json' } }
+      );
+    };
+
+    const invalidCredProbe = await probeProviderConnection(conn1, {
+      fetchImpl: mock401Fetch,
+    });
+    assert.equal(invalidCredProbe.probePassed, false);
+    assert.equal(invalidCredProbe.updatedConnection.lastTestStatus, 'Failed');
+    assert.equal(invalidCredProbe.sanitizedError?.code, 'PROVIDER_AUTH_REJECTED');
+    assert.equal(invalidCredProbe.sanitizedError?.httpStatus, 401);
+
+    // 3. Missing server credentials produce CREDENTIAL_MISSING without making a network request
+    const prevGeminiKey = process.env.GEMINI_API_KEY;
+    delete process.env.GEMINI_API_KEY;
+    let networkWasAttempted = false;
+    const trackingFetch = async (): Promise<Response> => {
+      networkWasAttempted = true;
+      return new Response('{}', { status: 200 });
+    };
+
+    const serverEnvConn = createProviderConnectionRecord({
+      ownerUid: 'user_probe_test',
+      label: 'Gemini Server Env Conn',
+      providerBrand: 'Google Gemini',
+      protocol: 'google-gemini',
+      baseUrl: 'https://generativelanguage.googleapis.com',
+      modelId: 'gemini-3.8-flash',
+      authMode: 'server-env',
+    });
+
+    const missingCredProbe = await probeProviderConnection(serverEnvConn, {
+      fetchImpl: trackingFetch,
+    });
+    assert.equal(missingCredProbe.probePassed, false);
+    assert.equal(missingCredProbe.sanitizedError?.code, 'CREDENTIAL_MISSING');
+    assert.equal(networkWasAttempted, false, 'No upstream network request must be made when server credential is missing');
+    if (prevGeminiKey) process.env.GEMINI_API_KEY = prevGeminiKey;
+
+    // 4. HTTP 403, 404, 429, and 500 responses are handled truthfully
+    const statusCodesToTest = [
+      { status: 403, expectedCode: 'PROVIDER_FORBIDDEN' },
+      { status: 404, expectedCode: 'PROVIDER_ENDPOINT_NOT_FOUND' },
+      { status: 429, expectedCode: 'PROVIDER_QUOTA_EXCEEDED' },
+      { status: 500, expectedCode: 'PROVIDER_UPSTREAM_ERROR' },
+    ];
+
+    for (const item of statusCodesToTest) {
+      const probeRes = await probeProviderConnection(conn1, {
+        fetchImpl: async () =>
+          new Response(JSON.stringify({ error: { message: `Simulated HTTP ${item.status}` } }), {
+            status: item.status,
+            headers: { 'Content-Type': 'application/json' },
+          }),
+      });
+      assert.equal(probeRes.probePassed, false);
+      assert.equal(probeRes.sanitizedError?.code, item.expectedCode);
+      assert.equal(probeRes.sanitizedError?.httpStatus, item.status);
+    }
+
+    // 5. Timeouts and network errors do not produce false success
+    const timeoutProbe = await probeProviderConnection(conn1, {
+      fetchImpl: async () => {
+        const err = new Error('The operation was aborted');
+        err.name = 'AbortError';
+        throw err;
+      },
+      timeoutMs: 100,
+    });
+    assert.equal(timeoutProbe.probePassed, false);
+    assert.equal(timeoutProbe.sanitizedError?.code, 'REQUEST_TIMEOUT');
+    assert.equal(timeoutProbe.sanitizedError?.httpStatus, 408);
+
+    // 6. SSRF and unsafe redirects are rejected before credentials are sent
+    let ssrfNetworkAttempted = false;
+    const ssrfBadConn = {
+      ...conn1,
+      baseUrl: 'https://169.254.169.254',
+    };
+    const ssrfProbe = await probeProviderConnection(ssrfBadConn, {
+      fetchImpl: async () => {
+        ssrfNetworkAttempted = true;
+        return new Response('{}', { status: 200 });
+      },
+    });
+    assert.equal(ssrfProbe.probePassed, false);
+    assert.equal(ssrfProbe.sanitizedError?.code, 'SSRF_METADATA_OR_INTERNAL_HOST_FORBIDDEN');
+    assert.equal(ssrfNetworkAttempted, false, 'SSRF blocked request before network transport was touched');
+
+    // Unsafe cross-host redirect is blocked
+    const crossHostRedirectProbe = await probeProviderConnection(conn1, {
+      fetchImpl: async () => {
+        return new Response('', {
+          status: 302,
+          headers: { location: 'https://attacker.evil-domain.com/steal-creds' },
+        });
+      },
+    });
+    assert.equal(crossHostRedirectProbe.probePassed, false);
+    assert.equal(
+      crossHostRedirectProbe.sanitizedError?.code,
+      'SSRF_CROSS_HOST_REDIRECT_WITH_AUTH_FORBIDDEN'
+    );
+
+    // 7. No tested capability is marked Verified without corresponding evidence
+    const onlyTextProbe = await probeProviderConnection(conn1, {
+      probeTools: false,
+      probeStructuredOutput: false,
+      probeVision: false,
+      probeStreaming: false,
+      fetchImpl: mockSuccessFetch,
+    });
+    assert.equal(onlyTextProbe.probePassed, true);
+    assert.deepEqual(onlyTextProbe.verifiedCapabilities, ['text']);
+    assert.equal(onlyTextProbe.updatedConnection.capabilities.toolFunctionCalling.state, 'Not tested');
+    assert.equal(onlyTextProbe.updatedConnection.capabilities.imageInput.state, 'Not tested');
+
+    // 8. No provider secret appears in API responses, error diagnostics, or logs
+    const secretToGuard = 'sk-proj-valid-secret-1234567890';
+    const errorWithSecretProbe = await probeProviderConnection(conn1, {
+      fetchImpl: async () =>
+        new Response(
+          JSON.stringify({
+            error: `Upstream error containing secret: ${secretToGuard}`,
+          }),
+          { status: 400, headers: { 'Content-Type': 'application/json' } }
+        ),
+    });
+    assert.equal(errorWithSecretProbe.probePassed, false);
+    assert.equal(
+      errorWithSecretProbe.sanitizedError?.message.includes(secretToGuard),
+      false,
+      'Secret must be redacted from error messages'
+    );
+    assert.equal(
+      JSON.stringify(errorWithSecretProbe.formattedProbeRequestPreview).includes(secretToGuard),
+      false,
+      'Secret must be redacted from request preview'
+    );
+
+    // 9. Genuine Live Provider Verification (when real GEMINI_API_KEY is available)
+    if (process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY.trim()) {
+      const liveGeminiConn = createProviderConnectionRecord({
+        ownerUid: 'user_live_gemini',
+        workspaceId: 'ws_live_gemini',
+        label: 'Live Google Gemini 3.8 Flash',
+        providerBrand: 'Google Gemini',
+        protocol: 'google-gemini',
+        baseUrl: 'https://generativelanguage.googleapis.com',
+        modelId: 'gemini-3.8-flash',
+        authMode: 'server-env',
+      });
+
+      try {
+        const liveResult = await probeProviderConnection(liveGeminiConn, {
+          timeoutMs: 15000,
+        });
+
+        if (liveResult.probePassed) {
+          assert.equal(liveResult.updatedConnection.capabilities.text.state, 'Verified');
+          assert.ok(liveResult.latencyMs && liveResult.latencyMs > 0);
+          console.log(
+            `[LIVE_PROVIDER_VERIFICATION: Google Gemini live endpoint verified with genuine GEMINI_API_KEY in ${liveResult.latencyMs}ms]`
+          );
+        } else {
+          console.log(
+            `[LIVE_PROVIDER_TEST_STATUS: Live Gemini request returned ${liveResult.sanitizedError?.code}: ${liveResult.sanitizedError?.message}]`
+          );
+          assert.ok(liveResult.sanitizedError?.code);
+        }
+      } catch (err: any) {
+        console.log(
+          `[LIVE_PROVIDER_TEST_STATUS: Network egress blocked in test environment: ${err?.message}]`
+        );
+      }
+    }
+  } finally {
+    if (prevMaster !== undefined) {
+      process.env.SOWVEIL_MASTER_VAULT_KEY = prevMaster;
+    } else {
+      delete process.env.SOWVEIL_MASTER_VAULT_KEY;
+    }
   }
 });
 

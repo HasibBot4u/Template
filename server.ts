@@ -1,3 +1,4 @@
+import http from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import express from 'express';
@@ -16,10 +17,14 @@ async function startServer() {
     path.join(__dirname, '.data', 'sowveil-durable-store.json');
   const app = createApiApp({ persistenceFilePath });
   const PORT = Number(process.env.PORT || 3000);
+  const server = http.createServer(app);
 
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: false,
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -31,9 +36,18 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  server.on('error', (err: NodeJS.ErrnoException) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`Port ${PORT} is already in use. Please retry or release the port.`);
+    } else {
+      console.error('Server error:', err);
+    }
+  });
+
+  server.listen(PORT, '0.0.0.0', () => {
     console.log(`Sowveil Studio Server listening on http://0.0.0.0:${PORT}`);
   });
 }
 
 void startServer();
+

@@ -168,10 +168,11 @@ export const EditingStudioWorkspace: React.FC<EditingStudioWorkspaceProps> = ({
 }) => {
   // Resolve initial CanonicalProjectDocument with localStorage autosave recovery
   const initialCanonicalDoc = useMemo<CanonicalProjectDocument>(() => {
+    const safeOwnerUid = ownerUid || 'user-local';
     if (initialProject) {
       try {
         const savedDraft = window.localStorage.getItem(
-          `sowveil.canonical.autosave.${initialProject.id}`
+          `sowveil.canonical.autosave.${safeOwnerUid}.${initialProject.id}`
         );
         if (savedDraft) {
           const parsed = JSON.parse(savedDraft);
@@ -193,7 +194,7 @@ export const EditingStudioWorkspace: React.FC<EditingStudioWorkspaceProps> = ({
     if (sourceLibraryProject) {
       try {
         const savedDraft = window.localStorage.getItem(
-          `sowveil.canonical.autosave.${sourceLibraryProject.id}`
+          `sowveil.canonical.autosave.${safeOwnerUid}.${sourceLibraryProject.id}`
         );
         if (savedDraft) {
           const parsed = JSON.parse(savedDraft);
@@ -202,7 +203,7 @@ export const EditingStudioWorkspace: React.FC<EditingStudioWorkspaceProps> = ({
             return validated.project;
           }
         }
-        const migrated = migrateToCanonicalProject(sourceLibraryProject, ownerUid);
+        const migrated = migrateToCanonicalProject(sourceLibraryProject, safeOwnerUid);
         return migrated.project;
       } catch {
         // Fallback below
@@ -213,14 +214,14 @@ export const EditingStudioWorkspace: React.FC<EditingStudioWorkspaceProps> = ({
       return createCanonicalProjectFromTemplate({
         template: sourceTemplate,
         variant: sourceVariant,
-        ownerUid,
+        ownerUid: safeOwnerUid,
       });
     }
 
-    // Try recovering last active project in standalone route mode
+    // Try recovering last active project in standalone route mode (user-scoped)
     try {
       const lastActiveRaw = window.localStorage.getItem(
-        'sowveil.canonical.lastActiveProject'
+        `sowveil.canonical.lastActiveProject.${safeOwnerUid}`
       );
       if (lastActiveRaw) {
         const parsed = JSON.parse(lastActiveRaw);
@@ -234,7 +235,7 @@ export const EditingStudioWorkspace: React.FC<EditingStudioWorkspaceProps> = ({
     }
 
     return createMinimalCanonicalProject({
-      ownerUid,
+      ownerUid: safeOwnerUid,
       title: 'Sowveil Editing Studio Composition',
       aspectRatio: '9:16',
       fps: 60,
@@ -351,18 +352,19 @@ export const EditingStudioWorkspace: React.FC<EditingStudioWorkspaceProps> = ({
     return () => cancelAnimationFrame(rafId);
   }, [isPlaying, loopEnabled, project.canvas.durationSec]);
 
-  // Frequent autosave to localStorage + recovery snapshot
+  // Frequent autosave to localStorage + recovery snapshot (user-scoped)
   useEffect(() => {
     setAutosaveState('saving');
+    const safeOwnerUid = ownerUid || 'user-local';
     const timer = window.setTimeout(() => {
       try {
         const serialized = serializeCanonicalProject(project);
         window.localStorage.setItem(
-          `sowveil.canonical.autosave.${project.id}`,
+          `sowveil.canonical.autosave.${safeOwnerUid}.${project.id}`,
           serialized
         );
         window.localStorage.setItem(
-          'sowveil.canonical.lastActiveProject',
+          `sowveil.canonical.lastActiveProject.${safeOwnerUid}`,
           serialized
         );
       } catch {
@@ -371,7 +373,7 @@ export const EditingStudioWorkspace: React.FC<EditingStudioWorkspaceProps> = ({
       setAutosaveState('saved');
     }, 220);
     return () => window.clearTimeout(timer);
-  }, [project]);
+  }, [project, ownerUid]);
 
   const dispatchCommand = (
     cmd: CanonicalProjectCommand,

@@ -206,6 +206,7 @@ export interface ApiAppOptions {
   ownerBootstrapSecret?: string;
   storageEnabled?: boolean;
   persistenceFilePath?: string | null;
+  providerProbeFetchImpl?: typeof fetch;
 }
 
 interface AuthenticatedRequest extends Request {
@@ -6364,70 +6365,78 @@ export function createApiApp(options: ApiAppOptions = {}) {
     }
   });
 
+  const handleProbeConnection = async (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const uid = authReq.authIdentity!.uid;
+    const existing = providerConnectionsStore.get(req.params.id);
+    if (!existing) {
+      return sendError(
+        res,
+        authReq.requestId,
+        404,
+        'CONNECTION_NOT_FOUND',
+        'Provider connection not found.'
+      );
+    }
+    if (existing.ownerUid !== uid) {
+      return sendError(
+        res,
+        authReq.requestId,
+        403,
+        'FORBIDDEN_CONNECTION_ACCESS',
+        'Workspace isolation violation: cannot test another user’s provider connection.'
+      );
+    }
+
+    const body = req.body || {};
+    const probeResult = await probeProviderConnection(existing, {
+      probeTools: Boolean(body.probeTools),
+      probeStructuredOutput: Boolean(body.probeStructuredOutput),
+      probeVision: Boolean(body.probeVision),
+      probeStreaming: Boolean(body.probeStreaming),
+      redirectHopUrlsToValidate: Array.isArray(body.redirectHopUrlsToValidate)
+        ? body.redirectHopUrlsToValidate
+        : undefined,
+      fetchImpl: options.providerProbeFetchImpl,
+    });
+
+    providerConnectionsStore.set(existing.id, probeResult.updatedConnection);
+    persistState();
+
+    recordAudit(
+      uid,
+      authReq.authIdentity!.email,
+      probeResult.probePassed
+        ? 'PROVIDER_CONNECTION_PROBE_VERIFIED'
+        : 'PROVIDER_CONNECTION_PROBE_FAILED',
+      existing.id,
+      probeResult.probePassed
+        ? `Verified capabilities [${probeResult.verifiedCapabilities.join(', ')}] on ${existing.label}`
+        : `Probe failed on ${existing.label}: ${probeResult.sanitizedError?.code} - ${probeResult.sanitizedError?.message}`,
+      authReq.requestId,
+      'system',
+      probeResult.probePassed ? 'success' : 'denied'
+    );
+
+    return sendOk(res, authReq.requestId, {
+      connection: toPublicProviderConnectionView(probeResult.updatedConnection),
+      probePassed: probeResult.probePassed,
+      verifiedCapabilities: probeResult.verifiedCapabilities,
+      formattedProbeRequestPreview: probeResult.formattedProbeRequestPreview,
+      sanitizedError: probeResult.sanitizedError,
+      latencyMs: probeResult.latencyMs,
+    });
+  };
+
   app.post(
     '/api/v1/provider-hub/connections/:id/test',
     requireAuth,
-    (req: Request, res: Response) => {
-      const authReq = req as AuthenticatedRequest;
-      const uid = authReq.authIdentity!.uid;
-      const existing = providerConnectionsStore.get(req.params.id);
-      if (!existing) {
-        return sendError(
-          res,
-          authReq.requestId,
-          404,
-          'CONNECTION_NOT_FOUND',
-          'Provider connection not found.'
-        );
-      }
-      if (existing.ownerUid !== uid) {
-        return sendError(
-          res,
-          authReq.requestId,
-          403,
-          'FORBIDDEN_CONNECTION_ACCESS',
-          'Workspace isolation violation: cannot test another user’s provider connection.'
-        );
-      }
-
-      const body = req.body || {};
-      const probeResult = probeProviderConnection(existing, {
-        probeTools: Boolean(body.probeTools),
-        probeStructuredOutput: Boolean(body.probeStructuredOutput),
-        probeVision: Boolean(body.probeVision),
-        probeStreaming: Boolean(body.probeStreaming),
-        simulateFailureCode: body.simulateFailureCode,
-        redirectHopUrlsToValidate: Array.isArray(body.redirectHopUrlsToValidate)
-          ? body.redirectHopUrlsToValidate
-          : undefined,
-      });
-
-      providerConnectionsStore.set(existing.id, probeResult.updatedConnection);
-      persistState();
-
-      recordAudit(
-        uid,
-        authReq.authIdentity!.email,
-        probeResult.probePassed
-          ? 'PROVIDER_CONNECTION_PROBE_VERIFIED'
-          : 'PROVIDER_CONNECTION_PROBE_FAILED',
-        existing.id,
-        probeResult.probePassed
-          ? `Verified capabilities [${probeResult.verifiedCapabilities.join(', ')}] on ${existing.label}`
-          : `Probe failed on ${existing.label}: ${probeResult.sanitizedError?.code} - ${probeResult.sanitizedError?.message}`,
-        authReq.requestId,
-        'system',
-        probeResult.probePassed ? 'success' : 'denied'
-      );
-
-      return sendOk(res, authReq.requestId, {
-        connection: toPublicProviderConnectionView(probeResult.updatedConnection),
-        probePassed: probeResult.probePassed,
-        verifiedCapabilities: probeResult.verifiedCapabilities,
-        formattedProbeRequestPreview: probeResult.formattedProbeRequestPreview,
-        sanitizedError: probeResult.sanitizedError,
-      });
-    }
+    handleProbeConnection
+  );
+  app.post(
+    '/api/v1/provider-hub/connections/:id/probe',
+    requireAuth,
+    handleProbeConnection
   );
 
   app.patch(

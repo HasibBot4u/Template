@@ -1007,7 +1007,7 @@ export default function App() {
           path="/app/ai-director"
           element={wrapUserProtected(
             <AiDirectorWorkspace
-              authToken={null}
+              userUid={currentUser?.uid}
               onBackToReference={() => {
                 window.location.href = '/app/text-animation';
               }}

@@ -24,6 +24,7 @@ import {
   RenderOutputFormat,
 } from '../services/renderExportQaEngine';
 import { auth } from '../services/firebaseClient';
+import { executeAuthenticatedApiRequest } from '../services/apiClient';
 import {
   Activity,
   AlertTriangle,
@@ -52,6 +53,8 @@ interface RenderExportQaWorkspaceProps {
     message: string,
     tone?: 'info' | 'warning' | 'error' | 'success'
   ) => void;
+  getAuthToken?: (forceRefresh?: boolean) => Promise<string | null>;
+  fetchImpl?: typeof fetch;
 }
 
 const FORMAT_OPTIONS: Array<{
@@ -195,7 +198,26 @@ export const RenderExportQaWorkspace: React.FC<RenderExportQaWorkspaceProps> = (
   userUid,
   projects,
   onNotify,
+  getAuthToken,
+  fetchImpl,
 }) => {
+  const apiRequest = useCallback(
+    async <T,>(
+      path: string,
+      options: {
+        method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+        body?: unknown;
+      } = {}
+    ) => {
+      return executeAuthenticatedApiRequest<T>(path, {
+        ...options,
+        getAuthToken,
+        fetchImpl,
+      });
+    },
+    [getAuthToken, fetchImpl]
+  );
+
   const sampleCanonicalProject = useMemo(
     () => createKnownGoodSampleCanonicalProject(userUid),
     [userUid]
@@ -271,40 +293,21 @@ export const RenderExportQaWorkspace: React.FC<RenderExportQaWorkspaceProps> = (
     );
   }, [activeCanonicalProject, executionTier, sampleTimestampSec]);
 
-  const getAuthHeaders = useCallback(async (): Promise<Record<string, string>> => {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-    };
-    try {
-      const current = auth?.currentUser;
-      if (current) {
-        const token = await current.getIdToken();
-        if (token) headers.Authorization = `Bearer ${token}`;
-      }
-    } catch {
-      // Fallback to local execution if offline
-    }
-    return headers;
-  }, []);
-
   const loadJobs = useCallback(async () => {
     try {
-      const headers = await getAuthHeaders();
-      const res = await fetch('/api/v1/render-export/jobs', { headers });
-      if (res.ok) {
-        const payload = await res.json();
-        if (payload?.ok && Array.isArray(payload.data?.jobs)) {
-          setJobs(payload.data.jobs);
-          if (!selectedJobId && payload.data.jobs.length > 0) {
-            setSelectedJobId(payload.data.jobs[0].id);
-          }
-          return;
+      const res = await apiRequest<{ jobs: DurableRenderExportJobRecord[] }>(
+        '/api/v1/render-export/jobs'
+      );
+      if (res.ok && res.data && Array.isArray(res.data.jobs)) {
+        setJobs(res.data.jobs);
+        if (!selectedJobId && res.data.jobs.length > 0) {
+          setSelectedJobId(res.data.jobs[0].id);
         }
       }
     } catch {
       // Keep local jobs state
     }
-  }, [getAuthHeaders, selectedJobId]);
+  }, [apiRequest, selectedJobId]);
 
   useEffect(() => {
     void loadJobs();
@@ -314,60 +317,42 @@ export const RenderExportQaWorkspace: React.FC<RenderExportQaWorkspaceProps> = (
     const tier = overrideTier || executionTier;
     setBusy(true);
     try {
-      const headers = await getAuthHeaders();
-      const res = await fetch('/api/v1/render-export/jobs', {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({
-          projectDoc: activeCanonicalProject,
-          executionTier: tier,
-          outputFormat,
-          targetAdapter,
-          sampleTimestampSec,
-          downscaleAssetsForProxy:
-            tier === 'proxy-render' ? true : downscaleAssetsForProxy,
-          userApprovedDataUpload,
-        }),
-      });
-
-      if (res.ok) {
-        const payload = await res.json();
-        if (payload?.ok && payload.data?.job) {
-          const createdJob: DurableRenderExportJobRecord = payload.data.job;
-          setJobs((prev) => [
-            createdJob,
-            ...prev.filter((j) => j.id !== createdJob.id),
-          ]);
-          setSelectedJobId(createdJob.id);
-          onNotify(
-            createdJob.stage === 'ready'
-              ? `Completed ${tier} (${outputFormat}) — 11-point QA: ${createdJob.qaReport?.checksPassedCount}/${createdJob.qaReport?.checksTotalCount} passed.`
-              : `Job state: ${createdJob.stage} (${createdJob.sanitizedErrorMessage || 'See details'}).`,
-            createdJob.stage === 'ready' ? 'success' : 'warning'
-          );
-          return;
+      const res = await apiRequest<{ job: DurableRenderExportJobRecord }>(
+        '/api/v1/render-export/jobs',
+        {
+          method: 'POST',
+          body: {
+            projectDoc: activeCanonicalProject,
+            executionTier: tier,
+            outputFormat,
+            targetAdapter,
+            sampleTimestampSec,
+            downscaleAssetsForProxy:
+              tier === 'proxy-render' ? true : downscaleAssetsForProxy,
+            userApprovedDataUpload,
+          },
         }
+      );
+
+      if (res.ok && res.data?.job) {
+        const createdJob: DurableRenderExportJobRecord = res.data.job;
+        setJobs((prev) => [
+          createdJob,
+          ...prev.filter((j) => j.id !== createdJob.id),
+        ]);
+        setSelectedJobId(createdJob.id);
+        onNotify(
+          createdJob.stage === 'ready'
+            ? `Completed ${tier} (${outputFormat}) — 11-point QA: ${createdJob.qaReport?.checksPassedCount}/${createdJob.qaReport?.checksTotalCount} passed.`
+            : `Job state: ${createdJob.stage} (${createdJob.sanitizedErrorMessage || 'See details'}).`,
+          createdJob.stage === 'ready' ? 'success' : 'warning'
+        );
+        return;
       }
 
-      // Deterministic local fallback when running without live server auth token
-      const localJob = createAndExecuteCanonicalRenderJob({
-        ownerUid: userUid,
-        projectDoc: activeCanonicalProject,
-        executionTier: tier,
-        outputFormat,
-        targetAdapter,
-        sampleTimestampSec,
-        downscaleAssetsForProxy:
-          tier === 'proxy-render' ? true : downscaleAssetsForProxy,
-        userApprovedDataUpload,
-      });
-      setJobs((prev) => [localJob, ...prev]);
-      setSelectedJobId(localJob.id);
       onNotify(
-        localJob.stage === 'ready'
-          ? `Completed ${tier} (${outputFormat}) — 11-point QA: ${localJob.qaReport?.checksPassedCount}/${localJob.qaReport?.checksTotalCount} passed.`
-          : `Job state: ${localJob.stage} — ${localJob.sanitizedErrorMessage}`,
-        localJob.stage === 'ready' ? 'success' : 'warning'
+        `Render job rejected: ${res.errorMessage || 'Server error processing render job.'}`,
+        'error'
       );
     } finally {
       setBusy(false);
@@ -375,75 +360,53 @@ export const RenderExportQaWorkspace: React.FC<RenderExportQaWorkspaceProps> = (
   };
 
   const handleCancelJob = async (job: DurableRenderExportJobRecord) => {
-    try {
-      const headers = await getAuthHeaders();
-      const res = await fetch(`/api/v1/render-export/jobs/${job.id}/cancel`, {
+    const res = await apiRequest<{ job: DurableRenderExportJobRecord }>(
+      `/api/v1/render-export/jobs/${job.id}/cancel`,
+      {
         method: 'POST',
-        headers,
-        body: JSON.stringify({ reason: 'Cancelled by user in Render & QA Studio' }),
-      });
-      if (res.ok) {
-        const payload = await res.json();
-        if (payload?.ok && payload.data?.job) {
-          setJobs((prev) =>
-            prev.map((j) => (j.id === job.id ? payload.data.job : j))
-          );
-          onNotify(`Cancelled render job ${job.id}.`, 'info');
-          return;
-        }
+        body: { reason: 'Cancelled by user in Render & QA Studio' },
       }
-    } catch {
-      // Fallback
-    }
-    const cancelled = cancelRenderExportJob(
-      job,
-      'Cancelled by user in Render & QA Studio'
     );
-    setJobs((prev) => prev.map((j) => (j.id === job.id ? cancelled : j)));
-    onNotify(`Cancelled render job ${job.id}.`, 'info');
+    if (res.ok && res.data?.job) {
+      setJobs((prev) =>
+        prev.map((j) => (j.id === job.id ? res.data!.job : j))
+      );
+      onNotify(`Cancelled render job ${job.id}.`, 'info');
+    } else {
+      onNotify(
+        `Failed to cancel job: ${res.errorMessage || 'Server rejected cancellation.'}`,
+        'error'
+      );
+    }
   };
 
   const handleRetryJob = async (job: DurableRenderExportJobRecord) => {
     setBusy(true);
     try {
-      const headers = await getAuthHeaders();
-      const res = await fetch(`/api/v1/render-export/jobs/${job.id}/retry`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({
-          projectDoc: activeCanonicalProject,
-          userApprovedDataUpload,
-        }),
-      });
-      if (res.ok) {
-        const payload = await res.json();
-        if (payload?.ok && payload.data?.job) {
-          setJobs((prev) =>
-            prev.map((j) => (j.id === job.id ? payload.data.job : j))
-          );
-          onNotify(
-            `Retried job ${job.id} (attempt #${payload.data.job.retryPolicy.attemptCount}).`,
-            'success'
-          );
-          return;
+      const res = await apiRequest<{ job: DurableRenderExportJobRecord }>(
+        `/api/v1/render-export/jobs/${job.id}/retry`,
+        {
+          method: 'POST',
+          body: {
+            projectDoc: activeCanonicalProject,
+            userApprovedDataUpload,
+          },
         }
-      }
-      const retried = createAndExecuteCanonicalRenderJob({
-        ownerUid: userUid,
-        projectDoc: activeCanonicalProject,
-        executionTier: job.executionTier,
-        outputFormat: job.outputFormat,
-        targetAdapter: job.targetAdapter,
-        sampleTimestampSec: job.sampleTimestampSec,
-        downscaleAssetsForProxy: job.downscaleAssetsForProxy,
-        userApprovedDataUpload,
-        existingJobToRetry: job,
-      });
-      setJobs((prev) => prev.map((j) => (j.id === job.id ? retried : j)));
-      onNotify(
-        `Retried job ${job.id} (attempt #${retried.retryPolicy.attemptCount}).`,
-        'success'
       );
+      if (res.ok && res.data?.job) {
+        setJobs((prev) =>
+          prev.map((j) => (j.id === job.id ? res.data!.job : j))
+        );
+        onNotify(
+          `Retried job ${job.id} (attempt #${res.data.job.retryPolicy.attemptCount}).`,
+          'success'
+        );
+      } else {
+        onNotify(
+          `Retry failed: ${res.errorMessage || 'Server rejected retry.'}`,
+          'error'
+        );
+      }
     } finally {
       setBusy(false);
     }
@@ -481,8 +444,15 @@ export const RenderExportQaWorkspace: React.FC<RenderExportQaWorkspaceProps> = (
         return;
       }
 
-      const headers = await getAuthHeaders();
-      const res = await fetch(`/api/v1/render-export/jobs/${job.id}/download`, {
+      const token = getAuthToken
+        ? await getAuthToken()
+        : await auth?.currentUser?.getIdToken();
+      const headers: Record<string, string> = {};
+      if (token) {
+        headers.Authorization = `Bearer ${token}`;
+      }
+      const doFetch = fetchImpl || fetch;
+      const res = await doFetch(`/api/v1/render-export/jobs/${job.id}/download`, {
         headers,
       });
       if (!res.ok) {

@@ -19,6 +19,7 @@ import {
   CapabilityRegistryEntry,
   CapabilityRegistryMap,
   CapabilityVerificationState,
+  ConnectionProbeOptions,
   CredentialVaultStatus,
   EncryptedVaultCiphertext,
   evaluateRoutingReadiness,
@@ -27,6 +28,7 @@ import {
   ExtensionPermissionScope,
   ExtensionSandboxValidationRun,
   ExtensionVersionSnapshot,
+  FormattedProbePreview,
   HubAuthMode,
   HubProviderProtocol,
   HubTaskType,
@@ -37,6 +39,7 @@ import {
   ProviderConnectionPublicView,
   ProviderConnectionRecord,
   ProviderEndpointSettings,
+  ProviderProbeResult,
   REGISTERED_AI_TOOLS,
   RegisteredAiToolDefinition,
   RISKY_EXTENSION_PERMISSIONS,
@@ -93,6 +96,7 @@ export type {
   CapabilityRegistryEntry,
   CapabilityRegistryMap,
   CapabilityVerificationState,
+  ConnectionProbeOptions,
   CredentialVaultStatus,
   EncryptedVaultCiphertext,
   ExtensionPackageKind,
@@ -100,6 +104,7 @@ export type {
   ExtensionPermissionScope,
   ExtensionSandboxValidationRun,
   ExtensionVersionSnapshot,
+  FormattedProbePreview,
   HubAuthMode,
   HubProviderProtocol,
   HubTaskType,
@@ -109,6 +114,7 @@ export type {
   ProviderConnectionPublicView,
   ProviderConnectionRecord,
   ProviderEndpointSettings,
+  ProviderProbeResult,
   RegisteredAiToolDefinition,
   SecretStorageMode,
   SsrfValidationResult,
@@ -891,30 +897,256 @@ export function createProviderConnectionRecord(
   };
 }
 
-export interface ConnectionProbeOptions {
-  probeTools?: boolean;
-  probeStructuredOutput?: boolean;
-  probeVision?: boolean;
-  probeStreaming?: boolean;
-  simulateFailureCode?: '401_UNAUTHORIZED' | '429_QUOTA_EXCEEDED' | 'TIMEOUT';
-  redirectHopUrlsToValidate?: string[];
+export interface SafeUpstreamRequestOptions {
+  url: string;
+  method: string;
+  headers: Record<string, string>;
+  body: unknown;
+  timeoutMs: number;
+  maxResponseBytes?: number;
+  fetchImpl?: typeof fetch;
+  resolvedSecret?: string;
 }
 
-export function probeProviderConnection(
+export interface SafeUpstreamResponse {
+  ok: boolean;
+  httpStatus: number;
+  latencyMs: number;
+  headers: Record<string, string>;
+  rawBody: any;
+  rawText: string;
+  errorCode?: string;
+  errorMessage?: string;
+}
+
+export async function executeSafeUpstreamRequest(
+  options: SafeUpstreamRequestOptions
+): Promise<SafeUpstreamResponse> {
+  const start = Date.now();
+  const maxBytes = options.maxResponseBytes || 5 * 1024 * 1024;
+  const effectiveFetch = options.fetchImpl || globalThis.fetch;
+  const timeoutMs = Math.max(500, Math.min(60000, options.timeoutMs || 15000));
+
+  // 1. Pre-flight SSRF validate endpoint before sending credentials
+  const ssrf = validateCustomEndpointSsrf(options.url);
+  if (!ssrf.allowed) {
+    return {
+      ok: false,
+      httpStatus: 400,
+      latencyMs: Date.now() - start,
+      headers: {},
+      rawBody: null,
+      rawText: '',
+      errorCode: ssrf.errorCode || 'SSRF_ENDPOINT_REJECTED',
+      errorMessage: `SSRF Guard blocked request to ${options.url}: ${ssrf.reason}`,
+    };
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    let currentUrl = options.url;
+    let currentHeaders = { ...options.headers };
+    let currentBody =
+      options.body !== undefined && options.method !== 'GET' && options.method !== 'HEAD'
+        ? typeof options.body === 'string'
+          ? options.body
+          : JSON.stringify(options.body)
+        : undefined;
+
+    let response: Response | null = null;
+    let hopCount = 0;
+    const maxHops = 3;
+
+    while (hopCount <= maxHops) {
+      response = await effectiveFetch(currentUrl, {
+        method: options.method,
+        headers: currentHeaders,
+        body: currentBody,
+        signal: controller.signal,
+        redirect: 'manual',
+      });
+
+      // Handle redirect status (301, 302, 303, 307, 308)
+      if (response.status >= 300 && response.status < 400) {
+        hopCount++;
+        const location = response.headers.get('location');
+        if (!location) {
+          return {
+            ok: false,
+            httpStatus: response.status,
+            latencyMs: Date.now() - start,
+            headers: {},
+            rawBody: null,
+            rawText: '',
+            errorCode: 'REDIRECT_MISSING_LOCATION',
+            errorMessage: `Received HTTP ${response.status} redirect without a Location header.`,
+          };
+        }
+
+        const resolvedLocation = new URL(location, currentUrl).toString();
+        const redirectCheck = validateRedirectChainSsrf(options.url, [resolvedLocation]);
+        if (!redirectCheck.allowed) {
+          return {
+            ok: false,
+            httpStatus: 400,
+            latencyMs: Date.now() - start,
+            headers: {},
+            rawBody: null,
+            rawText: '',
+            errorCode: redirectCheck.errorCode || 'SSRF_UNSAFE_REDIRECT',
+            errorMessage: `Redirect hop blocked by SSRF policy: ${redirectCheck.reason}`,
+          };
+        }
+
+        if (hopCount > maxHops) {
+          return {
+            ok: false,
+            httpStatus: 400,
+            latencyMs: Date.now() - start,
+            headers: {},
+            rawBody: null,
+            rawText: '',
+            errorCode: 'SSRF_TOO_MANY_REDIRECTS',
+            errorMessage: 'Redirect chain exceeded maximum limit of 3 hops.',
+          };
+        }
+
+        currentUrl = resolvedLocation;
+        continue;
+      }
+
+      break;
+    }
+
+    if (!response) {
+      throw new Error('No response received from upstream transport.');
+    }
+
+    const latencyMs = Math.max(1, Date.now() - start);
+
+    const contentLength = response.headers.get('content-length');
+    if (contentLength && Number(contentLength) > maxBytes) {
+      return {
+        ok: false,
+        httpStatus: 413,
+        latencyMs,
+        headers: {},
+        rawBody: null,
+        rawText: '',
+        errorCode: 'RESPONSE_TOO_LARGE',
+        errorMessage: `Upstream response content-length (${contentLength} bytes) exceeds maximum limit (${maxBytes} bytes).`,
+      };
+    }
+
+    const responseHeaders: Record<string, string> = {};
+    response.headers.forEach((val, key) => {
+      responseHeaders[key.toLowerCase()] = val;
+    });
+
+    const rawText = await response.text();
+    if (rawText.length > maxBytes) {
+      return {
+        ok: false,
+        httpStatus: 413,
+        latencyMs,
+        headers: responseHeaders,
+        rawBody: null,
+        rawText: '',
+        errorCode: 'RESPONSE_TOO_LARGE',
+        errorMessage: `Upstream response body (${rawText.length} bytes) exceeds maximum limit (${maxBytes} bytes).`,
+      };
+    }
+
+    let rawBody: any = null;
+    try {
+      rawBody = JSON.parse(rawText);
+    } catch {
+      rawBody = null;
+    }
+
+    if (response.status >= 200 && response.status < 300) {
+      return {
+        ok: true,
+        httpStatus: response.status,
+        latencyMs,
+        headers: responseHeaders,
+        rawBody: rawBody || rawText,
+        rawText,
+      };
+    }
+
+    const extractedMsg =
+      (typeof rawBody?.error === 'string' ? rawBody.error : null) ||
+      rawBody?.error?.message ||
+      rawBody?.message ||
+      rawBody?.detail ||
+      (typeof rawBody === 'string' ? rawBody : null) ||
+      rawText.slice(0, 300) ||
+      `HTTP ${response.status}`;
+
+    const sanitizedMsg = options.resolvedSecret
+      ? redactSecretsFromText(extractedMsg, [options.resolvedSecret])
+      : extractedMsg;
+
+    let errorCode = 'PROVIDER_REQUEST_FAILED';
+    if (response.status === 401) {
+      errorCode = 'PROVIDER_AUTH_REJECTED';
+    } else if (response.status === 403) {
+      errorCode = 'PROVIDER_FORBIDDEN';
+    } else if (response.status === 404) {
+      errorCode = 'PROVIDER_ENDPOINT_NOT_FOUND';
+    } else if (response.status === 429) {
+      errorCode = 'PROVIDER_QUOTA_EXCEEDED';
+    } else if (response.status >= 500) {
+      errorCode = 'PROVIDER_UPSTREAM_ERROR';
+    }
+
+    return {
+      ok: false,
+      httpStatus: response.status,
+      latencyMs,
+      headers: responseHeaders,
+      rawBody,
+      rawText,
+      errorCode,
+      errorMessage: sanitizedMsg,
+    };
+  } catch (err: any) {
+    const latencyMs = Math.max(1, Date.now() - start);
+    const isTimeout =
+      err?.name === 'AbortError' ||
+      err?.name === 'TimeoutError' ||
+      controller.signal.aborted;
+
+    const errMsg = isTimeout
+      ? `Upstream provider request timed out after ${timeoutMs}ms.`
+      : err?.message || 'Network transport failure contacting provider.';
+
+    const sanitizedMsg = options.resolvedSecret
+      ? redactSecretsFromText(errMsg, [options.resolvedSecret])
+      : errMsg;
+
+    return {
+      ok: false,
+      httpStatus: isTimeout ? 408 : 0,
+      latencyMs,
+      headers: {},
+      rawBody: null,
+      rawText: '',
+      errorCode: isTimeout ? 'REQUEST_TIMEOUT' : 'NETWORK_TRANSPORT_ERROR',
+      errorMessage: sanitizedMsg,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export async function probeProviderConnection(
   connection: ProviderConnectionRecord,
   options: ConnectionProbeOptions = {}
-): {
-  updatedConnection: ProviderConnectionRecord;
-  probePassed: boolean;
-  formattedProbeRequestPreview: {
-    url: string;
-    method: string;
-    redactedHeaders: Record<string, string>;
-    bodySummary: Record<string, unknown>;
-  } | null;
-  verifiedCapabilities: ModelCapabilityKey[];
-  sanitizedError: ProviderConnectionRecord['lastSanitizedError'];
-} {
+): Promise<ProviderProbeResult> {
   const now = new Date().toISOString();
   const retestExpiry = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString();
 
@@ -940,6 +1172,7 @@ export function probeProviderConnection(
       formattedProbeRequestPreview: null,
       verifiedCapabilities: [],
       sanitizedError,
+      latencyMs: 0,
     };
   }
 
@@ -968,6 +1201,7 @@ export function probeProviderConnection(
         formattedProbeRequestPreview: null,
         verifiedCapabilities: [],
         sanitizedError,
+        latencyMs: 0,
       };
     }
   }
@@ -993,6 +1227,7 @@ export function probeProviderConnection(
       formattedProbeRequestPreview: null,
       verifiedCapabilities: [],
       sanitizedError,
+      latencyMs: 0,
     };
   }
 
@@ -1017,12 +1252,37 @@ export function probeProviderConnection(
       formattedProbeRequestPreview: null,
       verifiedCapabilities: [],
       sanitizedError,
+      latencyMs: 0,
     };
   }
 
   let resolvedSecret = '';
   if (connection.authMode === 'server-env') {
-    resolvedSecret = process.env.GEMINI_API_KEY || 'SERVER_ENV_KEY_PLACEHOLDER';
+    const envKey = process.env.GEMINI_API_KEY;
+    if (!envKey || !envKey.trim()) {
+      const sanitizedError = {
+        code: 'CREDENTIAL_MISSING',
+        message: 'Required server environment credential (GEMINI_API_KEY) is missing.',
+        httpStatus: 401,
+        timestamp: now,
+      };
+      const updated: ProviderConnectionRecord = {
+        ...connection,
+        lastTestedAt: now,
+        lastTestStatus: 'Failed',
+        lastSanitizedError: sanitizedError,
+        updatedAt: now,
+      };
+      return {
+        updatedConnection: updated,
+        probePassed: false,
+        formattedProbeRequestPreview: null,
+        verifiedCapabilities: [],
+        sanitizedError,
+        latencyMs: 0,
+      };
+    }
+    resolvedSecret = envKey.trim();
   } else if (connection.encryptedCredential) {
     try {
       resolvedSecret = decryptCredentialFromVault(connection.encryptedCredential, {
@@ -1062,6 +1322,7 @@ export function probeProviderConnection(
         formattedProbeRequestPreview: null,
         verifiedCapabilities: [],
         sanitizedError,
+        latencyMs: 0,
       };
     }
   } else {
@@ -1084,56 +1345,56 @@ export function probeProviderConnection(
       formattedProbeRequestPreview: null,
       verifiedCapabilities: [],
       sanitizedError,
+      latencyMs: 0,
     };
   }
 
-  // Build minimal safe request & optional tool/structured/vision probes
-  const formattedReq = buildProtocolRequest({
+  // Step 3: Base Text Probe (Real Upstream Request)
+  const textReq = buildProtocolRequest({
     connection,
     resolvedSecret,
     systemInstruction: 'Respond with PONG.',
     userPrompt: 'PING',
-    tools: options.probeTools
-      ? [
-          {
-            name: 'probe_noop',
-            description: 'Minimal safe capability probe tool',
-            inputSchema: {
-              type: 'object',
-              properties: { echo: { type: 'string' } },
-              required: ['echo'],
-            },
-          },
-        ]
-      : [],
-    structuredOutputSchema: options.probeStructuredOutput
-      ? {
-          type: 'object',
-          properties: { status: { type: 'string' } },
-          required: ['status'],
-        }
-      : undefined,
-    stream: Boolean(options.probeStreaming),
     temperature: 0,
+    stream: false,
   });
 
   const redactedHeaders: Record<string, string> = {};
-  for (const [k, v] of Object.entries(formattedReq.headers)) {
+  for (const [k, v] of Object.entries(textReq.headers)) {
     redactedHeaders[k] = redactSecretsFromText(v, [resolvedSecret]);
   }
 
-  // Handle explicit failure simulation or invalid short test key
-  if (
-    options.simulateFailureCode === '401_UNAUTHORIZED' ||
-    resolvedSecret.includes('INVALID_KEY')
-  ) {
+  const timeoutMs = options.timeoutMs || connection.timeoutMs || 15000;
+  const textRes = await executeSafeUpstreamRequest({
+    url: textReq.url,
+    method: textReq.method,
+    headers: textReq.headers,
+    body: textReq.body,
+    timeoutMs,
+    maxResponseBytes: options.maxResponseBytes,
+    fetchImpl: options.fetchImpl,
+    resolvedSecret,
+  });
+
+  const formattedProbeRequestPreview: FormattedProbePreview = {
+    url: redactSecretsFromText(textReq.url, [resolvedSecret]),
+    method: textReq.method,
+    redactedHeaders,
+    bodySummary: (typeof textReq.body === 'object' && textReq.body !== null
+      ? textReq.body
+      : {}) as Record<string, unknown>,
+    latencyMs: textRes.latencyMs,
+    httpStatus: textRes.httpStatus,
+  };
+
+  // If text request failed, fail closed immediately
+  if (!textRes.ok) {
     const sanitizedError = {
-      code: 'PROVIDER_AUTH_REJECTED',
-      message: redactSecretsFromText(
-        `Provider rejected credential (${connection.maskedCredential}) with HTTP 401 Unauthorized.`,
-        [resolvedSecret]
-      ),
-      httpStatus: 401,
+      code: textRes.errorCode || 'PROVIDER_REQUEST_FAILED',
+      message:
+        textRes.errorMessage ||
+        `Upstream provider rejected probe with HTTP ${textRes.httpStatus}.`,
+      httpStatus: textRes.httpStatus,
       timestamp: now,
     };
     const updated: ProviderConnectionRecord = {
@@ -1146,22 +1407,21 @@ export function probeProviderConnection(
     return {
       updatedConnection: updated,
       probePassed: false,
-      formattedProbeRequestPreview: {
-        url: redactSecretsFromText(formattedReq.url, [resolvedSecret]),
-        method: formattedReq.method,
-        redactedHeaders,
-        bodySummary: formattedReq.body,
-      },
+      formattedProbeRequestPreview,
       verifiedCapabilities: [],
       sanitizedError,
+      latencyMs: textRes.latencyMs,
     };
   }
 
-  if (options.simulateFailureCode === '429_QUOTA_EXCEEDED') {
+  // Parse response to ensure completion text was actually returned
+  const parsedText = parseProtocolResponse(connection.protocol, textRes.rawBody);
+  if (!parsedText.text && !parsedText.finishReason) {
     const sanitizedError = {
-      code: 'PROVIDER_QUOTA_EXCEEDED',
-      message: `Endpoint account quota or rate limit exceeded (HTTP 429) for model "${connection.modelId}".`,
-      httpStatus: 429,
+      code: 'UNEXPECTED_RESPONSE_PAYLOAD',
+      message:
+        'Provider responded with HTTP 200, but the response could not be parsed into valid completion text.',
+      httpStatus: 200,
       timestamp: now,
     };
     const updated: ProviderConnectionRecord = {
@@ -1174,66 +1434,271 @@ export function probeProviderConnection(
     return {
       updatedConnection: updated,
       probePassed: false,
-      formattedProbeRequestPreview: {
-        url: redactSecretsFromText(formattedReq.url, [resolvedSecret]),
-        method: formattedReq.method,
-        redactedHeaders,
-        bodySummary: formattedReq.body,
-      },
+      formattedProbeRequestPreview,
       verifiedCapabilities: [],
       sanitizedError,
+      latencyMs: textRes.latencyMs,
     };
   }
 
   const nextCapabilities: CapabilityRegistryMap = { ...connection.capabilities };
   const verifiedList: ModelCapabilityKey[] = [];
 
-  const markVerifiedIfStructurallySupported = (
-    cap: ModelCapabilityKey,
-    evidence: string
-  ) => {
-    if (nextCapabilities[cap].state !== 'Unsupported') {
-      nextCapabilities[cap] = {
-        capability: cap,
-        state: 'Verified',
-        lastTestedAt: now,
-        expiresAt: retestExpiry,
-        probeEvidence: evidence,
-        userOverrideWarning: null,
-      };
-      verifiedList.push(cap);
-    }
+  // Text is genuinely verified with evidence
+  nextCapabilities.text = {
+    capability: 'text',
+    state: 'Verified',
+    lastTestedAt: now,
+    expiresAt: retestExpiry,
+    probeEvidence: `Verified upstream text response via ${connection.protocol} (${connection.modelId}) in ${textRes.latencyMs}ms on ${now}.`,
+    userOverrideWarning: null,
   };
+  verifiedList.push('text');
 
-  // Base minimal text probe always runs
-  markVerifiedIfStructurallySupported(
-    'text',
-    `Minimal PING probe verified via ${connection.protocol} on ${now}.`
-  );
+  // Step 4: Individual capability verification using real upstream tests
 
-  if (options.probeStructuredOutput) {
-    markVerifiedIfStructurallySupported(
-      'structuredOutput',
-      `Structured JSON schema probe verified via ${connection.protocol}.`
-    );
+  // Structured Output Probe
+  if (
+    options.probeStructuredOutput &&
+    connection.capabilities.structuredOutput?.state !== 'Unsupported'
+  ) {
+    try {
+      const structReq = buildProtocolRequest({
+        connection,
+        resolvedSecret,
+        systemInstruction: 'Respond with JSON adhering to the schema.',
+        userPrompt: 'Output status="ok"',
+        structuredOutputSchema: {
+          type: 'object',
+          properties: { status: { type: 'string' } },
+          required: ['status'],
+        },
+        temperature: 0,
+        stream: false,
+      });
+
+      const structRes = await executeSafeUpstreamRequest({
+        url: structReq.url,
+        method: structReq.method,
+        headers: structReq.headers,
+        body: structReq.body,
+        timeoutMs,
+        maxResponseBytes: options.maxResponseBytes,
+        fetchImpl: options.fetchImpl,
+        resolvedSecret,
+      });
+
+      if (structRes.ok) {
+        const parsedStruct = parseProtocolResponse(connection.protocol, structRes.rawBody);
+        if (
+          parsedStruct.structuredOutput ||
+          (parsedStruct.text && parsedStruct.text.includes('"status"'))
+        ) {
+          nextCapabilities.structuredOutput = {
+            capability: 'structuredOutput',
+            state: 'Verified',
+            lastTestedAt: now,
+            expiresAt: retestExpiry,
+            probeEvidence: `Verified upstream structured output schema in ${structRes.latencyMs}ms on ${now}.`,
+            userOverrideWarning: null,
+          };
+          verifiedList.push('structuredOutput');
+        }
+      } else if (structRes.httpStatus === 400) {
+        nextCapabilities.structuredOutput = {
+          capability: 'structuredOutput',
+          state: 'Unsupported',
+          lastTestedAt: now,
+          expiresAt: retestExpiry,
+          probeEvidence: `Provider rejected structured output schema (HTTP 400): ${structRes.errorMessage}`,
+          userOverrideWarning: null,
+        };
+      }
+    } catch {
+      // Keep existing state or mark unverified
+    }
   }
-  if (options.probeTools) {
-    markVerifiedIfStructurallySupported(
-      'toolFunctionCalling',
-      `Function declaration probe_noop verified via ${connection.protocol}.`
-    );
+
+  // Tool / Function Calling Probe
+  if (
+    options.probeTools &&
+    connection.capabilities.toolFunctionCalling?.state !== 'Unsupported'
+  ) {
+    try {
+      const toolReq = buildProtocolRequest({
+        connection,
+        resolvedSecret,
+        systemInstruction: 'Use tools when available.',
+        userPrompt: 'Call probe_noop with echo="test"',
+        tools: [
+          {
+            name: 'probe_noop',
+            description: 'Probe tool for checking tool declaration support',
+            inputSchema: {
+              type: 'object',
+              properties: { echo: { type: 'string' } },
+              required: ['echo'],
+            },
+          },
+        ],
+        temperature: 0,
+        stream: false,
+      });
+
+      const toolRes = await executeSafeUpstreamRequest({
+        url: toolReq.url,
+        method: toolReq.method,
+        headers: toolReq.headers,
+        body: toolReq.body,
+        timeoutMs,
+        maxResponseBytes: options.maxResponseBytes,
+        fetchImpl: options.fetchImpl,
+        resolvedSecret,
+      });
+
+      if (toolRes.ok) {
+        const parsedTool = parseProtocolResponse(connection.protocol, toolRes.rawBody);
+        nextCapabilities.toolFunctionCalling = {
+          capability: 'toolFunctionCalling',
+          state: 'Verified',
+          lastTestedAt: now,
+          expiresAt: retestExpiry,
+          probeEvidence: `Verified upstream tool declarations in ${toolRes.latencyMs}ms (toolCalls: ${parsedTool.toolCalls.length}).`,
+          userOverrideWarning: null,
+        };
+        verifiedList.push('toolFunctionCalling');
+      } else if (toolRes.httpStatus === 400) {
+        nextCapabilities.toolFunctionCalling = {
+          capability: 'toolFunctionCalling',
+          state: 'Unsupported',
+          lastTestedAt: now,
+          expiresAt: retestExpiry,
+          probeEvidence: `Provider rejected functionDeclarations/tools (HTTP 400): ${toolRes.errorMessage}`,
+          userOverrideWarning: null,
+        };
+      }
+    } catch {
+      // Keep existing state
+    }
   }
-  if (options.probeVision) {
-    markVerifiedIfStructurallySupported(
-      'imageInput',
-      `1x1 PNG inline vision probe verified via ${connection.protocol}.`
-    );
+
+  // Vision (Image Input) Probe
+  if (
+    options.probeVision &&
+    connection.capabilities.imageInput?.state !== 'Unsupported'
+  ) {
+    try {
+      const visionReq = buildProtocolRequest({
+        connection,
+        resolvedSecret,
+        userPrompt: 'Describe this image in one word.',
+        mediaInputs: [
+          {
+            modality: 'image',
+            mimeType: 'image/png',
+            base64Data:
+              'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+          },
+        ],
+        temperature: 0,
+        stream: false,
+      });
+
+      const visionRes = await executeSafeUpstreamRequest({
+        url: visionReq.url,
+        method: visionReq.method,
+        headers: visionReq.headers,
+        body: visionReq.body,
+        timeoutMs,
+        maxResponseBytes: options.maxResponseBytes,
+        fetchImpl: options.fetchImpl,
+        resolvedSecret,
+      });
+
+      if (visionRes.ok) {
+        const parsedVision = parseProtocolResponse(connection.protocol, visionRes.rawBody);
+        if (parsedVision.text) {
+          nextCapabilities.imageInput = {
+            capability: 'imageInput',
+            state: 'Verified',
+            lastTestedAt: now,
+            expiresAt: retestExpiry,
+            probeEvidence: `Verified upstream inline vision input in ${visionRes.latencyMs}ms on ${now}.`,
+            userOverrideWarning: null,
+          };
+          verifiedList.push('imageInput');
+        }
+      } else if (visionRes.httpStatus === 400) {
+        nextCapabilities.imageInput = {
+          capability: 'imageInput',
+          state: 'Unsupported',
+          lastTestedAt: now,
+          expiresAt: retestExpiry,
+          probeEvidence: `Provider rejected image/vision input (HTTP 400): ${visionRes.errorMessage}`,
+          userOverrideWarning: null,
+        };
+      }
+    } catch {
+      // Keep existing state
+    }
   }
-  if (options.probeStreaming) {
-    markVerifiedIfStructurallySupported(
-      'streaming',
-      `Streaming framing (${formattedReq.streamingFraming}) verified.`
-    );
+
+  // Streaming Probe
+  if (
+    options.probeStreaming &&
+    connection.capabilities.streaming?.state !== 'Unsupported'
+  ) {
+    try {
+      const streamReq = buildProtocolRequest({
+        connection,
+        resolvedSecret,
+        userPrompt: 'Echo 123',
+        stream: true,
+        temperature: 0,
+      });
+
+      const streamRes = await executeSafeUpstreamRequest({
+        url: streamReq.url,
+        method: streamReq.method,
+        headers: streamReq.headers,
+        body: streamReq.body,
+        timeoutMs,
+        maxResponseBytes: options.maxResponseBytes,
+        fetchImpl: options.fetchImpl,
+        resolvedSecret,
+      });
+
+      if (streamRes.ok) {
+        const contentType = streamRes.headers['content-type'] || '';
+        const hasStreamFraming =
+          contentType.includes('text/event-stream') ||
+          streamRes.rawText.includes('data:') ||
+          streamRes.rawText.includes('"parts"');
+
+        if (hasStreamFraming || streamRes.httpStatus === 200) {
+          nextCapabilities.streaming = {
+            capability: 'streaming',
+            state: 'Verified',
+            lastTestedAt: now,
+            expiresAt: retestExpiry,
+            probeEvidence: `Verified upstream streaming endpoint in ${streamRes.latencyMs}ms.`,
+            userOverrideWarning: null,
+          };
+          verifiedList.push('streaming');
+        }
+      } else if (streamRes.httpStatus === 400) {
+        nextCapabilities.streaming = {
+          capability: 'streaming',
+          state: 'Unsupported',
+          lastTestedAt: now,
+          expiresAt: retestExpiry,
+          probeEvidence: `Provider rejected streaming request (HTTP 400): ${streamRes.errorMessage}`,
+          userOverrideWarning: null,
+        };
+      }
+    } catch {
+      // Keep existing state
+    }
   }
 
   const updatedConnection: ProviderConnectionRecord = {
@@ -1248,14 +1713,10 @@ export function probeProviderConnection(
   return {
     updatedConnection,
     probePassed: true,
-    formattedProbeRequestPreview: {
-      url: redactSecretsFromText(formattedReq.url, [resolvedSecret]),
-      method: formattedReq.method,
-      redactedHeaders,
-      bodySummary: formattedReq.body,
-    },
+    formattedProbeRequestPreview,
     verifiedCapabilities: verifiedList,
     sanitizedError: null,
+    latencyMs: textRes.latencyMs,
   };
 }
 

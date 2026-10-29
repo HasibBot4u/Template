@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
   AlertTriangle,
   ArrowLeft,
@@ -28,6 +28,7 @@ import type {
 } from '../services/aiDirectorProductionEngine';
 import type { MobileAspectRatio } from '../types/sowveil';
 import { MobileProEditorModal } from './MobileProEditorModal';
+import { executeAuthenticatedApiRequest } from '../services/apiClient';
 
 interface SampleScriptItem {
   id: string;
@@ -39,10 +40,13 @@ interface SampleScriptItem {
   scriptText: string;
 }
 
-interface AiDirectorWorkspaceProps {
-  authToken: string | null;
+export interface AiDirectorWorkspaceProps {
+  authToken?: string | null;
+  userUid?: string;
   onBackToReference: () => void;
   onOpenProjectLibrary?: () => void;
+  getAuthToken?: (forceRefresh?: boolean) => Promise<string | null>;
+  fetchImpl?: typeof fetch;
 }
 
 type DirectorStageTab =
@@ -55,8 +59,11 @@ type DirectorStageTab =
 
 export const AiDirectorWorkspace: React.FC<AiDirectorWorkspaceProps> = ({
   authToken,
+  userUid,
   onBackToReference,
   onOpenProjectLibrary,
+  getAuthToken,
+  fetchImpl,
 }) => {
   const [activeTab, setActiveTab] = useState<DirectorStageTab>('intake');
   const [samples, setSamples] = useState<SampleScriptItem[]>([]);
@@ -111,28 +118,49 @@ export const AiDirectorWorkspace: React.FC<AiDirectorWorkspaceProps> = ({
   const [simulateFailShotIds] = useState<string[]>([]);
   const [isTimelineModalOpen, setIsTimelineModalOpen] = useState(false);
 
-  const buildHeaders = (): Record<string, string> => {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-    };
-    if (authToken) {
-      headers.Authorization = `Bearer ${authToken}`;
-    } else {
-      headers['X-Test-Uid'] = 'demo-director-user';
-      headers['X-Test-Email'] = 'director@sowveil.studio';
-    }
-    return headers;
-  };
+  const resolveToken = useCallback(
+    async (forceRefresh = false) => {
+      if (getAuthToken) return await getAuthToken(forceRefresh);
+      if (authToken) return authToken;
+      return null;
+    },
+    [getAuthToken, authToken]
+  );
+
+  const apiRequest = useCallback(
+    async <T,>(
+      path: string,
+      options: {
+        method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+        body?: unknown;
+      } = {}
+    ) => {
+      return executeAuthenticatedApiRequest<T>(path, {
+        ...options,
+        getAuthToken: getAuthToken || authToken ? resolveToken : undefined,
+        fetchImpl,
+      });
+    },
+    [resolveToken, getAuthToken, authToken, fetchImpl]
+  );
 
   const fetchSamplesAndSessions = async () => {
     try {
-      const [samplesRes, sessionsRes] = await Promise.all([
-        fetch('/api/v1/ai-director/samples'),
-        fetch('/api/v1/ai-director/sessions', { headers: buildHeaders() }),
+      const fetchFn = fetchImpl || globalThis.fetch;
+      const samplesPromise = fetchFn('/api/v1/ai-director/samples')
+        .then((r) => r.json())
+        .catch(() => null);
+      const sessionsPromise = apiRequest<{ items: AiDirectorSessionRecord[] }>(
+        '/api/v1/ai-director/sessions'
+      );
+
+      const [samplesJson, sessionsRes] = await Promise.all([
+        samplesPromise,
+        sessionsPromise,
       ]);
-      if (samplesRes.ok) {
-        const sJson = await samplesRes.json();
-        const loadedSamples: SampleScriptItem[] = sJson.data?.samples || [];
+
+      if (samplesJson?.ok && Array.isArray(samplesJson.data?.samples)) {
+        const loadedSamples: SampleScriptItem[] = samplesJson.data.samples;
         setSamples(loadedSamples);
         if (!scriptText && loadedSamples.length > 0) {
           const first = loadedSamples[0];
@@ -144,9 +172,9 @@ export const AiDirectorWorkspace: React.FC<AiDirectorWorkspaceProps> = ({
           setVisualGoals(first.visualGoals);
         }
       }
-      if (sessionsRes.ok) {
-        const sessJson = await sessionsRes.json();
-        const items: AiDirectorSessionRecord[] = sessJson.data?.items || [];
+
+      if (sessionsRes.ok && sessionsRes.data?.items) {
+        const items = sessionsRes.data.items;
         setSessions(items);
         if (!activeSession && items.length > 0) {
           setActiveSession(items[0]);
@@ -159,7 +187,7 @@ export const AiDirectorWorkspace: React.FC<AiDirectorWorkspaceProps> = ({
 
   useEffect(() => {
     fetchSamplesAndSessions();
-  }, [authToken]);
+  }, [authToken, userUid]);
 
   const handleLoadSample = (sample: SampleScriptItem) => {
     setTitle(sample.title);
@@ -196,45 +224,46 @@ export const AiDirectorWorkspace: React.FC<AiDirectorWorkspaceProps> = ({
     setErrorBanner(null);
     setStatusBanner(null);
     try {
-      const res = await fetch('/api/v1/ai-director/sessions', {
-        method: 'POST',
-        headers: buildHeaders(),
-        body: JSON.stringify({
-          title,
-          rawScriptText: scriptText,
-          intake: {
+      const res = await apiRequest<{ session: AiDirectorSessionRecord }>(
+        '/api/v1/ai-director/sessions',
+        {
+          method: 'POST',
+          body: {
             title,
-            intendedPlatform,
-            targetDurationSec,
-            aspectRatio,
-            fps,
-            language,
-            audience,
-            visualGoals,
-            brandKit: {
-              brandName: 'Sowveil Studio',
-              primaryColorHex: brandPrimaryColor,
-              secondaryColorHex: brandSecondaryColor,
-              backgroundColorHex: '#0B0A09',
-              headingFont: brandFontFamily,
-              bodyFont: brandFontFamily,
+            rawScriptText: scriptText,
+            intake: {
+              title,
+              intendedPlatform,
+              targetDurationSec,
+              aspectRatio,
+              fps,
+              language,
+              audience,
+              visualGoals,
+              brandKit: {
+                brandName: 'Sowveil Studio',
+                primaryColorHex: brandPrimaryColor,
+                secondaryColorHex: brandSecondaryColor,
+                backgroundColorHex: '#0B0A09',
+                headingFont: brandFontFamily,
+                bodyFont: brandFontFamily,
+              },
+              prohibitedContent: mustPreserveInput
+                ? [`Must preserve exact phrases: ${mustPreserveInput}`]
+                : [],
+              budgetLatencyPreference,
+              maxBudgetUsd,
+              preserveEveryRepetition,
+              noQuestionsWorkflow,
+              autonomyMode,
             },
-            prohibitedContent: mustPreserveInput
-              ? [`Must preserve exact phrases: ${mustPreserveInput}`]
-              : [],
-            budgetLatencyPreference,
-            maxBudgetUsd,
-            preserveEveryRepetition,
-            noQuestionsWorkflow,
-            autonomyMode,
           },
-        }),
-      });
-      const json = await res.json();
-      if (!res.ok || !json.ok) {
-        throw new Error(json.error?.message || 'Failed to create AI Director session');
+        }
+      );
+      if (!res.ok || !res.data?.session) {
+        throw new Error(res.errorMessage || 'Failed to create AI Director session');
       }
-      const created: AiDirectorSessionRecord = json.data.session;
+      const created: AiDirectorSessionRecord = res.data.session;
       setActiveSession(created);
       setSessions((prev) => [created, ...prev.filter((s) => s.id !== created.id)]);
       setStatusBanner(
@@ -263,19 +292,20 @@ export const AiDirectorWorkspace: React.FC<AiDirectorWorkspaceProps> = ({
         }
       }
 
-      const res = await fetch(`/api/v1/ai-director/sessions/${activeSession.id}/questions`, {
-        method: 'POST',
-        headers: buildHeaders(),
-        body: JSON.stringify({
-          answers: answersMap,
-          applyDefaultsToUnanswered,
-        }),
-      });
-      const json = await res.json();
-      if (!res.ok || !json.ok) {
-        throw new Error(json.error?.message || 'Failed to submit question answers');
+      const res = await apiRequest<{ session: AiDirectorSessionRecord }>(
+        `/api/v1/ai-director/sessions/${activeSession.id}/questions`,
+        {
+          method: 'POST',
+          body: {
+            answers: answersMap,
+            applyDefaultsToUnanswered,
+          },
+        }
+      );
+      if (!res.ok || !res.data?.session) {
+        throw new Error(res.errorMessage || 'Failed to submit question answers');
       }
-      const updated: AiDirectorSessionRecord = json.data.session;
+      const updated: AiDirectorSessionRecord = res.data.session;
       setActiveSession(updated);
       setSessions((prev) => [updated, ...prev.filter((s) => s.id !== updated.id)]);
       setStatusBanner(
@@ -297,16 +327,17 @@ export const AiDirectorWorkspace: React.FC<AiDirectorWorkspaceProps> = ({
     setLoading(true);
     setErrorBanner(null);
     try {
-      const res = await fetch(`/api/v1/ai-director/sessions/${activeSession.id}/plan`, {
-        method: 'POST',
-        headers: buildHeaders(),
-        body: JSON.stringify(payload),
-      });
-      const json = await res.json();
-      if (!res.ok || !json.ok) {
-        throw new Error(json.error?.message || 'Failed to update shot plan');
+      const res = await apiRequest<{ session: AiDirectorSessionRecord }>(
+        `/api/v1/ai-director/sessions/${activeSession.id}/plan`,
+        {
+          method: 'POST',
+          body: payload,
+        }
+      );
+      if (!res.ok || !res.data?.session) {
+        throw new Error(res.errorMessage || 'Failed to update shot plan');
       }
-      const updated: AiDirectorSessionRecord = json.data.session;
+      const updated: AiDirectorSessionRecord = res.data.session;
       setActiveSession(updated);
       setSessions((prev) => [updated, ...prev.filter((s) => s.id !== updated.id)]);
       setStatusBanner(successMsg);
@@ -322,18 +353,19 @@ export const AiDirectorWorkspace: React.FC<AiDirectorWorkspaceProps> = ({
     setLoading(true);
     setErrorBanner(null);
     try {
-      const res = await fetch(`/api/v1/ai-director/sessions/${activeSession.id}/produce`, {
-        method: 'POST',
-        headers: buildHeaders(),
-        body: JSON.stringify({
-          simulateFailedShotIds: simulateFailShotIds,
-        }),
-      });
-      const json = await res.json();
-      if (!res.ok || !json.ok) {
-        throw new Error(json.error?.message || 'Production compilation blocked');
+      const res = await apiRequest<{ session: AiDirectorSessionRecord }>(
+        `/api/v1/ai-director/sessions/${activeSession.id}/produce`,
+        {
+          method: 'POST',
+          body: {
+            simulateFailedShotIds: simulateFailShotIds,
+          },
+        }
+      );
+      if (!res.ok || !res.data?.session) {
+        throw new Error(res.errorMessage || 'Production compilation blocked');
       }
-      const updated: AiDirectorSessionRecord = json.data.session;
+      const updated: AiDirectorSessionRecord = res.data.session;
       setActiveSession(updated);
       setSessions((prev) => [updated, ...prev.filter((s) => s.id !== updated.id)]);
       setStatusBanner(
@@ -352,19 +384,20 @@ export const AiDirectorWorkspace: React.FC<AiDirectorWorkspaceProps> = ({
     setLoading(true);
     setErrorBanner(null);
     try {
-      const res = await fetch(`/api/v1/ai-director/sessions/${activeSession.id}/save-project`, {
+      const res = await apiRequest<{
+        session: AiDirectorSessionRecord;
+        project: { id: string; name: string };
+      }>(`/api/v1/ai-director/sessions/${activeSession.id}/save-project`, {
         method: 'POST',
-        headers: buildHeaders(),
       });
-      const json = await res.json();
-      if (!res.ok || !json.ok) {
-        throw new Error(json.error?.message || 'Failed to save to Project Library');
+      if (!res.ok || !res.data?.session) {
+        throw new Error(res.errorMessage || 'Failed to save to Project Library');
       }
-      const updated: AiDirectorSessionRecord = json.data.session;
+      const updated: AiDirectorSessionRecord = res.data.session;
       setActiveSession(updated);
       setSessions((prev) => [updated, ...prev.filter((s) => s.id !== updated.id)]);
       setStatusBanner(
-        `Saved project "${json.data.project.name}" (ID: ${json.data.project.id}) to Project Library.`
+        `Saved project "${res.data.project.name}" (ID: ${res.data.project.id}) to Project Library.`
       );
     } catch (err) {
       setErrorBanner(err instanceof Error ? err.message : 'Failed to save project');
@@ -378,16 +411,17 @@ export const AiDirectorWorkspace: React.FC<AiDirectorWorkspaceProps> = ({
     setLoading(true);
     setErrorBanner(null);
     try {
-      const res = await fetch(`/api/v1/ai-director/sessions/${activeSession.id}/refine`, {
-        method: 'POST',
-        headers: buildHeaders(),
-        body: JSON.stringify({ suggestionId }),
-      });
-      const json = await res.json();
-      if (!res.ok || !json.ok) {
-        throw new Error(json.error?.message || 'Refinement action blocked');
+      const res = await apiRequest<{ session: AiDirectorSessionRecord }>(
+        `/api/v1/ai-director/sessions/${activeSession.id}/refine`,
+        {
+          method: 'POST',
+          body: { suggestionId },
+        }
+      );
+      if (!res.ok || !res.data?.session) {
+        throw new Error(res.errorMessage || 'Refinement action blocked');
       }
-      const updated: AiDirectorSessionRecord = json.data.session;
+      const updated: AiDirectorSessionRecord = res.data.session;
       setActiveSession(updated);
       setSessions((prev) => [updated, ...prev.filter((s) => s.id !== updated.id)]);
       setStatusBanner('Applied adaptive refinement and saved pre-refinement checkpoint.');
@@ -403,16 +437,17 @@ export const AiDirectorWorkspace: React.FC<AiDirectorWorkspaceProps> = ({
     setLoading(true);
     setErrorBanner(null);
     try {
-      const res = await fetch(`/api/v1/ai-director/sessions/${activeSession.id}/rollback`, {
-        method: 'POST',
-        headers: buildHeaders(),
-        body: JSON.stringify({ checkpointId }),
-      });
-      const json = await res.json();
-      if (!res.ok || !json.ok) {
-        throw new Error(json.error?.message || 'Rollback failed');
+      const res = await apiRequest<{ session: AiDirectorSessionRecord }>(
+        `/api/v1/ai-director/sessions/${activeSession.id}/rollback`,
+        {
+          method: 'POST',
+          body: { checkpointId },
+        }
+      );
+      if (!res.ok || !res.data?.session) {
+        throw new Error(res.errorMessage || 'Rollback failed');
       }
-      const updated: AiDirectorSessionRecord = json.data.session;
+      const updated: AiDirectorSessionRecord = res.data.session;
       setActiveSession(updated);
       setSessions((prev) => [updated, ...prev.filter((s) => s.id !== updated.id)]);
       setStatusBanner(`Rolled back session to checkpoint ${checkpointId}.`);

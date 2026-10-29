@@ -62,8 +62,9 @@ import {
   rankTemplatesWithTransparentSignals,
 } from '../services/templateFactoryEngine';
 import { EditingStudioWorkspace } from './EditingStudioWorkspace';
+import { executeAuthenticatedApiRequest } from '../services/apiClient';
 
-interface TemplateFactoryWorkspaceProps {
+export interface TemplateFactoryWorkspaceProps {
   userUid?: string;
   projects: ProjectLibraryItem[];
   onSaveProjectToLibrary?: (
@@ -73,6 +74,8 @@ interface TemplateFactoryWorkspaceProps {
     message: string,
     tone?: 'info' | 'warning' | 'error' | 'success'
   ) => void;
+  getAuthToken?: (forceRefresh?: boolean) => Promise<string | null>;
+  fetchImpl?: typeof fetch;
 }
 
 const PARAMETER_CATEGORIES: {
@@ -105,7 +108,25 @@ export const TemplateFactoryWorkspace: React.FC<TemplateFactoryWorkspaceProps> =
   projects,
   onSaveProjectToLibrary,
   onNotify,
+  getAuthToken,
+  fetchImpl,
 }) => {
+  const apiRequest = useCallback(
+    async <T,>(
+      path: string,
+      options: {
+        method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+        body?: unknown;
+      } = {}
+    ) => {
+      return executeAuthenticatedApiRequest<T>(path, {
+        ...options,
+        getAuthToken,
+        fetchImpl,
+      });
+    },
+    [getAuthToken, fetchImpl]
+  );
   const [activeTab, setActiveTab] = useState<
     'pipeline' | 'drafts' | 'deduplication' | 'preferences'
   >('pipeline');
@@ -199,14 +220,13 @@ export const TemplateFactoryWorkspace: React.FC<TemplateFactoryWorkspaceProps> =
   const loadDraftsFromServer = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await fetch('/api/v1/template-factory/drafts', {
-        headers: {
-          'x-sowveil-dev-uid': userUid,
-        },
-      });
-      if (res.ok) {
-        const json = await res.json();
-        const data = json.data || json;
+      const res = await apiRequest<{
+        items: TemplateFactoryDraftRecord[];
+        preferenceConsent?: UserPreferenceConsentConfig;
+        preferenceSignals?: TemplatePreferenceSignal[];
+      }>('/api/v1/template-factory/drafts');
+      if (res.ok && res.data) {
+        const data = res.data;
         if (Array.isArray(data.items)) {
           setDrafts(data.items);
           if (!selectedDraftId && data.items.length > 0) {
@@ -221,11 +241,11 @@ export const TemplateFactoryWorkspace: React.FC<TemplateFactoryWorkspaceProps> =
         }
       }
     } catch {
-      // Fallback to local state if offline
+      // Network error handled gracefully
     } finally {
       setLoading(false);
     }
-  }, [userUid, selectedDraftId]);
+  }, [apiRequest, selectedDraftId]);
 
   useEffect(() => {
     loadDraftsFromServer();
@@ -277,14 +297,11 @@ export const TemplateFactoryWorkspace: React.FC<TemplateFactoryWorkspaceProps> =
       .map((t) => t.trim())
       .filter(Boolean);
 
-    try {
-      const res = await fetch('/api/v1/template-factory/create', {
+    const res = await apiRequest<{ draft: TemplateFactoryDraftRecord }>(
+      '/api/v1/template-factory/create',
+      {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-sowveil-dev-uid': userUid,
-        },
-        body: JSON.stringify({
+        body: {
           sourceKind,
           title: templateTitle,
           description: templateDescription,
@@ -296,127 +313,74 @@ export const TemplateFactoryWorkspace: React.FC<TemplateFactoryWorkspaceProps> =
           selectedSceneIds:
             selectedSceneIds.length > 0 ? selectedSceneIds : undefined,
           exposedParameterKeys,
-        }),
-      });
-
-      if (res.ok) {
-        const json = await res.json();
-        const created: TemplateFactoryDraftRecord = (json.data || json).draft;
-        setLastCreatedDraft(created);
-        await loadDraftsFromServer();
-        setSelectedDraftId(created.id);
-        onNotify(
-          `Completed 10-stage Template Factory pipeline: "${created.title}" saved as private Draft.`,
-          'success'
-        );
-        return;
+        },
       }
-    } catch {
-      // Offline / local fallback
-    }
-
-    const localDraft = runTemplateFactoryPipeline({
-      ownerUid: userUid,
-      sourceKind,
-      title: templateTitle,
-      description: templateDescription,
-      moduleId: targetModuleId,
-      tags,
-      licenseType,
-      licenseNote,
-      sourceProject: sourceCanonicalProject,
-      selectedSceneIds:
-        selectedSceneIds.length > 0 ? selectedSceneIds : undefined,
-      exposedParameterKeys,
-      existingFactoryDrafts: drafts,
-    });
-    setLastCreatedDraft(localDraft);
-    setDrafts((prev) => [localDraft, ...prev]);
-    setSelectedDraftId(localDraft.id);
-    onNotify(
-      `Completed 10-stage Template Factory pipeline: "${localDraft.title}" saved as private Draft.`,
-      'success'
     );
+
+    if (res.ok && res.data?.draft) {
+      const created = res.data.draft;
+      setLastCreatedDraft(created);
+      await loadDraftsFromServer();
+      setSelectedDraftId(created.id);
+      onNotify(
+        `Completed 10-stage Template Factory pipeline: "${created.title}" saved as private Draft.`,
+        'success'
+      );
+    } else {
+      onNotify(
+        `Template creation failed: ${res.errorMessage || 'Server rejected template draft creation.'}`,
+        'error'
+      );
+    }
   };
 
   const handleSaveParameterOverridesToDraft = async () => {
     if (!selectedDraft) return;
-    try {
-      const res = await fetch(
-        `/api/v1/template-factory/drafts/${selectedDraft.id}`,
-        {
-          method: 'PATCH',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-sowveil-dev-uid': userUid,
-          },
-          body: JSON.stringify({
-            parameterDefaultOverrides: liveParamValues,
-            changelog:
-              'Updated exposed parameter defaults in Template Factory',
-          }),
-        }
-      );
-      if (res.ok) {
-        await loadDraftsFromServer();
-        onNotify(
-          `Saved new version for "${selectedDraft.title}".`,
-          'success'
-        );
-        return;
-      }
-    } catch {
-      // Local fallback
-    }
-
-    const updated = updateFactoryDraftRecord(
-      selectedDraft,
+    const res = await apiRequest<{ draft: TemplateFactoryDraftRecord }>(
+      `/api/v1/template-factory/drafts/${selectedDraft.id}`,
       {
-        parameterDefaultOverrides: liveParamValues,
-        changelog: 'Updated exposed parameter defaults in Template Factory',
-      },
-      userUid
+        method: 'PATCH',
+        body: {
+          parameterDefaultOverrides: liveParamValues,
+          changelog: 'Updated exposed parameter defaults in Template Factory',
+        },
+      }
     );
-    setDrafts((prev) =>
-      prev.map((d) => (d.id === updated.id ? updated : d))
-    );
-    onNotify(
-      `Saved new version v${updated.version} for "${updated.title}".`,
-      'success'
-    );
+    if (res.ok && res.data?.draft) {
+      await loadDraftsFromServer();
+      onNotify(
+        `Saved new version for "${selectedDraft.title}".`,
+        'success'
+      );
+    } else {
+      onNotify(
+        `Failed to save parameter defaults: ${res.errorMessage || 'Server rejected update.'}`,
+        'error'
+      );
+    }
   };
 
   const handleForkDraft = async (draft: TemplateFactoryDraftRecord) => {
-    try {
-      const res = await fetch(
-        `/api/v1/template-factory/drafts/${draft.id}/fork`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-sowveil-dev-uid': userUid,
-          },
-          body: JSON.stringify({
-            forkTitle: `${draft.title} (Fork)`,
-          }),
-        }
-      );
-      if (res.ok) {
-        const json = await res.json();
-        const forked: TemplateFactoryDraftRecord = (json.data || json).draft;
-        await loadDraftsFromServer();
-        setSelectedDraftId(forked.id);
-        onNotify(`Forked "${draft.title}" into "${forked.title}".`, 'success');
-        return;
+    const res = await apiRequest<{ draft: TemplateFactoryDraftRecord }>(
+      `/api/v1/template-factory/drafts/${draft.id}/fork`,
+      {
+        method: 'POST',
+        body: {
+          forkTitle: `${draft.title} (Fork)`,
+        },
       }
-    } catch {
-      // Local fallback
+    );
+    if (res.ok && res.data?.draft) {
+      const forked = res.data.draft;
+      await loadDraftsFromServer();
+      setSelectedDraftId(forked.id);
+      onNotify(`Forked "${draft.title}" into "${forked.title}".`, 'success');
+    } else {
+      onNotify(
+        `Fork failed: ${res.errorMessage || 'Server rejected fork.'}`,
+        'error'
+      );
     }
-
-    const forked = forkFactoryTemplate(draft, userUid, `${draft.title} (Fork)`);
-    setDrafts((prev) => [forked, ...prev]);
-    setSelectedDraftId(forked.id);
-    onNotify(`Forked "${draft.title}" into "${forked.title}".`, 'success');
   };
 
   const handleMergeDrafts = async () => {
@@ -424,209 +388,120 @@ export const TemplateFactoryWorkspace: React.FC<TemplateFactoryWorkspaceProps> =
     const secondary = drafts.find((d) => d.id === mergeTargetId);
     if (!secondary) return;
 
-    try {
-      const res = await fetch(
-        `/api/v1/template-factory/drafts/${selectedDraft.id}/merge`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-sowveil-dev-uid': userUid,
-          },
-          body: JSON.stringify({
-            secondaryDraftId: secondary.id,
-          }),
-        }
-      );
-      if (res.ok) {
-        await loadDraftsFromServer();
-        onNotify(
-          `Merged parameters and dependencies from "${secondary.title}" into "${selectedDraft.title}".`,
-          'success'
-        );
-        return;
+    const res = await apiRequest<{ draft: TemplateFactoryDraftRecord }>(
+      `/api/v1/template-factory/drafts/${selectedDraft.id}/merge`,
+      {
+        method: 'POST',
+        body: {
+          secondaryDraftId: secondary.id,
+        },
       }
-    } catch {
-      // Local fallback
-    }
-
-    const merged = mergeFactoryTemplates({
-      primaryDraft: selectedDraft,
-      secondaryDraft: secondary,
-      actorUid: userUid,
-    });
-    setDrafts((prev) => prev.map((d) => (d.id === merged.id ? merged : d)));
-    onNotify(
-      `Merged parameters and dependencies from "${secondary.title}" into "${selectedDraft.title}".`,
-      'success'
     );
+    if (res.ok && res.data?.draft) {
+      await loadDraftsFromServer();
+      onNotify(
+        `Merged parameters and dependencies from "${secondary.title}" into "${selectedDraft.title}".`,
+        'success'
+      );
+    } else {
+      onNotify(
+        `Merge failed: ${res.errorMessage || 'Server rejected merge.'}`,
+        'error'
+      );
+    }
   };
 
   const handleRestoreVersion = async (targetVersion: string) => {
     if (!selectedDraft) return;
-    try {
-      const res = await fetch(
-        `/api/v1/template-factory/drafts/${selectedDraft.id}/restore-version`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-sowveil-dev-uid': userUid,
-          },
-          body: JSON.stringify({ targetVersion }),
-        }
-      );
-      if (res.ok) {
-        await loadDraftsFromServer();
-        onNotify(`Restored template version v${targetVersion}.`, 'success');
-        return;
+    const res = await apiRequest<{ draft: TemplateFactoryDraftRecord }>(
+      `/api/v1/template-factory/drafts/${selectedDraft.id}/restore-version`,
+      {
+        method: 'POST',
+        body: { targetVersion },
       }
-    } catch {
-      // Local fallback
+    );
+    if (res.ok && res.data?.draft) {
+      await loadDraftsFromServer();
+      onNotify(`Restored template version v${targetVersion}.`, 'success');
+    } else {
+      onNotify(
+        `Restore version failed: ${res.errorMessage || 'Server rejected restore.'}`,
+        'error'
+      );
     }
-
-    const restored = restoreFactoryTemplateVersion(
-      selectedDraft,
-      targetVersion,
-      userUid
-    );
-    setDrafts((prev) =>
-      prev.map((d) => (d.id === restored.id ? restored : d))
-    );
-    onNotify(`Restored template version v${targetVersion}.`, 'success');
   };
 
   const handleDeprecateDraft = async () => {
     if (!selectedDraft) return;
-    try {
-      const res = await fetch(
-        `/api/v1/template-factory/drafts/${selectedDraft.id}/deprecate`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-sowveil-dev-uid': userUid,
-          },
-          body: JSON.stringify({
-            reason: deprecateReason,
-          }),
-        }
-      );
-      if (res.ok) {
-        await loadDraftsFromServer();
-        onNotify(`Deprecated template "${selectedDraft.title}".`, 'warning');
-        return;
+    const res = await apiRequest<{ draft: TemplateFactoryDraftRecord }>(
+      `/api/v1/template-factory/drafts/${selectedDraft.id}/deprecate`,
+      {
+        method: 'POST',
+        body: {
+          reason: deprecateReason,
+        },
       }
-    } catch {
-      // Local fallback
+    );
+    if (res.ok && res.data?.draft) {
+      await loadDraftsFromServer();
+      onNotify(`Deprecated template "${selectedDraft.title}".`, 'warning');
+    } else {
+      onNotify(
+        `Deprecation failed: ${res.errorMessage || 'Server rejected deprecation.'}`,
+        'error'
+      );
     }
-
-    const deprecated = deprecateFactoryTemplate(
-      selectedDraft,
-      deprecateReason
-    );
-    setDrafts((prev) =>
-      prev.map((d) => (d.id === deprecated.id ? deprecated : d))
-    );
-    onNotify(`Deprecated template "${selectedDraft.title}".`, 'warning');
   };
 
   const handleUpdateDependencies = async () => {
     if (!selectedDraft) return;
-    try {
-      const res = await fetch(
-        `/api/v1/template-factory/drafts/${selectedDraft.id}/update-dependencies`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-sowveil-dev-uid': userUid,
-          },
-          body: JSON.stringify({
-            resolveMissingAssets: true,
-          }),
-        }
-      );
-      if (res.ok) {
-        await loadDraftsFromServer();
-        onNotify(
-          `Updated dependencies and re-ran 10-point quality gate for "${selectedDraft.title}".`,
-          'success'
-        );
-        return;
+    const res = await apiRequest<{ draft: TemplateFactoryDraftRecord }>(
+      `/api/v1/template-factory/drafts/${selectedDraft.id}/update-dependencies`,
+      {
+        method: 'POST',
+        body: {
+          resolveMissingAssets: true,
+        },
       }
-    } catch {
-      // Local fallback
+    );
+    if (res.ok && res.data?.draft) {
+      await loadDraftsFromServer();
+      onNotify(
+        `Updated dependencies and re-ran 10-point quality gate for "${selectedDraft.title}".`,
+        'success'
+      );
+    } else {
+      onNotify(
+        `Dependency update failed: ${res.errorMessage || 'Server rejected update.'}`,
+        'error'
+      );
     }
-
-    const updated = updateFactoryTemplateDependencies(
-      selectedDraft,
-      { resolveMissingAssets: true },
-      userUid
-    );
-    setDrafts((prev) =>
-      prev.map((d) => (d.id === updated.id ? updated : d))
-    );
-    onNotify(
-      `Updated dependencies and re-ran 10-point quality gate for "${selectedDraft.title}".`,
-      'success'
-    );
   };
 
   const handlePublishDraft = async () => {
     if (!selectedDraft) return;
-    try {
-      const res = await fetch(
-        `/api/v1/template-factory/drafts/${selectedDraft.id}/publish`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-sowveil-dev-uid': userUid,
-          },
-          body: JSON.stringify({
-            explicitUserConfirmation: true,
-          }),
-        }
-      );
-      const json = await res.json();
-      if (!res.ok) {
-        onNotify(
-          `Publish blocked: ${json.error?.message || json.message || 'Quality or license gate blocked publication.'}`,
-          'error'
-        );
-        return;
-      }
+    const res = await apiRequest<{
+      draft: TemplateFactoryDraftRecord;
+      catalogItem: unknown;
+    }>(`/api/v1/template-factory/drafts/${selectedDraft.id}/publish`, {
+      method: 'POST',
+      body: {
+        explicitUserConfirmation: true,
+      },
+    });
+
+    if (res.ok && res.data?.draft) {
       await loadDraftsFromServer();
       onNotify(
         `Published "${selectedDraft.title}" to Validated Catalog!`,
         'success'
       );
-      return;
-    } catch {
-      // Local fallback
-    }
-
-    const result = publishFactoryTemplateToCatalog({
-      draft: selectedDraft,
-      actorUid: userUid,
-      explicitUserConfirmation: true,
-    });
-    if (!result.ok || !result.updatedDraft) {
+    } else {
       onNotify(
-        `Publish blocked: ${result.errorMessage || 'Failed publication check.'}`,
+        `Publish blocked: ${res.errorMessage || 'Quality or license gate blocked publication.'}`,
         'error'
       );
-      return;
     }
-    const updatedDraft = result.updatedDraft;
-    setDrafts((prev) =>
-      prev.map((d) => (d.id === updatedDraft.id ? updatedDraft : d))
-    );
-    onNotify(
-      `Published "${selectedDraft.title}" to Validated Catalog!`,
-      'success'
-    );
   };
 
   const handleResolveDuplicateSuggestion = async (
@@ -638,142 +513,83 @@ export const TemplateFactoryWorkspace: React.FC<TemplateFactoryWorkspaceProps> =
       | 'merge-into-existing'
       | 'undo-suggestion'
   ) => {
-    try {
-      const res = await fetch(
-        `/api/v1/template-factory/drafts/${draftId}/duplicate-suggestion`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-sowveil-dev-uid': userUid,
-          },
-          body: JSON.stringify({
-            suggestionId,
-            action,
-          }),
-        }
-      );
-      if (res.ok) {
-        await loadDraftsFromServer();
-        onNotify(
-          `Applied reversible deduplication action "${action}" without deleting any work.`,
-          'info'
-        );
-        return;
+    const res = await apiRequest<{ draft: TemplateFactoryDraftRecord }>(
+      `/api/v1/template-factory/drafts/${draftId}/duplicate-suggestion`,
+      {
+        method: 'POST',
+        body: {
+          suggestionId,
+          action,
+        },
       }
-    } catch {
-      // Local fallback
+    );
+    if (res.ok && res.data?.draft) {
+      await loadDraftsFromServer();
+      onNotify(
+        `Applied reversible deduplication action "${action}" without deleting any work.`,
+        'info'
+      );
+    } else {
+      onNotify(
+        `Deduplication action failed: ${res.errorMessage || 'Server rejected action.'}`,
+        'error'
+      );
     }
-
-    const target = drafts.find((d) => d.id === draftId);
-    if (!target) return;
-    const updated = resolveDuplicateSuggestion(target, suggestionId, action);
-    setDrafts((prev) =>
-      prev.map((d) => (d.id === updated.id ? updated : d))
-    );
-    onNotify(
-      `Applied reversible deduplication action "${action}" without deleting any work.`,
-      'info'
-    );
   };
 
   const handleTogglePreferenceConsent = async (consent: boolean) => {
-    try {
-      const res = await fetch('/api/v1/template-factory/feedback/consent', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-sowveil-dev-uid': userUid,
-        },
-        body: JSON.stringify({
-          consentToPreferenceRanking: consent,
-        }),
-      });
-      if (res.ok) {
-        const json = await res.json();
-        const data = json.data || json;
-        if (data.preferenceConsent) {
-          setPreferenceConsent(data.preferenceConsent);
-        }
-        onNotify(
-          consent
-            ? 'Enabled workspace-scoped transparent preference ranking.'
-            : 'Disabled preference ranking signals.',
-          'info'
-        );
-        return;
-      }
-    } catch {
-      // Local fallback
+    const res = await apiRequest<{
+      preferenceConsent: UserPreferenceConsentConfig;
+    }>('/api/v1/template-factory/feedback/consent', {
+      method: 'POST',
+      body: {
+        consentToPreferenceRanking: consent,
+      },
+    });
+    if (res.ok && res.data?.preferenceConsent) {
+      setPreferenceConsent(res.data.preferenceConsent);
+      onNotify(
+        consent
+          ? 'Enabled workspace-scoped transparent preference ranking.'
+          : 'Disabled preference ranking signals.',
+        'info'
+      );
+    } else {
+      onNotify(
+        `Preference update failed: ${res.errorMessage || 'Server rejected consent update.'}`,
+        'error'
+      );
     }
-
-    setPreferenceConsent((prev) => ({
-      ...prev,
-      consentToPreferenceRanking: consent,
-      allowCrossUserSharing: false,
-      silentModelTrainingEnabled: false,
-      updatedAt: new Date().toISOString(),
-    }));
-    onNotify(
-      consent
-        ? 'Enabled workspace-scoped transparent preference ranking.'
-        : 'Disabled preference ranking signals.',
-      'info'
-    );
   };
 
   const handleRecordSignal = async (
     draft: TemplateFactoryDraftRecord,
     action: TemplateFeedbackAction
   ) => {
-    try {
-      const res = await fetch('/api/v1/template-factory/feedback/signal', {
+    const res = await apiRequest<{ signal: TemplatePreferenceSignal }>(
+      '/api/v1/template-factory/feedback/signal',
+      {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-sowveil-dev-uid': userUid,
-        },
-        body: JSON.stringify({
+        body: {
           templateId: draft.id,
           moduleId: draft.moduleId,
           action,
           styleTag: draft.tags[0],
-        }),
-      });
-      if (res.ok) {
-        await loadDraftsFromServer();
-        onNotify(
-          `Recorded transparent signal "${action}" on "${draft.title}".`,
-          'success'
-        );
-        return;
+        },
       }
-    } catch {
-      // Local fallback
-    }
-
-    const resLocal = recordTemplateFeedbackSignal({
-      ownerUid: userUid,
-      consentConfig: preferenceConsent,
-      existingSignals: preferenceSignals,
-      templateId: draft.id,
-      moduleId: draft.moduleId,
-      action,
-      styleTag: draft.tags[0],
-    });
-    if (!resLocal.recorded) {
+    );
+    if (res.ok) {
+      await loadDraftsFromServer();
       onNotify(
-        resLocal.consentBlockedReason || 'Preference consent is disabled.',
+        `Recorded transparent signal "${action}" on "${draft.title}".`,
+        'success'
+      );
+    } else {
+      onNotify(
+        `Signal recording failed: ${res.errorMessage || 'Server rejected signal.'}`,
         'warning'
       );
-      return;
     }
-    setPreferenceSignals(resLocal.signals);
-    setPreferenceConsent(resLocal.updatedConsent);
-    onNotify(
-      `Recorded transparent signal "${action}" on "${draft.title}".`,
-      'success'
-    );
   };
 
   const rankedTemplates = useMemo(

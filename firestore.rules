@@ -268,29 +268,38 @@ service cloud.firestore {
     }
 
     function isValidTemplateFactoryDraftRecord(data) {
-      return data.keys().hasAll(['id', 'ownerUid', 'name', 'sourceMode', 'visibility', 'lifecycleStatus', 'createdAt', 'updatedAt']) &&
-        data.keys().hasOnly(['id', 'ownerUid', 'name', 'slug', 'summary', 'description', 'moduleId', 'categoryId', 'tags', 'sourceMode', 'sourceProjectId', 'sourceReferenceSessionId', 'sourceDirectorSessionId', 'rightsStatus', 'rightsNote', 'attributionText', 'selectedSceneIds', 'selectedTrackIds', 'selectedClipIds', 'exposedParameters', 'dependencies', 'previewThumbnailSvgDataUri', 'previewSampleDurationSec', 'qaReport', 'visibility', 'lifecycleStatus', 'publishedCatalogItemId', 'publishedVersion', 'versionHistory', 'deprecationStatus', 'deprecationReason', 'replacementTemplateId', 'canonicalProjectJson', 'createdAt', 'updatedAt']) &&
+      return data.keys().hasAll(['id', 'ownerUid', 'title', 'sourceKind', 'provenanceClassification', 'publishedToCatalog', 'version', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['id', 'ownerUid', 'title', 'slug', 'description', 'moduleId', 'categoryId', 'tags', 'sourceKind', 'provenanceClassification', 'originProjectId', 'originProjectRevision', 'originReferenceSessionId', 'reconstructedFidelityReport', 'selectedSceneIds', 'selectedClipIds', 'canonicalTemplateProject', 'extractedParameters', 'replaceableSlots', 'generalizationReport', 'requiredAssets', 'requiredFonts', 'requiredEffects', 'licenseType', 'licenseNote', 'attribution', 'thumbnailSvgDataUri', 'previewSnapshotHash', 'structuralContentHash', 'qualityReport', 'pipelineStages', 'duplicateSuggestions', 'catalogItemDraft', 'autoSavedFromAiComponent', 'publishedToCatalog', 'publishedAt', 'version', 'versionHistory', 'deprecationStatus', 'createdAt', 'updatedAt']) &&
         data.id is string && data.id.size() >= 1 && data.id.size() <= 128 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
         data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128 && data.ownerUid.matches('^[a-zA-Z0-9_\\-]+$') &&
         data.ownerUid == request.auth.uid &&
-        data.name is string && data.name.size() >= 1 && data.name.size() <= 160 &&
-        data.sourceMode in ['from-scratch', 'from-user-project', 'from-reference-reconstruction', 'from-ai-director-run'] &&
-        data.visibility in ['private', 'workspace', 'community', 'public'] &&
-        data.lifecycleStatus in ['private-draft', 'qa-passed-private', 'published', 'deprecated', 'archived'] &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 160 &&
+        data.sourceKind in ['from-scratch', 'canonical-project', 'reference-reconstruction', 'ai-director-component'] &&
+        data.provenanceClassification in ['Source-Proven Canonical', 'Author-Created Scratch', 'Reconstructed', 'Original', 'Derived-Authorized', 'Synthetic-AI'] &&
+        data.publishedToCatalog is bool &&
+        data.version is string && data.version.size() >= 1 && data.version.size() <= 32 &&
         data.createdAt is string && data.createdAt.size() <= 64 &&
         data.updatedAt is string && data.updatedAt.size() <= 64;
     }
 
     function isValidRenderExportJobRecord(data) {
-      return data.keys().hasAll(['id', 'ownerUid', 'projectId', 'executionTier', 'outputFormat', 'stage', 'createdAt', 'updatedAt']) &&
-        data.keys().hasOnly(['id', 'ownerUid', 'projectId', 'projectTitle', 'projectRevision', 'directorSessionId', 'executionTier', 'outputFormat', 'targetAdapter', 'requestedWidth', 'requestedHeight', 'requestedFps', 'requestedDurationSec', 'sampleTimestampSec', 'downscaleAssetsForProxy', 'userApprovedDataUpload', 'stage', 'completedWorkUnits', 'totalWorkUnits', 'progressPercent', 'stageHistory', 'retryPolicy', 'cancellationReason', 'sanitizedError', 'artifactMetadata', 'featureLossReport', 'qaReport', 'createdAt', 'updatedAt', 'finishedAt']) &&
+      return data.keys().hasAll(['id', 'ownerUid', 'projectId', 'projectTitle', 'projectRevision', 'executionTier', 'outputFormat', 'targetAdapter', 'requestedWidth', 'requestedHeight', 'requestedFps', 'requestedDurationSec', 'stage', 'cancellable', 'completedWorkUnits', 'totalWorkUnits', 'progressPercent', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['id', 'ownerUid', 'projectId', 'projectTitle', 'projectRevision', 'directorSessionId', 'executionTier', 'outputFormat', 'targetAdapter', 'requestedWidth', 'requestedHeight', 'requestedFps', 'requestedDurationSec', 'sampleTimestampSec', 'downscaleAssetsForProxy', 'serverWorkerDisclosure', 'stage', 'cancellable', 'completedWorkUnits', 'totalWorkUnits', 'progressPercent', 'stageHistory', 'retryPolicy', 'featureLossReport', 'artifactMetadata', 'artifactBytesBase64', 'qaReport', 'errorCode', 'sanitizedErrorMessage', 'createdAt', 'updatedAt', 'completedAt']) &&
         data.id is string && data.id.size() >= 1 && data.id.size() <= 128 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
         data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128 && data.ownerUid.matches('^[a-zA-Z0-9_\\-]+$') &&
         data.ownerUid == request.auth.uid &&
         data.projectId is string && data.projectId.size() >= 1 && data.projectId.size() <= 128 &&
+        data.projectTitle is string && data.projectTitle.size() >= 1 && data.projectTitle.size() <= 200 &&
+        data.projectRevision is number && data.projectRevision >= 1 &&
         data.executionTier in ['timeline-preview', 'proxy-render', 'final-render'] &&
-        data.outputFormat in ['png-frame', 'wav-audio', 'srt-captions', 'vtt-captions', 'captions-json', 'sowveil-project-json', 'alight-motion-xml', 'sowveil-bundle-zip', 'mp4-webm-video'] &&
-        data.stage in ['queued', 'validating-project', 'resolving-assets', 'synthesizing-frames', 'mixing-audio', 'encoding-packaging', 'running-qa-gates', 'ready', 'failed', 'cancelled', 'interrupted-on-restart', 'needs-worker-setup'] &&
+        data.outputFormat in ['sowveil-project-json', 'sowveil-bundle-zip', 'png-frame', 'jpeg-frame', 'svg-vector', 'wav-audio', 'audio-stems-zip', 'srt-captions', 'vtt-captions', 'alight-motion-xml', 'capcut-handoff-zip', 'node-video-handoff-zip', 'kinemaster-handoff-zip', 'webm-video', 'mp4-video'] &&
+        data.targetAdapter in ['sowveil-project', 'alight-motion', 'capcut', 'node-video', 'kinemaster', 'universal-bundle'] &&
+        data.stage in ['queued', 'validating-project', 'resolving-assets', 'rendering-frames', 'synthesizing-audio', 'packaging-container', 'running-final-qa', 'ready', 'cancelled', 'interrupted-recovered', 'failed', 'needs-worker-setup'] &&
+        data.requestedWidth is number && data.requestedWidth >= 64 && data.requestedWidth <= 4096 &&
+        data.requestedHeight is number && data.requestedHeight >= 64 && data.requestedHeight <= 4096 &&
+        data.requestedFps in [24, 30, 60] &&
+        data.cancellable is bool &&
+        data.progressPercent is number && data.progressPercent >= 0 && data.progressPercent <= 100 &&
         data.createdAt is string && data.createdAt.size() <= 64 &&
         data.updatedAt is string && data.updatedAt.size() <= 64;
     }
@@ -630,8 +639,8 @@ service cloud.firestore {
 
     // /templateFactoryDrafts/{draftId} — Strictly owner-scoped Template Factory drafts & derivations
     match /templateFactoryDrafts/{draftId} {
-      allow get: if isValidId(draftId) && isVerifiedUser() && (existing().ownerUid == request.auth.uid || existing().visibility in ['community', 'public'] || isAdmin());
-      allow list: if isVerifiedUser() && (existing().ownerUid == request.auth.uid || existing().visibility in ['community', 'public'] || isAdmin());
+      allow get: if isValidId(draftId) && isVerifiedUser() && (existing().ownerUid == request.auth.uid || existing().publishedToCatalog == true || isAdmin());
+      allow list: if isVerifiedUser() && (existing().ownerUid == request.auth.uid || existing().publishedToCatalog == true || isAdmin());
       allow create: if isValidId(draftId) && isVerifiedUser() &&
         isValidTemplateFactoryDraftRecord(incoming()) &&
         incoming().id == draftId &&
@@ -640,12 +649,12 @@ service cloud.firestore {
         isValidTemplateFactoryDraftRecord(incoming()) &&
         incoming().id == existing().id &&
         incoming().ownerUid == existing().ownerUid &&
-        incoming().sourceMode == existing().sourceMode &&
+        incoming().sourceKind == existing().sourceKind &&
         incoming().createdAt == existing().createdAt && (
           isAdmin() ||
           (
             existing().ownerUid == request.auth.uid &&
-            incoming().diff(existing()).affectedKeys().hasOnly(['name', 'slug', 'summary', 'description', 'categoryId', 'tags', 'rightsStatus', 'rightsNote', 'attributionText', 'selectedSceneIds', 'selectedTrackIds', 'selectedClipIds', 'exposedParameters', 'dependencies', 'previewThumbnailSvgDataUri', 'previewSampleDurationSec', 'qaReport', 'visibility', 'lifecycleStatus', 'publishedCatalogItemId', 'publishedVersion', 'versionHistory', 'deprecationStatus', 'deprecationReason', 'replacementTemplateId', 'canonicalProjectJson', 'updatedAt'])
+            incoming().diff(existing()).affectedKeys().hasOnly(['title', 'slug', 'description', 'categoryId', 'tags', 'selectedSceneIds', 'selectedClipIds', 'canonicalTemplateProject', 'extractedParameters', 'replaceableSlots', 'generalizationReport', 'requiredAssets', 'requiredFonts', 'requiredEffects', 'licenseType', 'licenseNote', 'attribution', 'thumbnailSvgDataUri', 'previewSnapshotHash', 'structuralContentHash', 'qualityReport', 'pipelineStages', 'duplicateSuggestions', 'catalogItemDraft', 'autoSavedFromAiComponent', 'publishedToCatalog', 'publishedAt', 'version', 'versionHistory', 'deprecationStatus', 'updatedAt'])
           )
         );
       allow delete: if isValidId(draftId) && isVerifiedUser() && (existing().ownerUid == request.auth.uid || isAdmin());
@@ -668,7 +677,7 @@ service cloud.firestore {
           isAdmin() ||
           (
             existing().ownerUid == request.auth.uid &&
-            incoming().diff(existing()).affectedKeys().hasOnly(['stage', 'completedWorkUnits', 'totalWorkUnits', 'progressPercent', 'stageHistory', 'retryPolicy', 'cancellationReason', 'sanitizedError', 'artifactMetadata', 'featureLossReport', 'qaReport', 'updatedAt', 'finishedAt'])
+            incoming().diff(existing()).affectedKeys().hasOnly(['stage', 'cancellable', 'completedWorkUnits', 'totalWorkUnits', 'progressPercent', 'stageHistory', 'retryPolicy', 'featureLossReport', 'artifactMetadata', 'artifactBytesBase64', 'qaReport', 'errorCode', 'sanitizedErrorMessage', 'updatedAt', 'completedAt'])
           )
         );
       allow delete: if isValidId(jobId) && isVerifiedUser() && (existing().ownerUid == request.auth.uid || isAdmin());

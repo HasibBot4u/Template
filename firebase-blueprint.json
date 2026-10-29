@@ -790,7 +790,7 @@
     },
     "TemplateFactoryDraftRecord": {
       "title": "TemplateFactoryDraftRecord",
-      "description": "Owner-scoped Template Factory private draft and published template derivation record with exposed parameters, dependency manifest, and 7-check QA suite.",
+      "description": "Owner-scoped Template Factory private draft and published template derivation record with exposed parameters, dependency manifest, and 10-point quality report.",
       "type": "object",
       "properties": {
         "id": {
@@ -803,22 +803,26 @@
           "maxLength": 128,
           "pattern": "^[a-zA-Z0-9_\\-]+$"
         },
-        "name": {
+        "title": {
           "type": "string",
           "minLength": 1,
           "maxLength": 160
         },
-        "sourceMode": {
+        "sourceKind": {
           "type": "string",
-          "enum": ["from-scratch", "from-user-project", "from-reference-reconstruction", "from-ai-director-run"]
+          "enum": ["from-scratch", "canonical-project", "reference-reconstruction", "ai-director-component"]
         },
-        "visibility": {
+        "provenanceClassification": {
           "type": "string",
-          "enum": ["private", "workspace", "community", "public"]
+          "enum": ["Source-Proven Canonical", "Author-Created Scratch", "Reconstructed", "Original", "Derived-Authorized", "Synthetic-AI"]
         },
-        "lifecycleStatus": {
+        "publishedToCatalog": {
+          "type": "boolean"
+        },
+        "version": {
           "type": "string",
-          "enum": ["private-draft", "qa-passed-private", "published", "deprecated", "archived"]
+          "minLength": 1,
+          "maxLength": 32
         },
         "createdAt": {
           "type": "string",
@@ -829,7 +833,7 @@
           "format": "date-time"
         }
       },
-      "required": ["id", "ownerUid", "name", "sourceMode", "visibility", "lifecycleStatus", "createdAt", "updatedAt"]
+      "required": ["id", "ownerUid", "title", "sourceKind", "provenanceClassification", "publishedToCatalog", "version", "createdAt", "updatedAt"]
     },
     "RenderExportJobRecord": {
       "title": "RenderExportJobRecord",
@@ -850,17 +854,64 @@
           "type": "string",
           "maxLength": 128
         },
+        "projectTitle": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "projectRevision": {
+          "type": "integer",
+          "minimum": 1
+        },
         "executionTier": {
           "type": "string",
           "enum": ["timeline-preview", "proxy-render", "final-render"]
         },
         "outputFormat": {
           "type": "string",
-          "enum": ["png-frame", "wav-audio", "srt-captions", "vtt-captions", "captions-json", "sowveil-project-json", "alight-motion-xml", "sowveil-bundle-zip", "mp4-webm-video"]
+          "enum": ["sowveil-project-json", "sowveil-bundle-zip", "png-frame", "jpeg-frame", "svg-vector", "wav-audio", "audio-stems-zip", "srt-captions", "vtt-captions", "alight-motion-xml", "capcut-handoff-zip", "node-video-handoff-zip", "kinemaster-handoff-zip", "webm-video", "mp4-video"]
+        },
+        "targetAdapter": {
+          "type": "string",
+          "enum": ["sowveil-project", "alight-motion", "capcut", "node-video", "kinemaster", "universal-bundle"]
+        },
+        "requestedWidth": {
+          "type": "integer",
+          "minimum": 64,
+          "maximum": 4096
+        },
+        "requestedHeight": {
+          "type": "integer",
+          "minimum": 64,
+          "maximum": 4096
+        },
+        "requestedFps": {
+          "type": "integer",
+          "enum": [24, 30, 60]
+        },
+        "requestedDurationSec": {
+          "type": "number",
+          "minimum": 0
         },
         "stage": {
           "type": "string",
-          "enum": ["queued", "validating-project", "resolving-assets", "synthesizing-frames", "mixing-audio", "encoding-packaging", "running-qa-gates", "ready", "failed", "cancelled", "interrupted-on-restart", "needs-worker-setup"]
+          "enum": ["queued", "validating-project", "resolving-assets", "rendering-frames", "synthesizing-audio", "packaging-container", "running-final-qa", "ready", "cancelled", "interrupted-recovered", "failed", "needs-worker-setup"]
+        },
+        "cancellable": {
+          "type": "boolean"
+        },
+        "completedWorkUnits": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "totalWorkUnits": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "progressPercent": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
         },
         "createdAt": {
           "type": "string",
@@ -871,7 +922,7 @@
           "format": "date-time"
         }
       },
-      "required": ["id", "ownerUid", "projectId", "executionTier", "outputFormat", "stage", "createdAt", "updatedAt"]
+      "required": ["id", "ownerUid", "projectId", "projectTitle", "projectRevision", "executionTier", "outputFormat", "targetAdapter", "requestedWidth", "requestedHeight", "requestedFps", "requestedDurationSec", "stage", "cancellable", "completedWorkUnits", "totalWorkUnits", "progressPercent", "createdAt", "updatedAt"]
     }
   },
   "firestore": {

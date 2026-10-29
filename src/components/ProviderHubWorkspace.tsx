@@ -79,8 +79,14 @@ export interface ProviderHubApiResult<T> {
   details?: unknown;
 }
 
+import {
+  executeAuthenticatedApiRequest,
+  ApiResponse,
+} from '../services/apiClient';
+
 /**
  * Browser-safe authenticated API helper for Provider Hub, Extensions, and Tool Registry.
+ * - Delegates to the shared unified authenticated API client (`executeAuthenticatedApiRequest`).
  * - Obtains a verified Firebase ID token via `auth.currentUser.getIdToken()` (or injected test token getter).
  * - Sends `Authorization: Bearer <token>`.
  * - Never sends unverified development bypass headers.
@@ -95,74 +101,21 @@ export async function executeProviderHubApiRequest<T>(
     fetchImpl?: typeof fetch;
   } = {}
 ): Promise<ProviderHubApiResult<T>> {
-  const resolveToken =
-    options.getAuthToken ||
-    (async () => {
-      if (auth?.currentUser) {
-        return await auth.currentUser.getIdToken();
-      }
-      return null;
-    });
+  const res: ApiResponse<T> = await executeAuthenticatedApiRequest<T>(path, {
+    method: options.method,
+    body: options.body,
+    getAuthToken: options.getAuthToken ? async () => options.getAuthToken!() : undefined,
+    fetchImpl: options.fetchImpl,
+  });
 
-  let token: string | null = null;
-  try {
-    token = await resolveToken();
-  } catch {
-    token = null;
-  }
-
-  if (!token) {
-    return {
-      ok: false,
-      status: 401,
-      errorCode: 'AUTH_SESSION_REQUIRED',
-      errorMessage:
-        'An active authenticated session is required for Provider Hub operations. Please sign in and retry.',
-    };
-  }
-
-  const effectiveFetch = options.fetchImpl || globalThis.fetch;
-  const headers: Record<string, string> = {
-    Authorization: `Bearer ${token}`,
+  return {
+    ok: res.ok,
+    status: res.status,
+    data: res.data,
+    errorCode: res.errorCode,
+    errorMessage: res.errorMessage,
+    details: res.details,
   };
-  if (options.body !== undefined) {
-    headers['Content-Type'] = 'application/json';
-  }
-
-  try {
-    const response = await effectiveFetch(path, {
-      method: options.method || 'GET',
-      headers,
-      body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
-    });
-
-    const json = await response.json().catch(() => null);
-    if (!response.ok || !json || json.ok === false) {
-      return {
-        ok: false,
-        status: response.status,
-        errorCode: json?.error?.code || `HTTP_${response.status}`,
-        errorMessage:
-          json?.error?.message ||
-          `Request to ${path} failed with HTTP ${response.status}.`,
-        details: json?.error?.details,
-      };
-    }
-
-    return {
-      ok: true,
-      status: response.status,
-      data: json.data as T,
-    };
-  } catch (err: any) {
-    return {
-      ok: false,
-      status: 0,
-      errorCode: 'NETWORK_REQUEST_FAILED',
-      errorMessage:
-        err?.message || `Network error while contacting ${path}. No local fallback was applied.`,
-    };
-  }
 }
 
 export const ProviderHubWorkspace: React.FC<ProviderHubWorkspaceProps> = ({

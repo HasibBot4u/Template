@@ -173,6 +173,35 @@ export type ProviderConnectionPublicView = Omit<
   'encryptedCredential'
 >;
 
+export interface FormattedProbePreview {
+  url: string;
+  method: string;
+  redactedHeaders: Record<string, string>;
+  bodySummary: Record<string, unknown>;
+  latencyMs?: number;
+  httpStatus?: number;
+}
+
+export interface ConnectionProbeOptions {
+  probeTools?: boolean;
+  probeStructuredOutput?: boolean;
+  probeVision?: boolean;
+  probeStreaming?: boolean;
+  redirectHopUrlsToValidate?: string[];
+  fetchImpl?: typeof fetch;
+  timeoutMs?: number;
+  maxResponseBytes?: number;
+}
+
+export interface ProviderProbeResult {
+  updatedConnection: ProviderConnectionRecord;
+  probePassed: boolean;
+  formattedProbeRequestPreview: FormattedProbePreview | null;
+  verifiedCapabilities: ModelCapabilityKey[];
+  sanitizedError: ProviderConnectionRecord['lastSanitizedError'];
+  latencyMs?: number;
+}
+
 export interface PrepopulatedModelCatalogEntry {
   presetId: string;
   label: string;

@@ -39,12 +39,15 @@ import {
 } from '../services/canonicalProjectEngine';
 import { MobileProEditorModal } from './MobileProEditorModal';
 import { CatalogItem, ProjectLibraryItem } from '../types/sowveil';
+import { executeAuthenticatedApiRequest } from '../services/apiClient';
 
 interface ReferenceLabWorkspaceProps {
   idToken?: string | null;
   userUid?: string | null;
   onProjectSaved?: (project: ProjectLibraryItem) => void;
   onTemplateSaved?: (template: CatalogItem) => void;
+  getAuthToken?: (forceRefresh?: boolean) => Promise<string | null>;
+  fetchImpl?: typeof fetch;
 }
 
 const PROVENANCE_BADGE_STYLES: Record<
@@ -88,7 +91,26 @@ export const ReferenceLabWorkspace: React.FC<ReferenceLabWorkspaceProps> = ({
   userUid,
   onProjectSaved,
   onTemplateSaved,
+  getAuthToken,
+  fetchImpl,
 }) => {
+  const apiRequest = React.useCallback(
+    async <T,>(
+      path: string,
+      options: {
+        method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+        body?: unknown;
+      } = {}
+    ) => {
+      return executeAuthenticatedApiRequest<T>(path, {
+        ...options,
+        getAuthToken:
+          getAuthToken || (idToken ? async () => idToken : undefined),
+        fetchImpl,
+      });
+    },
+    [getAuthToken, idToken, fetchImpl]
+  );
   // 1. Rights & Usage Mode State (Mandatory at start)
   const [usageMode, setUsageMode] = useState<ReferenceUsageMode | null>(
     'authorized-reconstruction'
@@ -202,19 +224,15 @@ export const ReferenceLabWorkspace: React.FC<ReferenceLabWorkspaceProps> = ({
     }
 
     setSourceKind('public-url');
-    if (idToken) {
-      try {
-        await fetch('/api/v1/reference-lab/inspect-url', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${idToken}`,
-          },
-          body: JSON.stringify({ url: sourceUrlInput }),
-        });
-      } catch {
-        // Local inspection already succeeded
+    const res = await apiRequest<{ inspection: ReferenceUrlInspectionResult }>(
+      '/api/v1/reference-lab/inspect-url',
+      {
+        method: 'POST',
+        body: { url: sourceUrlInput },
       }
+    );
+    if (res.ok && res.data?.inspection) {
+      setUrlInspection(res.data.inspection);
     }
 
     setStatusBanner({
@@ -246,7 +264,7 @@ export const ReferenceLabWorkspace: React.FC<ReferenceLabWorkspaceProps> = ({
 
     setStatusBanner({
       tone: 'ok',
-      message: `Loaded lawful file "${file.name}" (${Math.round(file.size / 1024)} KB) as ${detectedKind}.`,
+      message: `Selected lawful file "${file.name}" (${Math.round(file.size / 1024)} KB) as ${detectedKind}. Ready to run analysis pipeline.`,
     });
   };
 
@@ -278,59 +296,53 @@ export const ReferenceLabWorkspace: React.FC<ReferenceLabWorkspaceProps> = ({
     }
 
     try {
-      const nextSession = createReferenceLabSession({
-        ownerUid: userUid || 'local-studio-user',
+      const payload = {
         title: sessionTitle.trim() || 'Reference Reconstruction',
         usageMode,
         sourceKind,
         sourceUrl: sourceUrlInput.trim() || undefined,
         presetId: selectedPresetId,
         suppliedFileNames,
-        allowRemoteModelUpload: cancelledBeforeRemoteUpload ? false : allowRemoteModelUpload,
+        allowRemoteModelUpload: cancelledBeforeRemoteUpload
+          ? false
+          : allowRemoteModelUpload,
         cancelledBeforeRemoteUpload,
         attributionText,
-      });
+      };
 
-      setSession(nextSession);
-      setPlayheadSec(nextSession.shots[0]?.representativeTimestampsSec[0] || 0.2);
-      setSelectedShotId(nextSession.shots[0]?.id || 'shot_01');
+      const res = await apiRequest<{ session: ReferenceLabSession }>(
+        '/api/v1/reference-lab/sessions',
+        {
+          method: 'POST',
+          body: payload,
+        }
+      );
 
-      if (idToken) {
-        try {
-          const res = await fetch('/api/v1/reference-lab/sessions', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              Authorization: `Bearer ${idToken}`,
-            },
-            body: JSON.stringify({
-              title: nextSession.title,
-              usageMode,
-              sourceKind,
-              sourceUrl: sourceUrlInput.trim() || undefined,
-              presetId: selectedPresetId,
-              suppliedFileNames,
-              allowRemoteModelUpload: cancelledBeforeRemoteUpload
-                ? false
-                : allowRemoteModelUpload,
-              cancelledBeforeRemoteUpload,
-              attributionText,
-            }),
+      let activeSession: ReferenceLabSession;
+      if (res.ok && res.data?.session) {
+        activeSession = res.data.session;
+      } else {
+        activeSession = createReferenceLabSession({
+          ownerUid: userUid || 'local-studio-user',
+          ...payload,
+        });
+        if (!res.ok && res.status !== 401) {
+          setStatusBanner({
+            tone: 'warn',
+            message: `Server analysis rejected: ${res.errorMessage || 'Using local reconstruction session.'}`,
           });
-          const body = await res.json().catch(() => null);
-          if (res.ok && body?.data?.session) {
-            setSession(body.data.session);
-          }
-        } catch {
-          // Local session remains active
         }
       }
+
+      setSession(activeSession);
+      setPlayheadSec(activeSession.shots[0]?.representativeTimestampsSec[0] || 0.2);
+      setSelectedShotId(activeSession.shots[0]?.id || 'shot_01');
 
       setStatusBanner({
         tone: 'ok',
         message:
           usageMode === 'authorized-reconstruction'
-            ? `Authorized Reconstruction complete: ${nextSession.shots.length} shots segmented, ${nextSession.fidelityReport.reconstructedEditableProperties.length} editable properties mapped to Canonical Project v2.0.0.`
+            ? `Authorized Reconstruction complete: ${activeSession.shots.length} shots segmented, ${activeSession.fidelityReport.reconstructedEditableProperties.length} editable properties mapped to Canonical Project v2.0.0.`
             : `Reference-Inspired synthesis complete: Preserved broad pacing/contrast lessons and generated an independent editable composition with original copy, shifted timing, and Sowveil original audio.`,
       });
     } catch (err: any) {
@@ -357,19 +369,15 @@ export const ReferenceLabWorkspace: React.FC<ReferenceLabWorkspaceProps> = ({
     const updated = applyReferenceCorrectionAction(session, input);
     setSession(updated);
 
-    if (idToken) {
-      try {
-        await fetch(`/api/v1/reference-lab/sessions/${session.id}/actions`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${idToken}`,
-          },
-          body: JSON.stringify(input),
-        });
-      } catch {
-        // Local state already updated and verified
+    const res = await apiRequest<{ session: ReferenceLabSession }>(
+      `/api/v1/reference-lab/sessions/${session.id}/actions`,
+      {
+        method: 'POST',
+        body: input,
       }
+    );
+    if (res.ok && res.data?.session) {
+      setSession(res.data.session);
     }
 
     setStatusBanner({
@@ -383,78 +391,62 @@ export const ReferenceLabWorkspace: React.FC<ReferenceLabWorkspaceProps> = ({
   };
 
   const handleSaveToProjectLibrary = async () => {
-    const partialRecord = convertReferenceSessionToProjectRecord(session);
-    const now = new Date().toISOString();
-    const projectRecord: ProjectLibraryItem = {
-      ...partialRecord,
-      id: `proj_ref_${session.id}`,
-      updatedAt: now,
-    };
-    onProjectSaved?.(projectRecord);
+    const res = await apiRequest<{
+      project: ProjectLibraryItem;
+      session: ReferenceLabSession;
+    }>(`/api/v1/reference-lab/sessions/${session.id}/save-project`, {
+      method: 'POST',
+    });
 
-    if (idToken) {
-      try {
-        await fetch(`/api/v1/reference-lab/sessions/${session.id}/save-project`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${idToken}`,
-          },
-        });
-      } catch {
-        // Saved locally
-      }
+    if (res.ok && res.data?.project) {
+      const projectRecord = res.data.project;
+      onProjectSaved?.(projectRecord);
+      setSession(res.data.session || {
+        ...session,
+        savedProjectId: projectRecord.id,
+        updatedAt: projectRecord.updatedAt,
+      });
+      setStatusBanner({
+        tone: 'ok',
+        message: `Saved "${projectRecord.title}" to Project Library (${projectRecord.id}) with full Canonical Project v2.0.0 timeline and provenance metadata.`,
+      });
+    } else {
+      setStatusBanner({
+        tone: 'error',
+        message: `Failed to save project to server: ${res.errorMessage || 'Server rejected project save.'}`,
+      });
     }
-
-    setSession({
-      ...session,
-      savedProjectId: projectRecord.id,
-      updatedAt: now,
-    });
-    setStatusBanner({
-      tone: 'ok',
-      message: `Saved "${projectRecord.title}" to Project Library (${projectRecord.id}) with full Canonical Project v2.0.0 timeline and provenance metadata.`,
-    });
   };
 
   const handleSaveTemplate = async (promoteToValidated: boolean) => {
-    let templateItem = buildDraftTemplateFromReferenceSession(session);
-    let promotionSummary = '';
-
-    if (promoteToValidated) {
-      const result = validateAndPromoteReferenceTemplate(session, templateItem);
-      templateItem = result.template;
-      promotionSummary = ` Render smoke test (${result.localChecks.renderSmokeTestPassed ? 'PASS' : 'FAIL'}) & Schema check (${result.localChecks.validCanonicalSchema ? 'PASS' : 'FAIL'}) → Status: ${templateItem.validationState}.`;
-    }
-
-    onTemplateSaved?.(templateItem);
-
-    if (idToken) {
-      try {
-        await fetch(`/api/v1/reference-lab/sessions/${session.id}/save-template`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${idToken}`,
-          },
-          body: JSON.stringify({ promoteToValidated }),
-        });
-      } catch {
-        // Local callback invoked
-      }
-    }
-
-    setSession({
-      ...session,
-      savedDraftTemplateId: templateItem.id,
-      ...(promoteToValidated ? { promotedValidatedTemplateId: templateItem.id } : {}),
-      updatedAt: new Date().toISOString(),
+    const res = await apiRequest<{
+      template: CatalogItem;
+      promotionResult?: unknown;
+      session: ReferenceLabSession;
+    }>(`/api/v1/reference-lab/sessions/${session.id}/save-template`, {
+      method: 'POST',
+      body: { promoteToValidated },
     });
 
-    setStatusBanner({
-      tone: 'ok',
-      message: `Saved reusable private template "${templateItem.name}" (${templateItem.id}, license: ${templateItem.licenseType}).${promotionSummary}`,
-    });
+    if (res.ok && res.data?.template) {
+      const templateItem = res.data.template;
+      onTemplateSaved?.(templateItem);
+      setSession(res.data.session || {
+        ...session,
+        savedDraftTemplateId: templateItem.id,
+        ...(promoteToValidated ? { promotedValidatedTemplateId: templateItem.id } : {}),
+        updatedAt: new Date().toISOString(),
+      });
+      setStatusBanner({
+        tone: 'ok',
+        message: `Saved reusable private template "${templateItem.name}" (${templateItem.id}, license: ${templateItem.licenseType}) to catalog.`,
+      });
+    } else {
+      setStatusBanner({
+        tone: 'error',
+        message: `Failed to save template to server: ${res.errorMessage || 'Server rejected template save.'}`,
+      });
+    }
   };
 
   // Evaluate reconstructed clips at current playheadSec for live side-by-side preview
