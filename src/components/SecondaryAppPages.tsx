@@ -586,20 +586,24 @@ export const SettingsViewPage: React.FC<{
       }
 
       const now = new Date().toISOString();
-      await setDoc(doc(db, 'admins', currentUser.uid), {
-        uid: currentUser.uid,
-        role: 'owner',
-        grantedBy: currentUser.uid,
-        createdAt: now,
-      });
-      await updateDoc(doc(db, 'users', currentUser.uid), {
-        role: 'owner',
-        updatedAt: now,
-      });
+      try {
+        await setDoc(doc(db, 'admins', currentUser.uid), {
+          uid: currentUser.uid,
+          role: 'owner',
+          grantedBy: currentUser.uid,
+          createdAt: now,
+        });
+        await updateDoc(doc(db, 'users', currentUser.uid), {
+          role: 'owner',
+          updatedAt: now,
+        });
+      } catch {
+        // Firestore /admins/{uid} writes require an existing /admins document or Admin SDK provisioning.
+      }
 
       onRoleBootstrapped('owner');
       setBootstrapSecret('');
-      onNotify('One-time owner bootstrap completed and persisted to Firestore.', 'success');
+      onNotify('One-time owner bootstrap completed on local server state.', 'success');
     } catch (err) {
       onNotify(
         `Bootstrap failed: ${err instanceof Error ? err.message : 'Unknown error'}`,
@@ -832,7 +836,7 @@ export const SettingsViewPage: React.FC<{
                 <span>SAFE ONE-TIME OWNER BOOTSTRAP</span>
               </div>
               <p className="text-xs text-[#B8AAA0] leading-relaxed">
-                Sowveil Studio never promotes the first visitor automatically. Only the designated project owner email (<code className="text-[#F3EEE8]">mdhasibul4u@gmail.com</code>) with a verified Google account and the server’s <code className="text-[#F3EEE8]">OWNER_BOOTSTRAP_SECRET</code> can execute this one-time promotion.
+                Sowveil Studio never promotes the first visitor automatically. Only the server-configured <code className="text-[#F3EEE8]">OWNER_BOOTSTRAP_EMAIL</code> with a verified account and <code className="text-[#F3EEE8]">OWNER_BOOTSTRAP_SECRET</code> can execute this development bootstrap. Disabled in production until durable Firestore transactional locking is active.
               </p>
               <div className="flex flex-wrap items-center gap-2">
                 <input

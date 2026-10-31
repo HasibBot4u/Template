@@ -70,6 +70,7 @@ export interface TemplateFactoryWorkspaceProps {
   onSaveProjectToLibrary?: (
     proj: Omit<ProjectLibraryItem, 'id' | 'updatedAt'>
   ) => Promise<void>;
+  onCatalogChanged?: () => void;
   onNotify: (
     message: string,
     tone?: 'info' | 'warning' | 'error' | 'success'
@@ -107,6 +108,7 @@ export const TemplateFactoryWorkspace: React.FC<TemplateFactoryWorkspaceProps> =
   userUid = 'user-local',
   projects,
   onSaveProjectToLibrary,
+  onCatalogChanged,
   onNotify,
   getAuthToken,
   fetchImpl,
@@ -492,6 +494,7 @@ export const TemplateFactoryWorkspace: React.FC<TemplateFactoryWorkspaceProps> =
 
     if (res.ok && res.data?.draft) {
       await loadDraftsFromServer();
+      onCatalogChanged?.();
       onNotify(
         `Published "${selectedDraft.title}" to Validated Catalog!`,
         'success'

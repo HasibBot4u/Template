@@ -11,7 +11,7 @@
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
     "lint:rules": "eslint firestore.rules",
-    "test": "tsx --test src/tests/phase2.test.ts src/tests/phase3.security.test.ts src/tests/firestore.rules.test.ts src/tests/mobileMigration.test.ts src/tests/adminAndDiagnostics.test.ts src/tests/editorGatewayPhase5.test.ts src/tests/mobileMediaWorkflows.test.ts src/tests/mobileHardeningPhase7.test.ts src/tests/aiDirectorPhase8.test.ts src/tests/canonicalProjectSchema.test.ts src/tests/referenceLab.test.ts src/tests/providerHub.test.ts src/tests/aiDirectorProduction.test.ts src/tests/editingStudioCoEdit.test.ts src/tests/templateFactory.test.ts src/tests/renderExportQa.test.ts src/tests/securityObservabilityReleasePhase14.test.ts src/tests/authenticatedWorkspacePhase1B.test.ts"
+    "test": "tsx --test src/tests/phase2.test.ts src/tests/phase3.security.test.ts src/tests/firestore.rules.test.ts src/tests/mobileMigration.test.ts src/tests/adminAndDiagnostics.test.ts src/tests/editorGatewayPhase5.test.ts src/tests/mobileMediaWorkflows.test.ts src/tests/mobileHardeningPhase7.test.ts src/tests/aiDirectorPhase8.test.ts src/tests/canonicalProjectSchema.test.ts src/tests/referenceLab.test.ts src/tests/providerHub.test.ts src/tests/aiDirectorProduction.test.ts src/tests/editingStudioCoEdit.test.ts src/tests/templateFactory.test.ts src/tests/renderExportQa.test.ts src/tests/securityObservabilityReleasePhase14.test.ts src/tests/authenticatedWorkspacePhase1B.test.ts src/tests/persistencePhase2A.test.ts src/tests/persistencePhase2B.test.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

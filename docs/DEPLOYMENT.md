@@ -22,8 +22,8 @@ Never commit real secrets or API keys to source control. Inject secrets via Clou
 |---|---|---|---|
 | `PORT` | Yes | `3000` | HTTP server port (must be `3000` in AI Studio runtime). |
 | `NODE_ENV` | Yes | `production` | Runtime environment (`development` or `production`). |
-| `OWNER_BOOTSTRAP_EMAIL` | Recommended | `mdhasibul4u@gmail.com` | Verified Google email authorized for one-time owner role claim. |
-| `OWNER_BOOTSTRAP_SECRET` | Recommended | `<min-16-char-random-secret>` | Secret required by `/api/v1/admin/bootstrap-owner` (fails closed with `503` if unset). |
+| `OWNER_BOOTSTRAP_EMAIL` | Optional (dev only) | `""` (empty by default) | Verified Google email authorized for one-time dev owner role claim. Fails closed (`503`) if unset; no hardcoded fallback. |
+| `OWNER_BOOTSTRAP_SECRET` | Optional (dev only) | `""` (empty by default) | Secret required by `/api/v1/admin/bootstrap-owner` (fails closed with `503` if unset; route is disabled in `NODE_ENV=production` until durable Firestore transactional lock is enabled). |
 | `SOWVEIL_MASTER_VAULT_KEY` | Required for encrypted vault | `<32-byte-hex-or-base64-key>` | Canonical master key for AES-256-GCM encryption/decryption of user provider credentials (`src/server/credentialVault.ts`). Fails closed (`503 VAULT_MASTER_KEY_NOT_CONFIGURED`) if unset; never uses a hardcoded or ephemeral fallback key. Legacy `SOWVEIL_VAULT_KEY` is accepted only when `SOWVEIL_MASTER_VAULT_KEY` is unset or identical; conflicting values fail closed (`VAULT_KEY_CONFIG_CONFLICT`). |
 | `GEMINI_API_KEY` | Optional | `<server-managed-gemini-key>` | Server-side key used when a Provider Hub connection uses `authMode: "server-env"`. |
 | `SOWVEIL_RENDER_WORKER_ENABLED` | Optional | `false` | Set to `true` only when a dedicated server-side video muxing worker is provisioned for `.mp4`/`.webm` output. |

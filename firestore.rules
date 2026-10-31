@@ -38,10 +38,8 @@ service cloud.firestore {
     }
 
     function isAdmin() {
-      return isVerifiedUser() && (
-        request.auth.token.email == 'mdhasibul4u@gmail.com' ||
-        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
-      );
+      return isVerifiedUser() &&
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid));
     }
 
     // 3. Entity Validation Blueprints (Anti-Update-Gap)
@@ -206,18 +204,34 @@ service cloud.firestore {
     }
 
     function isValidReferenceLabSessionRecord(data) {
-      return data.keys().hasAll(['id', 'ownerUid', 'title', 'usageMode', 'rightsDeclaration', 'sourceMetadata', 'fidelityReport', 'createdAt', 'updatedAt']) &&
-        data.keys().hasOnly(['id', 'ownerUid', 'title', 'usageMode', 'rightsDeclaration', 'sourceMetadata', 'pipelineMetadata', 'shots', 'audioAnalysis', 'independenceManifest', 'fidelityReport', 'canonicalProjectJson', 'savedProjectId', 'savedDraftTemplateId', 'templateValidationStatus', 'localCheckSummary', 'createdAt', 'updatedAt']) &&
-        data.id is string && data.id.size() >= 1 && data.id.size() <= 128 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
-        data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128 && data.ownerUid.matches('^[a-zA-Z0-9_\\-]+$') &&
-        data.ownerUid == request.auth.uid &&
-        data.title is string && data.title.size() >= 1 && data.title.size() <= 160 &&
-        data.usageMode in ['authorized-reconstruction', 'reference-inspired'] &&
-        data.rightsDeclaration is map &&
-        data.sourceMetadata is map &&
-        data.fidelityReport is map &&
-        data.createdAt is string && data.createdAt.size() <= 64 &&
-        data.updatedAt is string && data.updatedAt.size() <= 64;
+      return (
+        (
+          data.keys().hasAll(['id', 'ownerUid', 'title', 'sourceKind', 'usageMode', 'payloadJson', 'createdAt', 'updatedAt']) &&
+          data.keys().hasOnly(['id', 'ownerUid', 'title', 'sourceKind', 'usageMode', 'mediaAnalysisState', 'sourceMediaParsed', 'savedProjectId', 'savedDraftTemplateId', 'promotedValidatedTemplateId', 'payloadJson', 'createdAt', 'updatedAt']) &&
+          data.id is string && data.id.size() >= 1 && data.id.size() <= 128 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
+          data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128 && data.ownerUid.matches('^[a-zA-Z0-9_\\-]+$') &&
+          data.ownerUid == request.auth.uid &&
+          data.title is string && data.title.size() >= 1 && data.title.size() <= 160 &&
+          data.usageMode in ['authorized-reconstruction', 'reference-inspired'] &&
+          data.payloadJson is string &&
+          data.createdAt is string && data.createdAt.size() <= 64 &&
+          data.updatedAt is string && data.updatedAt.size() <= 64
+        ) ||
+        (
+          data.keys().hasAll(['id', 'ownerUid', 'title', 'usageMode', 'rightsDeclaration', 'sourceMetadata', 'fidelityReport', 'createdAt', 'updatedAt']) &&
+          data.keys().hasOnly(['id', 'ownerUid', 'title', 'usageMode', 'rightsDeclaration', 'sourceMetadata', 'pipelineMetadata', 'shots', 'audioAnalysis', 'independenceManifest', 'fidelityReport', 'canonicalProjectJson', 'savedProjectId', 'savedDraftTemplateId', 'templateValidationStatus', 'localCheckSummary', 'createdAt', 'updatedAt']) &&
+          data.id is string && data.id.size() >= 1 && data.id.size() <= 128 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
+          data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128 && data.ownerUid.matches('^[a-zA-Z0-9_\\-]+$') &&
+          data.ownerUid == request.auth.uid &&
+          data.title is string && data.title.size() >= 1 && data.title.size() <= 160 &&
+          data.usageMode in ['authorized-reconstruction', 'reference-inspired'] &&
+          data.rightsDeclaration is map &&
+          data.sourceMetadata is map &&
+          data.fidelityReport is map &&
+          data.createdAt is string && data.createdAt.size() <= 64 &&
+          data.updatedAt is string && data.updatedAt.size() <= 64
+        )
+      );
     }
 
     function isValidProviderConnectionRecord(data) {
@@ -254,32 +268,67 @@ service cloud.firestore {
     }
 
     function isValidAiDirectorSessionRecord(data) {
-      return data.keys().hasAll(['id', 'ownerUid', 'title', 'state', 'originalScriptSha256', 'coverageLedger', 'createdAt', 'updatedAt']) &&
-        data.keys().hasOnly(['id', 'ownerUid', 'workspaceId', 'title', 'state', 'intake', 'originalScriptText', 'originalScriptSha256', 'normalizedWorkingScriptText', 'segments', 'semanticAnalysis', 'coverageLedger', 'questions', 'answeredQuestionFingerprints', 'brief', 'shotPlan', 'planApprovedWhole', 'planRevisions', 'canonicalProject', 'commandReceipts', 'traceability', 'generatedAssetProvenance', 'checkpoints', 'refinementSuggestions', 'acceptanceGate', 'createdAt', 'updatedAt']) &&
-        data.id is string && data.id.size() >= 1 && data.id.size() <= 128 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
-        data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128 && data.ownerUid.matches('^[a-zA-Z0-9_\\-]+$') &&
-        data.ownerUid == request.auth.uid &&
-        data.title is string && data.title.size() >= 1 && data.title.size() <= 160 &&
-        data.state in ['intake', 'analysis-coverage', 'questions-clarification', 'brief-shot-plan', 'production-execution', 'adaptive-refinement', 'acceptance-verified'] &&
-        data.originalScriptSha256 is string && data.originalScriptSha256.size() >= 1 && data.originalScriptSha256.size() <= 128 &&
-        data.coverageLedger is map &&
-        data.createdAt is string && data.createdAt.size() <= 64 &&
-        data.updatedAt is string && data.updatedAt.size() <= 64;
+      return (
+        (
+          data.keys().hasAll(['id', 'ownerUid', 'title', 'state', 'stage', 'originalScriptSha256', 'activeRevisionNumber', 'payloadJson', 'createdAt', 'updatedAt']) &&
+          data.keys().hasOnly(['id', 'ownerUid', 'title', 'state', 'stage', 'originalScriptSha256', 'activeRevisionNumber', 'savedProjectId', 'payloadJson', 'createdAt', 'updatedAt']) &&
+          data.id is string && data.id.size() >= 1 && data.id.size() <= 128 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
+          data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128 && data.ownerUid.matches('^[a-zA-Z0-9_\\-]+$') &&
+          data.ownerUid == request.auth.uid &&
+          data.title is string && data.title.size() >= 1 && data.title.size() <= 160 &&
+          data.originalScriptSha256 is string && data.originalScriptSha256.size() >= 1 && data.originalScriptSha256.size() <= 128 &&
+          data.payloadJson is string &&
+          data.createdAt is string && data.createdAt.size() <= 64 &&
+          data.updatedAt is string && data.updatedAt.size() <= 64
+        ) ||
+        (
+          data.keys().hasAll(['id', 'ownerUid', 'title', 'state', 'originalScriptSha256', 'coverageLedger', 'createdAt', 'updatedAt']) &&
+          data.keys().hasOnly(['id', 'ownerUid', 'workspaceId', 'title', 'state', 'intake', 'originalScriptText', 'originalScriptSha256', 'normalizedWorkingScriptText', 'segments', 'semanticAnalysis', 'coverageLedger', 'questions', 'answeredQuestionFingerprints', 'brief', 'shotPlan', 'planApprovedWhole', 'planRevisions', 'canonicalProject', 'commandReceipts', 'traceability', 'generatedAssetProvenance', 'checkpoints', 'refinementSuggestions', 'acceptanceGate', 'createdAt', 'updatedAt']) &&
+          data.id is string && data.id.size() >= 1 && data.id.size() <= 128 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
+          data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128 && data.ownerUid.matches('^[a-zA-Z0-9_\\-]+$') &&
+          data.ownerUid == request.auth.uid &&
+          data.title is string && data.title.size() >= 1 && data.title.size() <= 160 &&
+          data.state in ['intake', 'analysis-coverage', 'questions-clarification', 'brief-shot-plan', 'production-execution', 'adaptive-refinement', 'acceptance-verified'] &&
+          data.originalScriptSha256 is string && data.originalScriptSha256.size() >= 1 && data.originalScriptSha256.size() <= 128 &&
+          data.coverageLedger is map &&
+          data.createdAt is string && data.createdAt.size() <= 64 &&
+          data.updatedAt is string && data.updatedAt.size() <= 64
+        )
+      );
     }
 
     function isValidTemplateFactoryDraftRecord(data) {
-      return data.keys().hasAll(['id', 'ownerUid', 'title', 'sourceKind', 'provenanceClassification', 'publishedToCatalog', 'version', 'createdAt', 'updatedAt']) &&
-        data.keys().hasOnly(['id', 'ownerUid', 'title', 'slug', 'description', 'moduleId', 'categoryId', 'tags', 'sourceKind', 'provenanceClassification', 'originProjectId', 'originProjectRevision', 'originReferenceSessionId', 'reconstructedFidelityReport', 'selectedSceneIds', 'selectedClipIds', 'canonicalTemplateProject', 'extractedParameters', 'replaceableSlots', 'generalizationReport', 'requiredAssets', 'requiredFonts', 'requiredEffects', 'licenseType', 'licenseNote', 'attribution', 'thumbnailSvgDataUri', 'previewSnapshotHash', 'structuralContentHash', 'qualityReport', 'pipelineStages', 'duplicateSuggestions', 'catalogItemDraft', 'autoSavedFromAiComponent', 'publishedToCatalog', 'publishedAt', 'version', 'versionHistory', 'deprecationStatus', 'createdAt', 'updatedAt']) &&
-        data.id is string && data.id.size() >= 1 && data.id.size() <= 128 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
-        data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128 && data.ownerUid.matches('^[a-zA-Z0-9_\\-]+$') &&
-        data.ownerUid == request.auth.uid &&
-        data.title is string && data.title.size() >= 1 && data.title.size() <= 160 &&
-        data.sourceKind in ['from-scratch', 'canonical-project', 'reference-reconstruction', 'ai-director-component'] &&
-        data.provenanceClassification in ['Source-Proven Canonical', 'Author-Created Scratch', 'Reconstructed', 'Original', 'Derived-Authorized', 'Synthetic-AI'] &&
-        data.publishedToCatalog is bool &&
-        data.version is string && data.version.size() >= 1 && data.version.size() <= 32 &&
-        data.createdAt is string && data.createdAt.size() <= 64 &&
-        data.updatedAt is string && data.updatedAt.size() <= 64;
+      return (
+        (
+          data.keys().hasAll(['id', 'ownerUid', 'title', 'sourceKind', 'provenanceClassification', 'publishedToCatalog', 'version', 'createdAt', 'updatedAt']) &&
+          data.keys().hasOnly(['id', 'ownerUid', 'title', 'sourceKind', 'provenanceClassification', 'version', 'publishedToCatalog', 'publishedCatalogItemId', 'publishedVersion', 'publishedAt', 'originProjectId', 'originProjectRevision', 'originReferenceSessionId', 'payloadJson', 'createdAt', 'updatedAt']) &&
+          data.id is string && data.id.size() >= 1 && data.id.size() <= 128 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
+          data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128 && data.ownerUid.matches('^[a-zA-Z0-9_\\-]+$') &&
+          data.ownerUid == request.auth.uid &&
+          data.title is string && data.title.size() >= 1 && data.title.size() <= 160 &&
+          data.sourceKind in ['from-scratch', 'canonical-project', 'reference-reconstruction', 'ai-director-component'] &&
+          data.provenanceClassification in ['Source-Proven Canonical', 'Author-Created Scratch', 'Reconstructed', 'Original', 'Derived-Authorized', 'Synthetic-AI'] &&
+          data.publishedToCatalog is bool &&
+          data.version is string && data.version.size() >= 1 && data.version.size() <= 32 &&
+          data.payloadJson is string &&
+          data.createdAt is string && data.createdAt.size() <= 64 &&
+          data.updatedAt is string && data.updatedAt.size() <= 64
+        ) ||
+        (
+          data.keys().hasAll(['id', 'ownerUid', 'title', 'sourceKind', 'provenanceClassification', 'publishedToCatalog', 'version', 'createdAt', 'updatedAt']) &&
+          data.keys().hasOnly(['id', 'ownerUid', 'title', 'slug', 'description', 'moduleId', 'categoryId', 'tags', 'sourceKind', 'provenanceClassification', 'originProjectId', 'originProjectRevision', 'originReferenceSessionId', 'reconstructedFidelityReport', 'selectedSceneIds', 'selectedClipIds', 'canonicalTemplateProject', 'extractedParameters', 'replaceableSlots', 'generalizationReport', 'requiredAssets', 'requiredFonts', 'requiredEffects', 'licenseType', 'licenseNote', 'attribution', 'thumbnailSvgDataUri', 'previewSnapshotHash', 'structuralContentHash', 'qualityReport', 'pipelineStages', 'duplicateSuggestions', 'catalogItemDraft', 'autoSavedFromAiComponent', 'publishedToCatalog', 'publishedAt', 'version', 'versionHistory', 'deprecationStatus', 'createdAt', 'updatedAt']) &&
+          data.id is string && data.id.size() >= 1 && data.id.size() <= 128 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
+          data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128 && data.ownerUid.matches('^[a-zA-Z0-9_\\-]+$') &&
+          data.ownerUid == request.auth.uid &&
+          data.title is string && data.title.size() >= 1 && data.title.size() <= 160 &&
+          data.sourceKind in ['from-scratch', 'canonical-project', 'reference-reconstruction', 'ai-director-component'] &&
+          data.provenanceClassification in ['Source-Proven Canonical', 'Author-Created Scratch', 'Reconstructed', 'Original', 'Derived-Authorized', 'Synthetic-AI'] &&
+          data.publishedToCatalog is bool &&
+          data.version is string && data.version.size() >= 1 && data.version.size() <= 32 &&
+          data.createdAt is string && data.createdAt.size() <= 64 &&
+          data.updatedAt is string && data.updatedAt.size() <= 64
+        )
+      );
     }
 
     function isValidRenderExportJobRecord(data) {
@@ -540,6 +589,21 @@ service cloud.firestore {
       allow create, update, delete: if false;
     }
 
+    // /serverVaultSecrets/{connectionId} & /__server_only_credential_vault__/{connectionId} — Server-only encrypted vault records (NEVER accessible to browser or client SDKs)
+    match /serverVaultSecrets/{connectionId} {
+      allow read, write: if false;
+    }
+    match /__server_only_credential_vault__/{connectionId} {
+      allow read, write: if false;
+    }
+
+    // /systemLocks/{lockId} — Atomic server-managed system locks (owner bootstrap)
+    match /systemLocks/{lockId} {
+      allow get: if isValidId(lockId) && isAdmin();
+      allow list: if isAdmin();
+      allow create, update, delete: if false;
+    }
+
     // /referenceLabSessions/{sessionId} — Strictly owner-scoped Reference Lab reconstruction sessions
     match /referenceLabSessions/{sessionId} {
       allow get: if isValidId(sessionId) && isVerifiedUser() && (existing().ownerUid == request.auth.uid || isAdmin());
@@ -557,7 +621,10 @@ service cloud.firestore {
           isAdmin() ||
           (
             existing().ownerUid == request.auth.uid &&
-            incoming().diff(existing()).affectedKeys().hasOnly(['title', 'shots', 'fidelityReport', 'canonicalProjectJson', 'savedProjectId', 'savedDraftTemplateId', 'templateValidationStatus', 'localCheckSummary', 'updatedAt'])
+            (
+              incoming().diff(existing()).affectedKeys().hasOnly(['title', 'sourceKind', 'mediaAnalysisState', 'sourceMediaParsed', 'savedProjectId', 'savedDraftTemplateId', 'promotedValidatedTemplateId', 'payloadJson', 'updatedAt']) ||
+              incoming().diff(existing()).affectedKeys().hasOnly(['title', 'shots', 'fidelityReport', 'canonicalProjectJson', 'savedProjectId', 'savedDraftTemplateId', 'templateValidationStatus', 'localCheckSummary', 'updatedAt'])
+            )
           )
         );
       allow delete: if isValidId(sessionId) && isVerifiedUser() && (existing().ownerUid == request.auth.uid || isAdmin());
@@ -631,7 +698,10 @@ service cloud.firestore {
           isAdmin() ||
           (
             existing().ownerUid == request.auth.uid &&
-            incoming().diff(existing()).affectedKeys().hasOnly(['title', 'state', 'intake', 'segments', 'semanticAnalysis', 'coverageLedger', 'questions', 'answeredQuestionFingerprints', 'brief', 'shotPlan', 'planApprovedWhole', 'planRevisions', 'canonicalProject', 'commandReceipts', 'traceability', 'generatedAssetProvenance', 'checkpoints', 'refinementSuggestions', 'acceptanceGate', 'updatedAt'])
+            (
+              incoming().diff(existing()).affectedKeys().hasOnly(['title', 'state', 'stage', 'activeRevisionNumber', 'savedProjectId', 'payloadJson', 'updatedAt']) ||
+              incoming().diff(existing()).affectedKeys().hasOnly(['title', 'state', 'intake', 'segments', 'semanticAnalysis', 'coverageLedger', 'questions', 'answeredQuestionFingerprints', 'brief', 'shotPlan', 'planApprovedWhole', 'planRevisions', 'canonicalProject', 'commandReceipts', 'traceability', 'generatedAssetProvenance', 'checkpoints', 'refinementSuggestions', 'acceptanceGate', 'updatedAt'])
+            )
           )
         );
       allow delete: if isValidId(sessionId) && isVerifiedUser() && (existing().ownerUid == request.auth.uid || isAdmin());
@@ -654,7 +724,10 @@ service cloud.firestore {
           isAdmin() ||
           (
             existing().ownerUid == request.auth.uid &&
-            incoming().diff(existing()).affectedKeys().hasOnly(['title', 'slug', 'description', 'categoryId', 'tags', 'selectedSceneIds', 'selectedClipIds', 'canonicalTemplateProject', 'extractedParameters', 'replaceableSlots', 'generalizationReport', 'requiredAssets', 'requiredFonts', 'requiredEffects', 'licenseType', 'licenseNote', 'attribution', 'thumbnailSvgDataUri', 'previewSnapshotHash', 'structuralContentHash', 'qualityReport', 'pipelineStages', 'duplicateSuggestions', 'catalogItemDraft', 'autoSavedFromAiComponent', 'publishedToCatalog', 'publishedAt', 'version', 'versionHistory', 'deprecationStatus', 'updatedAt'])
+            (
+              incoming().diff(existing()).affectedKeys().hasOnly(['title', 'slug', 'description', 'categoryId', 'tags', 'selectedSceneIds', 'selectedClipIds', 'canonicalTemplateProject', 'extractedParameters', 'replaceableSlots', 'generalizationReport', 'requiredAssets', 'requiredFonts', 'requiredEffects', 'licenseType', 'licenseNote', 'attribution', 'thumbnailSvgDataUri', 'previewSnapshotHash', 'structuralContentHash', 'qualityReport', 'pipelineStages', 'duplicateSuggestions', 'catalogItemDraft', 'autoSavedFromAiComponent', 'publishedToCatalog', 'publishedAt', 'version', 'versionHistory', 'deprecationStatus', 'updatedAt']) ||
+              incoming().diff(existing()).affectedKeys().hasOnly(['title', 'provenanceClassification', 'version', 'publishedToCatalog', 'publishedCatalogItemId', 'publishedVersion', 'publishedAt', 'originProjectId', 'originProjectRevision', 'originReferenceSessionId', 'payloadJson', 'updatedAt'])
+            )
           )
         );
       allow delete: if isValidId(draftId) && isVerifiedUser() && (existing().ownerUid == request.auth.uid || isAdmin());

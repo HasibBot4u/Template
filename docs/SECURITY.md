@@ -12,7 +12,9 @@ This document describes the implemented security controls, privacy guarantees, d
   - Roles (`user`, `admin`, `owner`) are resolved from server-side role records and Firestore `/admins/{uid}` + `/users/{uid}`, never from client request bodies.
   - Client attempts to pass `role`, `isAdmin`, `status`, or `uid` to `/api/v1/me/preferences` are rejected with `403 ROLE_ESCALATION_FORBIDDEN` and logged to the append-only audit trail.
 - **Safe One-Time Owner Bootstrap (`/api/v1/admin/bootstrap-owner`)**:
-  - Never auto-promotes the first visitor. Requires a verified Google account matching `OWNER_BOOTSTRAP_EMAIL` and a server-configured `OWNER_BOOTSTRAP_SECRET` (`>= 16` characters; fails closed with `503` if unconfigured) under a strict `10 req/min` sliding-window rate limit.
+  - Never auto-promotes the first visitor and never falls back to a hard-coded email address. Requires explicit server configuration of both `OWNER_BOOTSTRAP_EMAIL` and `OWNER_BOOTSTRAP_SECRET` (fails closed with `503 BOOTSTRAP_NOT_CONFIGURED` if either is unset).
+  - Explicitly disabled in production (`503 BOOTSTRAP_DISABLED_IN_PRODUCTION` when `NODE_ENV=production`) because `ownerBootstrappedUid` currently relies on a local disk snapshot lock rather than a durable distributed Firestore transaction.
+  - In `firestore.rules`, `isAdmin()` checks only `exists(/databases/$(database)/documents/admins/$(request.auth.uid))` with no hard-coded email branch, and clients cannot create or edit their own `/admins/{uid}` role documents.
 
 ---
 

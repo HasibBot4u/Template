@@ -166,7 +166,7 @@ export const EditingStudioWorkspace: React.FC<EditingStudioWorkspaceProps> = ({
   onSaveToProjectLibrary,
   onNotify,
 }) => {
-  // Resolve initial CanonicalProjectDocument with localStorage autosave recovery
+  // Resolve initial CanonicalProjectDocument with owner-scoped, revision-checked localStorage draft recovery
   const initialCanonicalDoc = useMemo<CanonicalProjectDocument>(() => {
     const safeOwnerUid = ownerUid || 'user-local';
     if (initialProject) {
@@ -180,6 +180,7 @@ export const EditingStudioWorkspace: React.FC<EditingStudioWorkspaceProps> = ({
           if (
             validated.valid &&
             validated.project &&
+            validated.project.ownerUid === safeOwnerUid &&
             validated.project.revision >= initialProject.revision
           ) {
             return validated.project;
@@ -192,6 +193,20 @@ export const EditingStudioWorkspace: React.FC<EditingStudioWorkspaceProps> = ({
     }
 
     if (sourceLibraryProject) {
+      let baseProject: CanonicalProjectDocument | null = null;
+      try {
+        const migrated = migrateToCanonicalProject(sourceLibraryProject, safeOwnerUid);
+        migrated.project.id = sourceLibraryProject.id;
+        migrated.project.ownerUid = sourceLibraryProject.ownerUid || safeOwnerUid;
+        migrated.project.title = sourceLibraryProject.title || migrated.project.title;
+        if (typeof sourceLibraryProject.revision === 'number' && sourceLibraryProject.revision >= 1) {
+          migrated.project.revision = sourceLibraryProject.revision;
+        }
+        baseProject = migrated.project;
+      } catch {
+        baseProject = null;
+      }
+
       try {
         const savedDraft = window.localStorage.getItem(
           `sowveil.canonical.autosave.${safeOwnerUid}.${sourceLibraryProject.id}`
@@ -199,14 +214,21 @@ export const EditingStudioWorkspace: React.FC<EditingStudioWorkspaceProps> = ({
         if (savedDraft) {
           const parsed = JSON.parse(savedDraft);
           const validated = validateCanonicalProject(parsed);
-          if (validated.valid && validated.project) {
+          if (
+            validated.valid &&
+            validated.project &&
+            validated.project.ownerUid === safeOwnerUid &&
+            (!baseProject || validated.project.revision > baseProject.revision)
+          ) {
+            validated.project.id = sourceLibraryProject.id;
             return validated.project;
           }
         }
-        const migrated = migrateToCanonicalProject(sourceLibraryProject, safeOwnerUid);
-        return migrated.project;
       } catch {
-        // Fallback below
+        // Ignore localStorage parse error
+      }
+      if (baseProject) {
+        return baseProject;
       }
     }
 
@@ -218,7 +240,7 @@ export const EditingStudioWorkspace: React.FC<EditingStudioWorkspaceProps> = ({
       });
     }
 
-    // Try recovering last active project in standalone route mode (user-scoped)
+    // Try recovering last active project in standalone route mode (strictly owner-scoped)
     try {
       const lastActiveRaw = window.localStorage.getItem(
         `sowveil.canonical.lastActiveProject.${safeOwnerUid}`
@@ -226,7 +248,11 @@ export const EditingStudioWorkspace: React.FC<EditingStudioWorkspaceProps> = ({
       if (lastActiveRaw) {
         const parsed = JSON.parse(lastActiveRaw);
         const validated = validateCanonicalProject(parsed);
-        if (validated.valid && validated.project) {
+        if (
+          validated.valid &&
+          validated.project &&
+          validated.project.ownerUid === safeOwnerUid
+        ) {
           return validated.project;
         }
       }
@@ -292,8 +318,15 @@ export const EditingStudioWorkspace: React.FC<EditingStudioWorkspaceProps> = ({
 
   const [openInspectorSection, setOpenInspectorSection] =
     useState<ProInspectorTab>('transform');
-  const [autosaveState, setAutosaveState] = useState<'saved' | 'saving' | 'recovered'>(
-    'saved'
+  const lastSyncedRevisionRef = useRef<number>(
+    sourceLibraryProject?.revision || initialCanonicalDoc.revision || 1
+  );
+  const [autosaveState, setAutosaveState] = useState<
+    'synced' | 'local-draft-unsynced' | 'saving'
+  >(() =>
+    typeof navigator !== 'undefined' && navigator.onLine === false
+      ? 'local-draft-unsynced'
+      : 'synced'
   );
   const [titleInput, setTitleInput] = useState<string>(project.title);
   const [snapshotLabelInput, setSnapshotLabelInput] = useState<string>('');
@@ -352,13 +385,17 @@ export const EditingStudioWorkspace: React.FC<EditingStudioWorkspaceProps> = ({
     return () => cancelAnimationFrame(rafId);
   }, [isPlaying, loopEnabled, project.canvas.durationSec]);
 
-  // Frequent autosave to localStorage + recovery snapshot (user-scoped)
+  // Frequent autosave to localStorage + recovery snapshot (strictly ownerUid-scoped; offline/uncommitted edits marked as local draft)
   useEffect(() => {
     setAutosaveState('saving');
     const safeOwnerUid = ownerUid || 'user-local';
     const timer = window.setTimeout(() => {
       try {
-        const serialized = serializeCanonicalProject(project);
+        const docWithOwner: CanonicalProjectDocument = {
+          ...project,
+          ownerUid: safeOwnerUid,
+        };
+        const serialized = serializeCanonicalProject(docWithOwner);
         window.localStorage.setItem(
           `sowveil.canonical.autosave.${safeOwnerUid}.${project.id}`,
           serialized
@@ -370,7 +407,11 @@ export const EditingStudioWorkspace: React.FC<EditingStudioWorkspaceProps> = ({
       } catch {
         // Ignore storage quota
       }
-      setAutosaveState('saved');
+      const isOffline =
+        typeof navigator !== 'undefined' && navigator.onLine === false;
+      const hasUnsyncedEdits =
+        isOffline || project.revision > lastSyncedRevisionRef.current;
+      setAutosaveState(hasUnsyncedEdits ? 'local-draft-unsynced' : 'synced');
     }, 220);
     return () => window.clearTimeout(timer);
   }, [project, ownerUid]);
@@ -546,12 +587,54 @@ export const EditingStudioWorkspace: React.FC<EditingStudioWorkspaceProps> = ({
   });
 
   const handleSaveProjectToLibrary = async () => {
-    const record = canonicalProjectToLibraryRecord(project);
-    await onSaveToProjectLibrary(record, sourceLibraryProject?.id || project.id);
-    onNotify(
-      `Saved canonical project "${project.title}" (v2.0 · rev r${project.revision}) to Project Library.`,
-      'success'
-    );
+    const safeOwnerUid = ownerUid || 'user-local';
+    const targetProjectId = sourceLibraryProject?.id || project.id;
+    const syncedDoc: CanonicalProjectDocument = {
+      ...project,
+      id: targetProjectId,
+      ownerUid: safeOwnerUid,
+    };
+
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      try {
+        const serialized = serializeCanonicalProject(syncedDoc);
+        window.localStorage.setItem(
+          `sowveil.canonical.autosave.${safeOwnerUid}.${targetProjectId}`,
+          serialized
+        );
+      } catch {
+        // Ignore storage quota
+      }
+      setAutosaveState('local-draft-unsynced');
+      onNotify(
+        `Offline: Saved "${syncedDoc.title}" (rev r${syncedDoc.revision}) as a local draft on this device. It is not yet synced to cloud Project Library.`,
+        'warning'
+      );
+      return;
+    }
+
+    const record = {
+      ...canonicalProjectToLibraryRecord(syncedDoc),
+      id: targetProjectId,
+      ownerUid: safeOwnerUid,
+    };
+    try {
+      await onSaveToProjectLibrary(record, targetProjectId);
+      lastSyncedRevisionRef.current = syncedDoc.revision;
+      setAutosaveState('synced');
+      onNotify(
+        `Saved canonical project "${syncedDoc.title}" (ID: ${targetProjectId} · rev r${syncedDoc.revision}) to Project Library.`,
+        'success'
+      );
+    } catch (err) {
+      setAutosaveState('local-draft-unsynced');
+      onNotify(
+        `Failed to sync project to Project Library (changes kept as local draft only): ${
+          err instanceof Error ? err.message : 'Persistence error'
+        }`,
+        'error'
+      );
+    }
   };
 
   const handleDownloadCanonicalJson = () => {
@@ -790,11 +873,17 @@ export const EditingStudioWorkspace: React.FC<EditingStudioWorkspaceProps> = ({
 
           <span
             data-testid="editor-autosave-status"
-            className="hidden xl:inline text-[11px] font-mono-tabular text-[#55B98B]"
+            className={`hidden xl:inline text-[11px] font-mono-tabular ${
+              autosaveState === 'local-draft-unsynced'
+                ? 'text-[#E4B45A]'
+                : 'text-[#55B98B]'
+            }`}
           >
             {autosaveState === 'saving'
-              ? 'Autosaving…'
-              : `Autosaved · r${project.revision} · ${project.activeBranch}`}
+              ? 'Autosaving local draft…'
+              : autosaveState === 'local-draft-unsynced'
+              ? `Local Draft (Unsynced) · r${project.revision} · ${project.activeBranch}`
+              : `Synced · r${project.revision} · ${project.activeBranch}`}
           </span>
         </div>
 

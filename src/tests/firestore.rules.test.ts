@@ -478,3 +478,100 @@ test('Firestore Security Simulator: Render Export Job create & update validation
   };
   assert.equal(simulateUpdateJob(validJob, badFormatUpdate, 'user_alice'), false);
 });
+
+test('Firestore Rules Hardening: isAdmin() has no hardcoded owner email and clients cannot self-create or edit /admins/{uid}', () => {
+  const rulesText = fs.readFileSync(rulesPath, 'utf8');
+  const envExampleText = fs.readFileSync(path.resolve(process.cwd(), '.env.example'), 'utf8');
+
+  // 1. Ensure no hardcoded personal email in firestore.rules or .env.example
+  assert.equal(
+    rulesText.includes('mdhasibul4u@gmail.com'),
+    false,
+    'firestore.rules must not contain a hardcoded owner email address'
+  );
+  assert.equal(
+    envExampleText.includes('mdhasibul4u@gmail.com'),
+    false,
+    '.env.example must use an empty placeholder for OWNER_BOOTSTRAP_EMAIL'
+  );
+  assert.ok(envExampleText.includes('OWNER_BOOTSTRAP_EMAIL=""'));
+  assert.ok(envExampleText.includes('OWNER_BOOTSTRAP_SECRET=""'));
+
+  // 2. Verify isAdmin() checks ONLY isVerifiedUser() and exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+  const isAdminMatch = rulesText.match(/function\s+isAdmin\s*\(\)\s*\{([\s\S]*?)\}/);
+  assert.ok(isAdminMatch, 'isAdmin() function must exist in firestore.rules');
+  const isAdminBody = isAdminMatch[1];
+  assert.ok(isAdminBody.includes('isVerifiedUser()'));
+  assert.ok(
+    isAdminBody.includes('exists(/databases/$(database)/documents/admins/$(request.auth.uid))')
+  );
+  assert.equal(
+    isAdminBody.includes('request.auth.token.email'),
+    false,
+    'isAdmin() must not grant admin privilege based on request.auth.token.email'
+  );
+
+  // 3. Verify /admins/{uid} block prevents non-admin clients from creating, updating, or deleting their own admin document
+  const adminsBlockMatch = rulesText.match(/match\s+\/admins\/\{uid\}\s*\{([\s\S]*?)\n    \}/);
+  assert.ok(adminsBlockMatch, 'match /admins/{uid} block must exist in firestore.rules');
+  const adminsBlock = adminsBlockMatch[1];
+  assert.ok(
+    adminsBlock.includes('allow create: if isValidId(uid) && isAdmin() && isValidAdminGrant(incoming()) && incoming().uid == uid;')
+  );
+  assert.ok(
+    adminsBlock.includes('allow update: if isValidId(uid) && isAdmin() && isValidAdminGrant(incoming())')
+  );
+  assert.ok(
+    adminsBlock.includes('allow delete: if isValidId(uid) && isAdmin();')
+  );
+
+  // 4. Behavioral evaluation of isAdmin() and /admins/{uid} write gates
+  function evaluateIsAdmin(auth: { uid: string; email: string; email_verified: boolean } | null, existingAdminDocs: Set<string>): boolean {
+    if (!auth || auth.email_verified !== true) return false;
+    return existingAdminDocs.has(auth.uid);
+  }
+
+  function canClientWriteAdminDoc(
+    auth: { uid: string; email: string; email_verified: boolean } | null,
+    targetUid: string,
+    incomingDoc: Record<string, unknown>,
+    existingAdminDocs: Set<string>
+  ): boolean {
+    if (!evaluateIsAdmin(auth, existingAdminDocs)) return false;
+    if (incomingDoc.uid !== targetUid) return false;
+    if (incomingDoc.role !== 'admin' && incomingDoc.role !== 'owner') return false;
+    return true;
+  }
+
+  const adminRegistry = new Set<string>(['trusted_admin_uid']);
+
+  // Non-admin user cannot self-create /admins/{uid} even with verified email
+  assert.equal(
+    canClientWriteAdminDoc(
+      { uid: 'user_mallory', email: 'mallory@example.com', email_verified: true },
+      'user_mallory',
+      { uid: 'user_mallory', role: 'owner', grantedBy: 'user_mallory', createdAt: '2026-10-29T00:00:00Z' },
+      adminRegistry
+    ),
+    false
+  );
+
+  // Former hardcoded email cannot bypass /admins/{uid} check without an existing /admins/{uid} document
+  assert.equal(
+    evaluateIsAdmin(
+      { uid: 'uid_without_admin_doc', email: 'mdhasibul4u@gmail.com', email_verified: true },
+      adminRegistry
+    ),
+    false
+  );
+
+  // Existing verified admin in /admins/{uid} passes isAdmin()
+  assert.equal(
+    evaluateIsAdmin(
+      { uid: 'trusted_admin_uid', email: 'admin@sowveil.studio', email_verified: true },
+      adminRegistry
+    ),
+    true
+  );
+});
+

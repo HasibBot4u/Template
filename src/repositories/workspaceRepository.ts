@@ -38,7 +38,10 @@ export interface IWorkspaceRepository {
   removeFavorite(itemId: string): Promise<string[]>;
   listProjects(): Promise<ProjectLibraryItem[]>;
   createProject(
-    input: Omit<ProjectLibraryItem, 'id' | 'updatedAt'>
+    input: Omit<ProjectLibraryItem, 'id' | 'updatedAt'> & {
+      id?: string;
+      createdAt?: string;
+    }
   ): Promise<ProjectLibraryItem>;
   updateProject(
     id: string,
@@ -67,8 +70,9 @@ export interface IWorkspaceRepository {
         | 'lastOpenedAt'
         | 'tags'
       >
-    >
+    > & { expectedRevision?: number }
   ): Promise<ProjectLibraryItem>;
+  upsertProjectRecord?(project: ProjectLibraryItem): Promise<ProjectLibraryItem>;
   deleteProject(id: string): Promise<void>;
   listJobs(): Promise<JobRecord[]>;
   createJob(
@@ -222,12 +226,12 @@ export class FirestoreWorkspaceRepository implements IWorkspaceRepository {
   }
 
   public async createProject(
-    input: Omit<ProjectLibraryItem, 'id' | 'updatedAt'>
+    input: Omit<ProjectLibraryItem, 'id' | 'updatedAt'> & {
+      id?: string;
+      createdAt?: string;
+    }
   ): Promise<ProjectLibraryItem> {
     const uid = this.requireUid();
-    const projId = sanitizeFirestoreId(
-      `proj_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
-    );
     const now = new Date().toISOString();
 
     if (
@@ -237,6 +241,40 @@ export class FirestoreWorkspaceRepository implements IWorkspaceRepository {
       throw new Error(
         'STORAGE_NOT_CONFIGURED: Local blob URLs cannot be saved as persistent cloud URLs.'
       );
+    }
+
+    let candidateId = input.id;
+    let syncedCanonicalJson = input.canonicalProjectJson;
+    const initialRevision =
+      typeof input.revision === 'number' && input.revision >= 1 ? Math.floor(input.revision) : 1;
+
+    if (syncedCanonicalJson) {
+      try {
+        const parsed = JSON.parse(syncedCanonicalJson) as Record<string, unknown>;
+        if (!candidateId && typeof parsed.id === 'string' && VALID_ID_REGEX.test(parsed.id)) {
+          candidateId = parsed.id;
+        }
+      } catch {
+        // Ignore parse error; fallback to generated ID
+      }
+    }
+
+    const projId = sanitizeFirestoreId(
+      candidateId || `proj_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
+    );
+
+    if (syncedCanonicalJson) {
+      try {
+        const parsed = JSON.parse(syncedCanonicalJson) as Record<string, unknown>;
+        parsed.id = projId;
+        parsed.ownerUid = uid;
+        parsed.title = input.title.trim().slice(0, 160);
+        parsed.revision = initialRevision;
+        parsed.updatedAt = now;
+        syncedCanonicalJson = JSON.stringify(parsed);
+      } catch {
+        // Keep raw string if unparseable
+      }
     }
 
     const record: ProjectLibraryItem = {
@@ -255,16 +293,16 @@ export class FirestoreWorkspaceRepository implements IWorkspaceRepository {
       ...(input.targetEditor ? { targetEditor: input.targetEditor } : {}),
       ...(input.aspectRatio ? { aspectRatio: input.aspectRatio } : {}),
       ...(input.sowveilSpecJson ? { sowveilSpecJson: input.sowveilSpecJson.slice(0, 15000) } : {}),
-      ...(input.canonicalProjectJson
-        ? { canonicalProjectJson: input.canonicalProjectJson.slice(0, 200000) }
+      ...(syncedCanonicalJson
+        ? { canonicalProjectJson: syncedCanonicalJson.slice(0, 200000) }
         : {}),
-      ...(input.revision !== undefined ? { revision: input.revision } : {}),
+      revision: initialRevision,
       ...(input.activeBranch ? { activeBranch: input.activeBranch.slice(0, 64) } : {}),
       ...(input.checkpoints ? { checkpoints: input.checkpoints.slice(0, 20) } : {}),
       hasExternalFootageWarning: Boolean(input.hasExternalFootageWarning),
       archived: Boolean(input.archived),
       tags: (input.tags || []).slice(0, 20).map((t) => String(t).slice(0, 64)),
-      createdAt: now,
+      createdAt: input.createdAt || now,
       updatedAt: now,
     };
 
@@ -278,9 +316,9 @@ export class FirestoreWorkspaceRepository implements IWorkspaceRepository {
 
   public async updateProject(
     id: string,
-    patch: Partial<ProjectLibraryItem>
+    patch: Partial<ProjectLibraryItem> & { expectedRevision?: number }
   ): Promise<ProjectLibraryItem> {
-    this.requireUid();
+    const uid = this.requireUid();
     const safeId = sanitizeFirestoreId(id);
     const docRef = doc(db, 'projects', safeId);
     const now = new Date().toISOString();
@@ -291,8 +329,24 @@ export class FirestoreWorkspaceRepository implements IWorkspaceRepository {
         throw new Error(`Project "${safeId}" not found`);
       }
       const existing = snap.data() as ProjectLibraryItem;
+      const existingRev = existing.revision || 1;
+      if (
+        patch.expectedRevision !== undefined &&
+        existingRev !== patch.expectedRevision
+      ) {
+        throw new Error(
+          `REVISION_CONFLICT: Stale project revision on "${safeId}": expected revision ${patch.expectedRevision}, actual revision ${existingRev}.`
+        );
+      }
+
+      const nextRevision =
+        typeof patch.revision === 'number' && patch.revision > existingRev
+          ? Math.floor(patch.revision)
+          : existingRev + 1;
+
       const updatePayload: Record<string, unknown> = {
         updatedAt: now,
+        revision: nextRevision,
       };
       if (patch.title !== undefined) updatePayload.title = patch.title.trim().slice(0, 160);
       if (patch.description !== undefined)
@@ -304,13 +358,28 @@ export class FirestoreWorkspaceRepository implements IWorkspaceRepository {
       if (patch.fileSizeLabel !== undefined)
         updatePayload.fileSizeLabel = patch.fileSizeLabel.slice(0, 80);
       if (patch.resolution !== undefined) updatePayload.resolution = patch.resolution;
+      if (patch.durationLabel !== undefined) updatePayload.durationLabel = patch.durationLabel;
+      if (patch.fps !== undefined) updatePayload.fps = patch.fps;
+      if (patch.aeVersion !== undefined) updatePayload.aeVersion = patch.aeVersion;
       if (patch.targetEditor !== undefined) updatePayload.targetEditor = patch.targetEditor;
       if (patch.aspectRatio !== undefined) updatePayload.aspectRatio = patch.aspectRatio;
       if (patch.sowveilSpecJson !== undefined)
         updatePayload.sowveilSpecJson = patch.sowveilSpecJson.slice(0, 15000);
-      if (patch.canonicalProjectJson !== undefined)
-        updatePayload.canonicalProjectJson = patch.canonicalProjectJson.slice(0, 200000);
-      if (patch.revision !== undefined) updatePayload.revision = patch.revision;
+      if (patch.canonicalProjectJson !== undefined) {
+        let syncedJson = patch.canonicalProjectJson;
+        try {
+          const parsed = JSON.parse(syncedJson) as Record<string, unknown>;
+          parsed.id = safeId;
+          parsed.ownerUid = existing.ownerUid || uid;
+          parsed.title = (updatePayload.title as string) || existing.title;
+          parsed.revision = nextRevision;
+          parsed.updatedAt = now;
+          syncedJson = JSON.stringify(parsed);
+        } catch {
+          // Keep raw string if unparseable
+        }
+        updatePayload.canonicalProjectJson = syncedJson.slice(0, 200000);
+      }
       if (patch.activeBranch !== undefined)
         updatePayload.activeBranch = patch.activeBranch.slice(0, 64);
       if (patch.checkpoints !== undefined)
@@ -318,6 +387,7 @@ export class FirestoreWorkspaceRepository implements IWorkspaceRepository {
       if (patch.hasExternalFootageWarning !== undefined)
         updatePayload.hasExternalFootageWarning = Boolean(patch.hasExternalFootageWarning);
       if (patch.archived !== undefined) updatePayload.archived = Boolean(patch.archived);
+      if (patch.lastOpenedAt !== undefined) updatePayload.lastOpenedAt = patch.lastOpenedAt;
       if (patch.tags !== undefined)
         updatePayload.tags = patch.tags.slice(0, 20).map((t) => String(t).slice(0, 64));
 
@@ -327,7 +397,27 @@ export class FirestoreWorkspaceRepository implements IWorkspaceRepository {
         ...(updatePayload as Partial<ProjectLibraryItem>),
       };
     } catch (err) {
+      if (err instanceof Error && err.message.startsWith('REVISION_CONFLICT:')) {
+        throw err;
+      }
       handleFirestoreError(err, OperationType.UPDATE, `projects/${safeId}`);
+    }
+  }
+
+  public async upsertProjectRecord(project: ProjectLibraryItem): Promise<ProjectLibraryItem> {
+    const uid = auth.currentUser?.uid;
+    if (!uid) return project;
+    const safeId = sanitizeFirestoreId(project.id);
+    const record: ProjectLibraryItem = {
+      ...project,
+      id: safeId,
+      ownerUid: project.ownerUid || uid,
+    };
+    try {
+      await setDoc(doc(db, 'projects', safeId), record);
+      return record;
+    } catch {
+      return record;
     }
   }
 
@@ -583,13 +673,62 @@ export class InMemoryTestWorkspaceRepository implements IWorkspaceRepository {
   }
 
   public async createProject(
-    input: Omit<ProjectLibraryItem, 'id' | 'updatedAt'>
+    input: Omit<ProjectLibraryItem, 'id' | 'updatedAt'> & {
+      id?: string;
+      createdAt?: string;
+    }
   ): Promise<ProjectLibraryItem> {
     this.assertWritable();
+    const now = new Date().toISOString();
+    let candidateId = input.id;
+    let syncedCanonicalJson = input.canonicalProjectJson;
+    const initialRevision =
+      typeof input.revision === 'number' && input.revision >= 1 ? Math.floor(input.revision) : 1;
+
+    if (syncedCanonicalJson) {
+      try {
+        const parsed = JSON.parse(syncedCanonicalJson) as Record<string, unknown>;
+        if (!candidateId && typeof parsed.id === 'string' && VALID_ID_REGEX.test(parsed.id)) {
+          candidateId = parsed.id;
+        }
+      } catch {
+        // Ignore parse error
+      }
+    }
+
+    const projId = sanitizeFirestoreId(
+      candidateId || `proj_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
+    );
+
+    if (syncedCanonicalJson) {
+      try {
+        const parsed = JSON.parse(syncedCanonicalJson) as Record<string, unknown>;
+        parsed.id = projId;
+        parsed.ownerUid = input.ownerUid || 'user-local';
+        parsed.title = input.title;
+        parsed.revision = initialRevision;
+        parsed.updatedAt = now;
+        syncedCanonicalJson = JSON.stringify(parsed);
+      } catch {
+        // Keep raw string
+      }
+    }
+
+    const existingIdx = this.projects.findIndex((p) => p.id === projId);
+    if (existingIdx !== -1) {
+      return this.updateProject(projId, {
+        ...input,
+        canonicalProjectJson: syncedCanonicalJson,
+      });
+    }
+
     const record: ProjectLibraryItem = {
       ...input,
-      id: `proj_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-      updatedAt: new Date().toISOString().slice(0, 10),
+      id: projId,
+      canonicalProjectJson: syncedCanonicalJson,
+      revision: initialRevision,
+      createdAt: input.createdAt || now,
+      updatedAt: now.slice(0, 10),
     };
     this.projects = [record, ...this.projects];
     return record;
@@ -597,21 +736,71 @@ export class InMemoryTestWorkspaceRepository implements IWorkspaceRepository {
 
   public async updateProject(
     id: string,
-    patch: Partial<ProjectLibraryItem>
+    patch: Partial<ProjectLibraryItem> & { expectedRevision?: number }
   ): Promise<ProjectLibraryItem> {
     this.assertWritable();
     const idx = this.projects.findIndex((p) => p.id === id);
     if (idx === -1) {
       throw new Error(`Project record "${id}" not found`);
     }
+    const existing = this.projects[idx];
+    const existingRev = existing.revision || 1;
+    if (
+      patch.expectedRevision !== undefined &&
+      existingRev !== patch.expectedRevision
+    ) {
+      throw new Error(
+        `REVISION_CONFLICT: Stale project revision on "${id}": expected revision ${patch.expectedRevision}, actual revision ${existingRev}.`
+      );
+    }
+
+    const nextRevision =
+      typeof patch.revision === 'number' && patch.revision > existingRev
+        ? Math.floor(patch.revision)
+        : existingRev + 1;
+
+    const { expectedRevision: _ignoredExpectedRev, ...cleanPatch } = patch;
+    let syncedCanonicalJson =
+      cleanPatch.canonicalProjectJson !== undefined
+        ? cleanPatch.canonicalProjectJson
+        : existing.canonicalProjectJson;
+    if (syncedCanonicalJson) {
+      try {
+        const parsed = JSON.parse(syncedCanonicalJson) as Record<string, unknown>;
+        parsed.id = existing.id;
+        parsed.ownerUid = existing.ownerUid || 'user-local';
+        parsed.title = cleanPatch.title || existing.title;
+        parsed.revision = nextRevision;
+        parsed.updatedAt = new Date().toISOString();
+        syncedCanonicalJson = JSON.stringify(parsed);
+      } catch {
+        // Ignore parse error
+      }
+    }
+
     const updated: ProjectLibraryItem = {
-      ...this.projects[idx],
-      ...patch,
-      id: this.projects[idx].id,
+      ...existing,
+      ...cleanPatch,
+      id: existing.id,
+      revision: nextRevision,
+      ...(syncedCanonicalJson !== undefined
+        ? { canonicalProjectJson: syncedCanonicalJson }
+        : {}),
       updatedAt: new Date().toISOString().slice(0, 10),
     };
     this.projects[idx] = updated;
     return updated;
+  }
+
+  public async upsertProjectRecord(project: ProjectLibraryItem): Promise<ProjectLibraryItem> {
+    this.assertWritable();
+    const idx = this.projects.findIndex((p) => p.id === project.id);
+    if (idx >= 0) {
+      this.projects[idx] = { ...project };
+    } else {
+      this.projects = [{ ...project }, ...this.projects];
+    }
+    return { ...project };
   }
 
   public async deleteProject(id: string): Promise<void> {

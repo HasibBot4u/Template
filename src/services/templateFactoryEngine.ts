@@ -225,6 +225,8 @@ export interface TemplateFactoryDraftRecord {
   catalogItemDraft: CatalogItem;
   autoSavedFromAiComponent: boolean;
   publishedToCatalog: boolean;
+  publishedCatalogItemId?: string;
+  publishedVersion?: string;
   publishedAt?: string;
   version: string;
   versionHistory: Array<{
@@ -1363,6 +1365,7 @@ export function detectDuplicateAndSimilarTemplates(params: {
 // ============================================================================
 
 export function runTemplateFactoryPipeline(params: {
+  id?: string;
   ownerUid: string;
   sourceKind: TemplateFactorySourceKind;
   title?: string;
@@ -1384,7 +1387,9 @@ export function runTemplateFactoryPipeline(params: {
   assetsMap?: Map<string, AssetMetadataRecord>;
 }): TemplateFactoryDraftRecord {
   const now = new Date().toISOString();
-  const draftId = `tpl_factory_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+  const draftId =
+    params.id?.trim() ||
+    `tpl_factory_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
   const pipelineStages: FactoryPipelineStageLog[] = [];
 
   // STAGE 1: Choose Source & Clone Project Graph Without Mutating Source
@@ -2347,6 +2352,7 @@ export function publishFactoryTemplateToCatalog(params: {
   assetsMap?: Map<string, AssetMetadataRecord>;
 }): {
   ok: boolean;
+  idempotentNoOp?: boolean;
   errorCode?: string;
   errorMessage?: string;
   updatedDraft?: TemplateFactoryDraftRecord;
@@ -2374,6 +2380,21 @@ export function publishFactoryTemplateToCatalog(params: {
     };
   }
 
+  // Idempotency guard: if this exact draft version is already published and validated, return existing state without duplicating version entries or mutating publishedAt.
+  if (
+    draft.publishedToCatalog &&
+    draft.publishedVersion === draft.version &&
+    draft.catalogItemDraft.visibility === 'published' &&
+    draft.catalogItemDraft.validationState === 'Validated'
+  ) {
+    return {
+      ok: true,
+      idempotentNoOp: true,
+      updatedDraft: draft,
+      publishedCatalogItem: draft.catalogItemDraft,
+    };
+  }
+
   const freshQuality = evaluateTemplateQualityGate({
     project: draft.canonicalTemplateProject,
     extractedParameters: draft.extractedParameters,
@@ -2392,12 +2413,31 @@ export function publishFactoryTemplateToCatalog(params: {
   }
 
   const now = new Date().toISOString();
+  const catalogItemId = draft.publishedCatalogItemId || draft.id;
+  const existingCatalogHistory = Array.isArray(draft.catalogItemDraft.versionHistory)
+    ? draft.catalogItemDraft.versionHistory
+    : [];
+  const nextCatalogHistory: TemplateVersionEntry[] = [
+    {
+      version: draft.version,
+      updatedAt: now,
+      updatedByUid: actorUid,
+      changelog: `Published version ${draft.version} from Template Factory (${draft.provenanceClassification}).`,
+      snapshotHash: draft.structuralContentHash,
+    },
+    ...existingCatalogHistory.filter((v) => v.version !== draft.version),
+  ];
+
   const publishedCatalogItem: CatalogItem = enrichCatalogItemWithMarketplaceDefaults({
     ...draft.catalogItemDraft,
+    id: catalogItemId,
+    ownerUid: draft.ownerUid,
+    creatorUid: draft.ownerUid,
     visibility: 'published',
     validationState: 'Validated',
     status: 'Available',
     statusReason: `Published from Template Factory (${draft.provenanceClassification}) after passing 10-point quality & license gate.`,
+    versionHistory: nextCatalogHistory,
     lastValidationRecord: {
       jobId: `valjob_factory_${draft.id}`,
       validationJobId: `valjob_factory_${draft.id}`,
@@ -2422,12 +2462,15 @@ export function publishFactoryTemplateToCatalog(params: {
     qualityReport: freshQuality,
     catalogItemDraft: publishedCatalogItem,
     publishedToCatalog: true,
-    publishedAt: now,
+    publishedCatalogItemId: catalogItemId,
+    publishedVersion: draft.version,
+    publishedAt: draft.publishedAt || now,
     updatedAt: now,
   };
 
   return {
     ok: true,
+    idempotentNoOp: false,
     updatedDraft,
     publishedCatalogItem,
   };

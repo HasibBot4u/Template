@@ -462,6 +462,7 @@ export interface AiDirectorSessionRecord {
   traceability: ProductionTraceabilityMappings;
   generatedAssetRecords: GeneratedAssetProvenanceRecord[];
   canonicalProject: CanonicalProjectDocument | null;
+  savedProjectId?: string;
   commandReceipts: ProjectCommandReceipt[];
   refinementSuggestions: AdaptiveRefinementSuggestion[];
   productionCheckpoints: ProductionCheckpointRecord[];

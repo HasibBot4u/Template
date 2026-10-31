@@ -1566,7 +1566,9 @@ interface ProjectLibraryWorkspaceProps {
   isLoading?: boolean;
   errorMessage?: string | null;
   onRetryLoad?: () => void;
-  onAddProject: (proj: Omit<ProjectLibraryItem, 'id' | 'updatedAt'>) => Promise<void> | void;
+  onAddProject: (
+    proj: Omit<ProjectLibraryItem, 'id' | 'updatedAt'> & { id?: string; createdAt?: string }
+  ) => Promise<void> | void;
   onUpdateProject: (
     id: string,
     patch: Partial<ProjectLibraryItem>
@@ -1703,6 +1705,7 @@ export const ProjectLibraryWorkspace: React.FC<ProjectLibraryWorkspaceProps> = (
     const canonicalJson = serializeCanonicalProject(canonicalDoc);
 
     await onAddProject({
+      id: canonicalDoc.id,
       title: newTitle.trim(),
       description:
         newDesc.trim() ||

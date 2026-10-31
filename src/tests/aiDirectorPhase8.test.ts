@@ -359,7 +359,7 @@ test('Phase 8G — Server API: AI Director endpoints (/ai/providers, /ai/provide
     const ssrfJson = await ssrfRes.json();
     assert.equal(ssrfJson.error.code, 'SSRF_LOOPBACK_FORBIDDEN');
 
-    // 3. POST /api/v1/ai/providers/test — Allow valid public endpoint
+    // 3. POST /api/v1/ai/providers/test — Deprecated legacy route must NOT falsely return verified: true or fabricated latency
     const validTestRes = await fetch(`${srv.baseUrl}/api/v1/ai/providers/test`, {
       method: 'POST',
       headers: {
@@ -372,10 +372,18 @@ test('Phase 8G — Server API: AI Director endpoints (/ai/providers, /ai/provide
         providerId: 'openai-chat',
       }),
     });
-    assert.equal(validTestRes.status, 200);
+    assert.equal(validTestRes.status, 410);
     const validTestJson = await validTestRes.json();
-    assert.equal(validTestJson.data.verified, true);
+    assert.equal(validTestJson.ok, false);
+    assert.equal(validTestJson.error.code, 'LEGACY_PROVIDER_TEST_DEPRECATED');
+    assert.equal(validTestJson.data.verified, false);
+    assert.equal(validTestJson.data.status, 'deprecated-unsupported');
+    assert.equal(validTestJson.data.latencyMs, null);
     assert.equal(validTestJson.data.maskedApiKey, 'sk-p••••••••3456');
+    assert.equal(
+      validTestJson.data.replacementEndpoint,
+      '/api/v1/provider-hub/connections/:id/test'
+    );
 
     // 4. POST /api/v1/ai/script/coverage
     const covRes = await fetch(`${srv.baseUrl}/api/v1/ai/script/coverage`, {

@@ -15,6 +15,7 @@ import { SEED_CATALOG_ITEMS } from './data/catalogSeeds';
 import {
   AuthenticatedUser,
   AuthErrorState,
+  CatalogItem,
   CompanionState,
   JobRecord,
   JobStatus,
@@ -83,12 +84,15 @@ interface ToastBanner {
 }
 
 const WorkspaceModuleRoute: React.FC<{
+  catalogItems: CatalogItem[];
   favoriteIds: string[];
   onToggleFavorite: (id: string) => Promise<void>;
   companion: CompanionState;
   preferences: UserPreferences;
   projects: ProjectLibraryItem[];
-  onAddProject: (p: Omit<ProjectLibraryItem, 'id' | 'updatedAt'>) => Promise<void>;
+  onAddProject: (
+    p: Omit<ProjectLibraryItem, 'id' | 'updatedAt'> & { id?: string; createdAt?: string }
+  ) => Promise<void>;
   onUpdateProject: (id: string, patch: Partial<ProjectLibraryItem>) => Promise<void>;
   onDeleteProject: (id: string) => Promise<void>;
   onQueueJob: (
@@ -99,6 +103,7 @@ const WorkspaceModuleRoute: React.FC<{
   ) => Promise<void>;
   onNotify: (message: string, tone?: 'info' | 'warning' | 'error' | 'success') => void;
 }> = ({
+  catalogItems,
   favoriteIds,
   onToggleFavorite,
   companion,
@@ -114,8 +119,15 @@ const WorkspaceModuleRoute: React.FC<{
   const mod = SOWVEIL_MODULES.find((m) => m.id === moduleId) || SOWVEIL_MODULES[0];
 
   const moduleItems = useMemo(
-    () => SEED_CATALOG_ITEMS.filter((i) => i.moduleId === mod.id && i.visibility === 'published'),
-    [mod.id]
+    () =>
+      catalogItems.filter(
+        (i) =>
+          i.moduleId === mod.id &&
+          (i.visibility === 'published' ||
+            i.visibility === 'public' ||
+            i.visibility === 'community')
+      ),
+    [catalogItems, mod.id]
   );
 
   const moduleCategories = useMemo(
@@ -566,7 +578,28 @@ export default function App() {
   const [projects, setProjects] = useState<ProjectLibraryItem[]>([]);
   const [jobs, setJobs] = useState<JobRecord[]>([]);
   const [preferences, setPreferences] = useState<UserPreferences>(DEFAULT_USER_PREFERENCES);
+  const [catalogItems, setCatalogItems] = useState<CatalogItem[]>(SEED_CATALOG_ITEMS);
   const [toast, setToast] = useState<ToastBanner | null>(null);
+
+  const refreshCatalog = useCallback(async () => {
+    try {
+      const token = await auth.currentUser?.getIdToken();
+      const headers: Record<string, string> = {};
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+      const res = await fetch('/api/v1/catalog?limit=500', { headers });
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data.items)) {
+          const map = new Map<string, CatalogItem>();
+          for (const item of SEED_CATALOG_ITEMS) map.set(item.id, item);
+          for (const item of data.items) map.set(item.id, item);
+          setCatalogItems(Array.from(map.values()));
+        }
+      }
+    } catch {
+      // Offline or network error; keep existing catalog items
+    }
+  }, []);
 
   const [companion, setCompanion] = useState<CompanionState>({
     status: 'Disconnected',
@@ -608,6 +641,7 @@ export default function App() {
         setJobs([]);
         setPreferences(DEFAULT_USER_PREFERENCES);
         setAuthReady(true);
+        void refreshCatalog();
         return;
       }
 
@@ -628,6 +662,7 @@ export default function App() {
         setFavoriteIds(favs);
         setProjects(projs);
         setJobs(jbs);
+        void refreshCatalog();
       } catch (err) {
         setAuthError(classifyFirebaseAuthError(err));
       } finally {
@@ -636,7 +671,7 @@ export default function App() {
     });
 
     return () => unsubscribe();
-  }, []);
+  }, [refreshCatalog]);
 
   // Optimistic Favorite Add/Remove with automatic rollback on failure
   const toggleFavorite = useCallback(
@@ -714,13 +749,30 @@ export default function App() {
   }, [notify]);
 
   const addProject = useCallback(
-    async (proj: Omit<ProjectLibraryItem, 'id' | 'updatedAt'>) => {
+    async (
+      proj: Omit<ProjectLibraryItem, 'id' | 'updatedAt'> & {
+        id?: string;
+        createdAt?: string;
+      }
+    ) => {
       await workspaceRepository.createProject(proj);
       const list = await workspaceRepository.listProjects();
       setProjects(list);
     },
     []
   );
+
+  const upsertServerProject = useCallback(async (serverProj: ProjectLibraryItem) => {
+    try {
+      await workspaceRepository.upsertProjectRecord?.(serverProj);
+    } catch {
+      // Ignore if offline or unauthenticated
+    }
+    setProjects((prev) => {
+      const filtered = prev.filter((p) => p.id !== serverProj.id);
+      return [serverProj, ...filtered];
+    });
+  }, []);
 
   const updateProject = useCallback(
     async (id: string, patch: Partial<ProjectLibraryItem>) => {
@@ -782,13 +834,13 @@ export default function App() {
   };
 
   const itemCountsByModule = useMemo(
-    () => computeActualModuleCounts(SEED_CATALOG_ITEMS, projects),
-    [projects]
+    () => computeActualModuleCounts(catalogItems, projects),
+    [catalogItems, projects]
   );
 
   const favoriteItems = useMemo(
-    () => SEED_CATALOG_ITEMS.filter((i) => favoriteIds.includes(i.id)),
-    [favoriteIds]
+    () => catalogItems.filter((i) => favoriteIds.includes(i.id)),
+    [catalogItems, favoriteIds]
   );
 
   const wrapUserProtected = (node: React.ReactNode) => (
@@ -972,11 +1024,16 @@ export default function App() {
           element={wrapUserProtected(
             <ReferenceLabWorkspace
               userUid={currentUser?.uid}
+              onCatalogChanged={refreshCatalog}
               onProjectSaved={(proj) => {
-                addProject(proj);
-                notify(`Saved "${proj.title}" from Reference Lab to Project Library.`, 'success');
+                void upsertServerProject(proj);
+                notify(
+                  `Saved "${proj.title}" (ID: ${proj.id} · rev r${proj.revision || 1}) from Reference Lab to Project Library.`,
+                  'success'
+                );
               }}
               onTemplateSaved={(tpl) => {
+                void refreshCatalog();
                 notify(
                   `Saved reusable template "${tpl.name}" (${String(tpl.validationState || 'Draft').toUpperCase()}, license: ${tpl.licenseType}).`,
                   'success'
@@ -1008,6 +1065,13 @@ export default function App() {
           element={wrapUserProtected(
             <AiDirectorWorkspace
               userUid={currentUser?.uid}
+              onProjectSaved={(proj) => {
+                void upsertServerProject(proj);
+                notify(
+                  `Saved "${proj.title}" (ID: ${proj.id} · rev r${proj.revision || 1}) from AI Director to Project Library.`,
+                  'success'
+                );
+              }}
               onBackToReference={() => {
                 window.location.href = '/app/text-animation';
               }}
@@ -1047,6 +1111,7 @@ export default function App() {
             <TemplateFactoryWorkspace
               userUid={currentUser?.uid || 'user-local'}
               projects={projects}
+              onCatalogChanged={refreshCatalog}
               onSaveProjectToLibrary={addProject}
               onNotify={notify}
             />
@@ -1068,6 +1133,7 @@ export default function App() {
           path="/app/:moduleId"
           element={wrapUserProtected(
             <WorkspaceModuleRoute
+              catalogItems={catalogItems}
               favoriteIds={favoriteIds}
               onToggleFavorite={toggleFavorite}
               companion={companion}
@@ -1168,7 +1234,9 @@ const AdminSubrouteWrapper: React.FC<{
 const EditingStudioRouteWrapper: React.FC<{
   projects: ProjectLibraryItem[];
   ownerUid: string;
-  onAddProject: (p: Omit<ProjectLibraryItem, 'id' | 'updatedAt'>) => Promise<void>;
+  onAddProject: (
+    p: Omit<ProjectLibraryItem, 'id' | 'updatedAt'> & { id?: string; createdAt?: string }
+  ) => Promise<void>;
   onUpdateProject: (id: string, patch: Partial<ProjectLibraryItem>) => Promise<void>;
   onNotify: (message: string, tone?: 'info' | 'warning' | 'error' | 'success') => void;
 }> = ({ projects, ownerUid, onAddProject, onUpdateProject, onNotify }) => {
@@ -1188,15 +1256,21 @@ const EditingStudioRouteWrapper: React.FC<{
 
   return (
     <EditingStudioWorkspace
+      key={`${ownerUid}:${targetLibraryProject?.id || 'draft'}`}
       mode="standalone-route"
       onClose={() => navigate('/app/text-animation')}
       sourceLibraryProject={targetLibraryProject}
+      availableProjects={projects}
       ownerUid={ownerUid}
       onSaveToProjectLibrary={async (record, existingId) => {
-        if (existingId && projects.some((p) => p.id === existingId)) {
-          await onUpdateProject(existingId, record);
+        const stableId = existingId || record.id;
+        if (stableId && projects.some((p) => p.id === stableId)) {
+          await onUpdateProject(stableId, record);
         } else {
-          await onAddProject(record);
+          await onAddProject({
+            ...record,
+            id: stableId,
+          });
         }
       }}
       onNotify={onNotify}

@@ -376,3 +376,91 @@ test('Phase 3 API Security: Prevents cross-user project access, rejects invalid 
     await srv.close();
   }
 });
+
+test('Phase 3 API Security: Missing OWNER_BOOTSTRAP_EMAIL or production non-durable snapshot lock disables bootstrap safely', async () => {
+  const prevOwnerEmail = process.env.OWNER_BOOTSTRAP_EMAIL;
+  delete process.env.OWNER_BOOTSTRAP_EMAIL;
+
+  // 1. Server with missing OWNER_BOOTSTRAP_EMAIL (no fallback to hardcoded address)
+  const appMissingEmail = createApiApp({
+    ownerBootstrapEmail: '',
+    ownerBootstrapSecret: 'TEST_BOOTSTRAP_SECRET_2026',
+    storageEnabled: false,
+    tokenVerifier: async (token: string) => {
+      const identity = MOCK_TOKENS[token];
+      if (!identity) throw new Error('Invalid token');
+      return identity;
+    },
+  });
+  const srvMissingEmail = http.createServer(appMissingEmail);
+  await new Promise<void>((resolve) => srvMissingEmail.listen(0, '127.0.0.1', resolve));
+  const addr1 = srvMissingEmail.address();
+  const baseUrl1 = `http://127.0.0.1:${typeof addr1 === 'object' && addr1 ? addr1.port : 0}`;
+
+  // 2. Server running in production mode where local disk snapshot lock is not durable/race-safe
+  const appProd = createApiApp({
+    ownerBootstrapEmail: 'owner@sowveil.studio',
+    ownerBootstrapSecret: 'TEST_BOOTSTRAP_SECRET_2026',
+    nodeEnv: 'production',
+    storageEnabled: false,
+    tokenVerifier: async () => ({
+      uid: 'prod_owner_uid',
+      email: 'owner@sowveil.studio',
+      emailVerified: true,
+      displayName: 'Prod Owner',
+    }),
+  });
+  const srvProd = http.createServer(appProd);
+  await new Promise<void>((resolve) => srvProd.listen(0, '127.0.0.1', resolve));
+  const addr2 = srvProd.address();
+  const baseUrl2 = `http://127.0.0.1:${typeof addr2 === 'object' && addr2 ? addr2.port : 0}`;
+
+  try {
+    // Missing OWNER_BOOTSTRAP_EMAIL -> canBootstrapOwner is false and POST /api/v1/admin/bootstrap-owner returns 503 BOOTSTRAP_NOT_CONFIGURED
+    const meRes = await fetch(`${baseUrl1}/api/v1/me`, {
+      headers: { Authorization: 'Bearer token_owner' },
+    });
+    assert.equal(meRes.status, 200);
+    const meJson = await meRes.json();
+    assert.equal(meJson.data.canBootstrapOwner, false);
+
+    const bootMissingEmailRes = await fetch(`${baseUrl1}/api/v1/admin/bootstrap-owner`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer token_owner',
+      },
+      body: JSON.stringify({ bootstrapSecret: 'TEST_BOOTSTRAP_SECRET_2026' }),
+    });
+    assert.equal(bootMissingEmailRes.status, 503);
+    const bootMissingEmailJson = await bootMissingEmailRes.json();
+    assert.equal(bootMissingEmailJson.error.code, 'BOOTSTRAP_NOT_CONFIGURED');
+    assert.match(bootMissingEmailJson.error.message, /OWNER_BOOTSTRAP_EMAIL/);
+
+    // Production mode -> canBootstrapOwner is false and POST /api/v1/admin/bootstrap-owner returns 503 BOOTSTRAP_DISABLED_IN_PRODUCTION
+    const meProdRes = await fetch(`${baseUrl2}/api/v1/me`, {
+      headers: { Authorization: 'Bearer token_owner' },
+    });
+    assert.equal(meProdRes.status, 200);
+    const meProdJson = await meProdRes.json();
+    assert.equal(meProdJson.data.canBootstrapOwner, false);
+
+    const bootProdRes = await fetch(`${baseUrl2}/api/v1/admin/bootstrap-owner`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer token_owner',
+      },
+      body: JSON.stringify({ bootstrapSecret: 'TEST_BOOTSTRAP_SECRET_2026' }),
+    });
+    assert.equal(bootProdRes.status, 503);
+    const bootProdJson = await bootProdRes.json();
+    assert.equal(bootProdJson.error.code, 'BOOTSTRAP_DISABLED_IN_PRODUCTION');
+  } finally {
+    if (prevOwnerEmail !== undefined) {
+      process.env.OWNER_BOOTSTRAP_EMAIL = prevOwnerEmail;
+    }
+    await new Promise<void>((resolve) => srvMissingEmail.close(() => resolve()));
+    await new Promise<void>((resolve) => srvProd.close(() => resolve()));
+  }
+});

@@ -188,6 +188,21 @@ import {
   RenderOutputFormat,
 } from '../services/renderExportQaEngine';
 import { loadDurableSnapshot, saveDurableSnapshot } from './durableStore';
+import {
+  ISowveilPersistenceAdapter,
+  PersistenceContractError,
+} from '../services/persistenceContracts';
+import { LocalSnapshotPersistenceAdapter } from './persistenceAdapters';
+import { decryptCredentialFromVault } from './credentialVault';
+import {
+  createSnapshotBackup,
+  executeMigrationApply,
+  executeMigrationDryRun,
+  executeMigrationRollback,
+  getMigrationCutoverDiagnostics,
+  isLegacySnapshotWriterDisabled,
+  setLegacySnapshotWriterDisabled,
+} from './migrationCutover';
 
 export interface VerifiedTokenIdentity {
   uid: string;
@@ -204,8 +219,12 @@ export interface ApiAppOptions {
   rateLimitMaxPerMinute?: number;
   ownerBootstrapEmail?: string;
   ownerBootstrapSecret?: string;
+  nodeEnv?: string;
   storageEnabled?: boolean;
   persistenceFilePath?: string | null;
+  persistenceAdapter?: ISowveilPersistenceAdapter;
+  allowSharedFilesystemInProd?: boolean;
+  refuseUnreadyProductionStartup?: boolean;
   providerProbeFetchImpl?: typeof fetch;
 }
 
@@ -349,6 +368,11 @@ const ProjectCheckpointSchema = z
 
 const ProjectCreateSchema = z
   .object({
+    id: z
+      .string()
+      .trim()
+      .regex(/^[a-zA-Z0-9_\-]{1,128}$/)
+      .optional(),
     title: z.string().trim().min(1).max(160),
     description: z.string().trim().max(2000).default(''),
     compCount: z.number().int().min(0).max(5000).nullable().default(null),
@@ -388,6 +412,7 @@ const ProjectCreateSchema = z
     hasExternalFootageWarning: z.boolean().default(false),
     archived: z.boolean().default(false),
     tags: z.array(z.string().trim().max(64)).max(20).default([]),
+    createdAt: z.string().trim().max(64).optional(),
   })
   .strict();
 
@@ -412,6 +437,7 @@ const ProjectPatchSchema = z
     resolution: z.string().trim().max(64).optional(),
     durationLabel: z.string().trim().max(64).optional(),
     fps: z.number().min(1).max(240).optional(),
+    aeVersion: z.string().trim().max(64).optional(),
     targetEditor: z
       .enum([
         'capcut',
@@ -426,11 +452,13 @@ const ProjectPatchSchema = z
     sowveilSpecJson: z.string().max(15000).optional(),
     canonicalProjectJson: z.string().max(200000).optional(),
     revision: z.number().int().min(1).optional(),
+    expectedRevision: z.number().int().min(1).optional(),
     activeBranch: z.string().trim().max(64).optional(),
     checkpoints: z.array(ProjectCheckpointSchema).max(20).optional(),
     hasExternalFootageWarning: z.boolean().optional(),
     archived: z.boolean().optional(),
     tags: z.array(z.string().trim().max(64)).max(20).optional(),
+    lastOpenedAt: z.string().trim().max(64).optional(),
   })
   .strict();
 
@@ -545,17 +573,24 @@ export function createApiApp(options: ApiAppOptions = {}) {
     options.tokenVerifier || verifyFirebaseIdTokenWithGoogle;
   const maxPerMinute = options.rateLimitMaxPerMinute ?? 120;
   const configuredOwnerEmail = (
-    options.ownerBootstrapEmail ||
-    process.env.OWNER_BOOTSTRAP_EMAIL ||
-    'mdhasibul4u@gmail.com'
+    options.ownerBootstrapEmail ??
+    process.env.OWNER_BOOTSTRAP_EMAIL ??
+    ''
   )
     .trim()
     .toLowerCase();
   const configuredBootstrapSecret = (
-    options.ownerBootstrapSecret ||
-    process.env.OWNER_BOOTSTRAP_SECRET ||
+    options.ownerBootstrapSecret ??
+    process.env.OWNER_BOOTSTRAP_SECRET ??
     ''
   ).trim();
+  const runtimeNodeEnv = (
+    options.nodeEnv ??
+    process.env.NODE_ENV ??
+    'development'
+  )
+    .trim()
+    .toLowerCase();
   const storageEnabled =
     options.storageEnabled ?? process.env.CLOUD_STORAGE_ENABLED === 'true';
 
@@ -608,6 +643,23 @@ export function createApiApp(options: ApiAppOptions = {}) {
   const authRateBuckets = new Map<string, { count: number; resetAt: number }>();
   const AUTH_RATE_LIMIT_PER_MINUTE = 10;
   const persistenceFilePath = options.persistenceFilePath ?? null;
+  const activePersistenceAdapter: ISowveilPersistenceAdapter =
+    options.persistenceAdapter ??
+    new LocalSnapshotPersistenceAdapter({
+      snapshotFilePath: persistenceFilePath,
+      nodeEnv: runtimeNodeEnv,
+      allowSharedFilesystemInProd: options.allowSharedFilesystemInProd,
+      refuseUnreadyProductionStartup: options.refuseUnreadyProductionStartup,
+      cloudStorageEnabled: storageEnabled,
+    });
+  const isProductionBootstrapLockUnsafe =
+    (runtimeNodeEnv === 'production' || process.env.NODE_ENV === 'production') &&
+    activePersistenceAdapter.adapterKind !== 'cloud-firestore-authoritative';
+  const isBootstrapSecretSufficient =
+    configuredBootstrapSecret.length >= 16 &&
+    !['changeme', 'secret', 'password', 'sample', '1234567890123456'].includes(
+      configuredBootstrapSecret.toLowerCase()
+    );
 
   let platformSettings: PlatformSettingsConfig = {
     exportMaxSizeMb: 50,
@@ -665,6 +717,16 @@ export function createApiApp(options: ApiAppOptions = {}) {
       visibility: 'draft',
     })
   );
+  for (const seededItem of catalogStore.values()) {
+    void activePersistenceAdapter.catalogAndVariants
+      .getCatalogItemById(seededItem.id)
+      .then((existing) => {
+        if (!existing) {
+          return activePersistenceAdapter.catalogAndVariants.saveCatalogItem(seededItem);
+        }
+      })
+      .catch(() => {});
+  }
 
   // Seed asset metadata records from initial catalog items (no mocked binary URLs)
   for (const item of SEED_CATALOG_ITEMS.slice(0, 12)) {
@@ -722,17 +784,31 @@ export function createApiApp(options: ApiAppOptions = {}) {
   if (loadedSnapshot) {
     catalogCacheVersion = loadedSnapshot.catalogCacheVersion || 1;
     ownerBootstrappedUid = loadedSnapshot.ownerBootstrappedUid || null;
+    if (ownerBootstrappedUid) {
+      void activePersistenceAdapter.governance
+        .claimOwnerBootstrapLock(ownerBootstrappedUid, runtimeNodeEnv)
+        .catch(() => {});
+    }
     if (loadedSnapshot.platformSettings) {
       platformSettings = { ...platformSettings, ...loadedSnapshot.platformSettings };
     }
     for (const [k, v] of Object.entries(loadedSnapshot.roles || {})) {
       roleStore.set(k, v);
+      void activePersistenceAdapter.governance
+        .setRole(k, v, 'snapshot-seed')
+        .catch(() => {});
     }
     for (const [k, v] of Object.entries(loadedSnapshot.userStatuses || {})) {
       userStatusStore.set(k, v);
+      void activePersistenceAdapter.governance
+        .setAccountStatus(k, v)
+        .catch(() => {});
     }
     for (const [k, v] of Object.entries(loadedSnapshot.userPreferences || {})) {
       userPreferencesStore.set(k, v);
+      void activePersistenceAdapter.governance
+        .savePreferences(k, v)
+        .catch(() => {});
     }
     for (const [k, v] of Object.entries(loadedSnapshot.userFavorites || {})) {
       userFavoritesStore.set(k, new Set(v));
@@ -741,16 +817,34 @@ export function createApiApp(options: ApiAppOptions = {}) {
       userRecentStore.set(k, Array.isArray(v) ? v : []);
     }
     for (const item of loadedSnapshot.catalogItems || []) {
-      catalogStore.set(item.id, enrichCatalogItemWithMarketplaceDefaults(item));
+      const enriched = enrichCatalogItemWithMarketplaceDefaults(item);
+      catalogStore.set(enriched.id, enriched);
+      void activePersistenceAdapter.catalogAndVariants
+        .saveCatalogItem(enriched)
+        .catch(() => {});
     }
     for (const variant of loadedSnapshot.templateVariants || []) {
       templateVariantsStore.set(variant.id, variant);
+      void activePersistenceAdapter.catalogAndVariants
+        .saveVariant(variant)
+        .catch(() => {});
     }
     for (const asset of loadedSnapshot.assets || []) {
       assetsStore.set(asset.id, asset);
     }
     for (const proj of loadedSnapshot.projects || []) {
       projectsStore.set(proj.id, proj);
+      void activePersistenceAdapter.projects
+        .getById(proj.id, proj.ownerUid || 'user-local', true)
+        .then((existing) => {
+          if (!existing) {
+            return activePersistenceAdapter.projects.create({
+              ...proj,
+              ownerUid: proj.ownerUid || 'user-local',
+            });
+          }
+        })
+        .catch(() => {});
     }
     for (const job of loadedSnapshot.jobs || []) {
       jobsStore.set(job.id, job);
@@ -766,22 +860,40 @@ export function createApiApp(options: ApiAppOptions = {}) {
     }
     for (const sess of loadedSnapshot.referenceLabSessions || []) {
       referenceLabSessionsStore.set(sess.id, sess);
+      void activePersistenceAdapter.referenceLabSessions
+        .save(sess)
+        .catch(() => {});
     }
     for (const conn of loadedSnapshot.providerConnections || []) {
       const inspected = inspectPersistedConnectionVaultHealth(conn);
       providerConnectionsStore.set(inspected.id, inspected);
+      void activePersistenceAdapter.providerConnections
+        .saveMetadata(inspected)
+        .catch(() => {});
     }
     for (const [uid, profiles] of Object.entries(loadedSnapshot.routingProfiles || {})) {
       routingProfilesStore.set(uid, profiles);
+      void activePersistenceAdapter.routingAndExtensions
+        .saveRoutingProfiles(uid, profiles)
+        .catch(() => {});
     }
     for (const ext of loadedSnapshot.extensionPackages || []) {
       extensionPackagesStore.set(ext.id, ext);
+      void activePersistenceAdapter.routingAndExtensions
+        .saveExtension(ext)
+        .catch(() => {});
     }
     for (const dirSess of loadedSnapshot.aiDirectorSessions || []) {
       aiDirectorSessionsStore.set(dirSess.id, dirSess);
+      void activePersistenceAdapter.aiDirectorSessions
+        .save(dirSess)
+        .catch(() => {});
     }
     for (const fDraft of loadedSnapshot.templateFactoryDrafts || []) {
       templateFactoryDraftsStore.set(fDraft.id, fDraft);
+      void activePersistenceAdapter.templateFactoryDrafts
+        .save(fDraft)
+        .catch(() => {});
     }
     if (Array.isArray(loadedSnapshot.templatePreferenceSignals)) {
       templatePreferenceSignalsStore.splice(
@@ -789,9 +901,24 @@ export function createApiApp(options: ApiAppOptions = {}) {
         templatePreferenceSignalsStore.length,
         ...loadedSnapshot.templatePreferenceSignals
       );
+      const signalsByUid = new Map<string, TemplatePreferenceSignal[]>();
+      for (const sig of loadedSnapshot.templatePreferenceSignals) {
+        if (!sig.ownerUid) continue;
+        const arr = signalsByUid.get(sig.ownerUid) || [];
+        arr.push(sig);
+        signalsByUid.set(sig.ownerUid, arr);
+      }
+      for (const [uid, sigs] of signalsByUid.entries()) {
+        void activePersistenceAdapter.templateFactoryDrafts
+          .savePreferenceSignals(uid, sigs)
+          .catch(() => {});
+      }
     }
     for (const [uid, cCfg] of Object.entries(loadedSnapshot.userPreferenceConsents || {})) {
       userPreferenceConsentsStore.set(uid, cCfg);
+      void activePersistenceAdapter.templateFactoryDrafts
+        .savePreferenceConsent(cCfg)
+        .catch(() => {});
     }
     if (Array.isArray(loadedSnapshot.renderExportJobs)) {
       const { recoveredJobs } = recoverInterruptedRenderJobsOnStartup(
@@ -799,18 +926,44 @@ export function createApiApp(options: ApiAppOptions = {}) {
       );
       for (const rJob of recoveredJobs) {
         renderExportJobsStore.set(rJob.id, rJob);
+        void activePersistenceAdapter.renderExportJobs
+          .saveJob(rJob, { cloudStorageEnabled: storageEnabled })
+          .catch(() => {});
       }
     }
     if (Array.isArray(loadedSnapshot.toolAuditRecords) && loadedSnapshot.toolAuditRecords.length > 0) {
       toolAuditRecordsStore.splice(0, toolAuditRecordsStore.length, ...loadedSnapshot.toolAuditRecords);
+      for (const tRec of loadedSnapshot.toolAuditRecords) {
+        void activePersistenceAdapter.routingAndExtensions
+          .appendToolAudit(tRec)
+          .catch(() => {});
+      }
     }
     if (Array.isArray(loadedSnapshot.auditEvents) && loadedSnapshot.auditEvents.length > 0) {
       auditLog.splice(0, auditLog.length, ...loadedSnapshot.auditEvents);
+      for (const ev of loadedSnapshot.auditEvents) {
+        void activePersistenceAdapter.governance
+          .appendAuditEvent(ev)
+          .catch(() => {});
+      }
     }
   }
 
+  // Hydrate ownerBootstrapLock from activePersistenceAdapter on startup
+  void activePersistenceAdapter.governance
+    .getOwnerBootstrapLock()
+    .then((lock) => {
+      if (lock && lock.bootstrapped && lock.ownerUid) {
+        ownerBootstrappedUid = lock.ownerUid;
+        roleStore.set(lock.ownerUid, 'owner');
+        userStatusStore.set(lock.ownerUid, 'active');
+      }
+    })
+    .catch(() => {});
+
   function persistState() {
     if (!persistenceFilePath) return;
+    if (isLegacySnapshotWriterDisabled()) return;
     const favObj: Record<string, string[]> = {};
     for (const [uid, set] of userFavoritesStore.entries()) {
       favObj[uid] = Array.from(set);
@@ -905,6 +1058,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
       createdAt: new Date().toISOString(),
     };
     auditLog.unshift(evt);
+    void activePersistenceAdapter.governance.appendAuditEvent(evt).catch(() => {});
   }
 
   function countActiveOwners(): number {
@@ -1124,7 +1278,15 @@ export function createApiApp(options: ApiAppOptions = {}) {
         );
       }
 
-      const accountStatus = userStatusStore.get(identity.uid) || 'active';
+      let accountStatus = userStatusStore.get(identity.uid);
+      if (!accountStatus) {
+        try {
+          accountStatus = await activePersistenceAdapter.governance.getAccountStatus(identity.uid);
+          userStatusStore.set(identity.uid, accountStatus);
+        } catch {
+          accountStatus = 'active';
+        }
+      }
       if (accountStatus === 'suspended') {
         recordAudit(
           identity.uid,
@@ -1147,10 +1309,20 @@ export function createApiApp(options: ApiAppOptions = {}) {
 
       authReq.authIdentity = identity;
 
-      // Resolve role strictly from server-side trusted role store (NEVER from client headers or body)
-      const resolvedRole: UserRole = roleStore.get(identity.uid) || 'user';
-      authReq.userRole = resolvedRole;
-      syncUserIntoDirectory(identity, resolvedRole);
+      // Resolve role strictly from server-side trusted role store / persistence adapter (NEVER from client headers or body)
+      let resolvedRole: UserRole | undefined = roleStore.get(identity.uid);
+      if (!resolvedRole) {
+        try {
+          resolvedRole = await activePersistenceAdapter.governance.getRole(identity.uid);
+          if (resolvedRole !== 'user') {
+            roleStore.set(identity.uid, resolvedRole);
+          }
+        } catch {
+          resolvedRole = 'user';
+        }
+      }
+      authReq.userRole = resolvedRole || 'user';
+      syncUserIntoDirectory(identity, authReq.userRole);
       return next();
     } catch (err) {
       const code =
@@ -1223,6 +1395,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
   // --- PUBLIC & SAFE DIAGNOSTIC ROUTES ---
   app.get('/api/v1/health', (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
+    const persistenceReadiness = activePersistenceAdapter.getReadinessReport();
     return sendOk(res, authReq.requestId, {
       status: 'ok',
       service: 'sowveil-studio-api',
@@ -1230,8 +1403,69 @@ export function createApiApp(options: ApiAppOptions = {}) {
       firebaseProjectId: firebaseConfig.projectId,
       firestoreDatabaseConfigured: Boolean(firebaseConfig.firestoreDatabaseId),
       storageConfigured: storageEnabled,
+      persistenceReadiness,
       catalogCacheVersion,
       timestamp: new Date().toISOString(),
+    });
+  });
+
+  app.get('/api/v1/ready', (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const persistenceReadiness = activePersistenceAdapter.getReadinessReport();
+    if (runtimeNodeEnv === 'production' && !persistenceReadiness.readyForProductionTraffic) {
+      return sendError(
+        res,
+        authReq.requestId,
+        503,
+        persistenceReadiness.blockerCode || 'PRODUCTION_DURABLE_ADAPTER_REQUIRED',
+        persistenceReadiness.blockerMessage ||
+          'Production readiness blocked: no supported durable persistence adapter is configured for required records.',
+        { persistenceReadiness }
+      );
+    }
+    return sendOk(res, authReq.requestId, {
+      status: persistenceReadiness.status,
+      readyForProductionTraffic: persistenceReadiness.readyForProductionTraffic,
+      persistenceReadiness,
+    });
+  });
+
+  app.get('/api/v1/diagnostics/persistence', (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+    const persistenceReadiness = activePersistenceAdapter.getReadinessReport();
+    const migrationCutover = getMigrationCutoverDiagnostics({
+      persistenceAdapter: activePersistenceAdapter,
+      snapshotFilePath: persistenceFilePath,
+    });
+    return sendOk(res, authReq.requestId, {
+      persistenceReadiness,
+      migrationCutover,
+      entitiesCovered: [
+        'projects',
+        'aiDirectorSessions',
+        'referenceLabSessions',
+        'templateFactoryDrafts',
+        'catalogItems',
+        'templateVariants',
+        'providerConnections',
+        'credentialVault',
+        'routingProfiles',
+        'extensionPackages',
+        'toolAuditRecords',
+        'renderExportJobs',
+        'userPreferences',
+        'favorites',
+        'roles',
+        'ownerBootstrapLock',
+        'auditEvents',
+      ],
+      redactionPolicy: {
+        exposesMasterVaultKey: false,
+        exposesProviderCredentials: false,
+        exposesPrivateProjectPayloads: false,
+        exposesServerFilesystemPaths: false,
+      },
     });
   });
 
@@ -1261,9 +1495,17 @@ export function createApiApp(options: ApiAppOptions = {}) {
       : callerUid
       ? allJobs.filter((j) => j.ownerUid === callerUid)
       : [];
+    const scopedCanonicalRenderJobs = callerUid
+      ? await listAuthoritativeRenderExportJobs(callerUid)
+      : isAdminOrOwner
+      ? Array.from(renderExportJobsStore.values())
+      : [];
 
     const lastSuccessJob = scopedJobs
       .filter((j) => j.status === 'ready' || j.status === 'downloaded' || j.status === 'succeeded')
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
+    const lastSuccessCanonicalRender = scopedCanonicalRenderJobs
+      .filter((j) => j.stage === 'ready')
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
 
     const adapters = Array.from(editorAdaptersStore.values()).map((a) => ({
@@ -1286,6 +1528,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
       viewerScope: isAdminOrOwner ? 'admin-deep-diagnostic' : callerUid ? 'signed-in-user' : 'public-summary',
       viewerRole: callerRole,
       apiHealth: 'reachable',
+      persistenceReadiness: activePersistenceAdapter.getReadinessReport(),
       firebaseReadiness: {
         authConfigured: Boolean(firebaseConfig.projectId && firebaseConfig.authDomain),
         firestoreConfigured: Boolean(firebaseConfig.firestoreDatabaseId),
@@ -1299,17 +1542,39 @@ export function createApiApp(options: ApiAppOptions = {}) {
           : 'Storage not configured (Metadata & Client Export Active)',
       },
       exportQueueStatus: {
-        activeOrQueuedCount: scopedJobs.filter(
-          (j) => j.status === 'queued' || j.status === 'claimed' || j.status === 'running'
-        ).length,
-        readyOrCompletedCount: scopedJobs.filter(
-          (j) => j.status === 'ready' || j.status === 'downloaded' || j.status === 'succeeded'
-        ).length,
-        failedOrNeedsSetupCount: scopedJobs.filter(
-          (j) => j.status === 'failed' || j.status === 'needs-setup'
-        ).length,
-        lastSuccessfulJobAt: lastSuccessJob ? lastSuccessJob.updatedAt : null,
-        lastSuccessfulJobTitle: lastSuccessJob ? lastSuccessJob.title : null,
+        activeOrQueuedCount:
+          scopedJobs.filter(
+            (j) => j.status === 'queued' || j.status === 'claimed' || j.status === 'running'
+          ).length +
+          scopedCanonicalRenderJobs.filter(
+            (j) =>
+              j.stage === 'queued' ||
+              j.stage === 'validating-project' ||
+              j.stage === 'resolving-assets' ||
+              j.stage === 'rendering-frames' ||
+              j.stage === 'synthesizing-audio' ||
+              j.stage === 'packaging-container' ||
+              j.stage === 'running-final-qa'
+          ).length,
+        readyOrCompletedCount:
+          scopedJobs.filter(
+            (j) => j.status === 'ready' || j.status === 'downloaded' || j.status === 'succeeded'
+          ).length + scopedCanonicalRenderJobs.filter((j) => j.stage === 'ready').length,
+        failedOrNeedsSetupCount:
+          scopedJobs.filter((j) => j.status === 'failed' || j.status === 'needs-setup').length +
+          scopedCanonicalRenderJobs.filter(
+            (j) => j.stage === 'failed' || j.stage === 'needs-worker-setup'
+          ).length,
+        lastSuccessfulJobAt: lastSuccessCanonicalRender
+          ? lastSuccessCanonicalRender.updatedAt
+          : lastSuccessJob
+          ? lastSuccessJob.updatedAt
+          : null,
+        lastSuccessfulJobTitle: lastSuccessCanonicalRender
+          ? lastSuccessCanonicalRender.projectTitle
+          : lastSuccessJob
+          ? lastSuccessJob.title
+          : null,
       },
       quotasAndLimits: {
         exportMaxSizeMb: platformSettings.exportMaxSizeMb,
@@ -1475,8 +1740,20 @@ export function createApiApp(options: ApiAppOptions = {}) {
     const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
     const { limit, offset } = parsePagination(req);
 
+    let allCatalogItems: CatalogItem[] = [];
+    try {
+      allCatalogItems = await listAuthoritativeCatalogItems();
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to list catalog items.'
+      );
+    }
+
     // Filter by requested visibility if specifically requested (e.g., ?visibility=private or ?visibility=published)
-    const rawItems = Array.from(catalogStore.values()).filter((item) => {
+    const rawItems = allCatalogItems.filter((item) => {
       if (!isCatalogItemVisibleToViewer(item, callerUid, callerIsAdmin)) {
         return false;
       }
@@ -1543,7 +1820,17 @@ export function createApiApp(options: ApiAppOptions = {}) {
 
   app.get('/api/v1/catalog/:id', async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
-    const item = catalogStore.get(req.params.id);
+    let item: CatalogItem | null = null;
+    try {
+      item = await getAuthoritativeCatalogItem(req.params.id);
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to read catalog item.'
+      );
+    }
     if (!item) {
       return sendError(res, authReq.requestId, 404, 'NOT_FOUND', 'Catalog item not found.');
     }
@@ -1596,15 +1883,40 @@ export function createApiApp(options: ApiAppOptions = {}) {
   });
 
   // --- AUTHENTICATED USER ROUTES ---
-  app.get('/api/v1/me', requireAuth, (req: Request, res: Response) => {
+  app.get('/api/v1/me', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const identity = authReq.authIdentity!;
     const role = authReq.userRole!;
-    const preferences = userPreferencesStore.get(identity.uid) || {
+    let storedPrefs = userPreferencesStore.get(identity.uid);
+    if (!storedPrefs) {
+      try {
+        storedPrefs =
+          (await activePersistenceAdapter.governance.getPreferences(identity.uid)) || undefined;
+        if (storedPrefs) {
+          userPreferencesStore.set(identity.uid, storedPrefs);
+        }
+      } catch {
+        // Fallback to default
+      }
+    }
+    const preferences = storedPrefs || {
       reducedMotion: false,
       defaultSortOrder: 'name',
       preserveSearchOnModuleSwitch: false,
     };
+
+    let alreadyLocked = Boolean(ownerBootstrappedUid);
+    if (!alreadyLocked) {
+      try {
+        const lock = await activePersistenceAdapter.governance.getOwnerBootstrapLock();
+        if (lock?.bootstrapped) {
+          ownerBootstrappedUid = lock.ownerUid;
+          alreadyLocked = true;
+        }
+      } catch {
+        // Ignore
+      }
+    }
 
     return sendOk(res, authReq.requestId, {
       uid: identity.uid,
@@ -1615,7 +1927,10 @@ export function createApiApp(options: ApiAppOptions = {}) {
       status: userStatusStore.get(identity.uid) || 'active',
       preferences,
       canBootstrapOwner:
-        !ownerBootstrappedUid &&
+        !isProductionBootstrapLockUnsafe &&
+        Boolean(configuredOwnerEmail) &&
+        isBootstrapSecretSufficient &&
+        !alreadyLocked &&
         identity.emailVerified &&
         identity.email.toLowerCase() === configuredOwnerEmail,
     });
@@ -1668,6 +1983,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
     };
     const updated: UserPreferences = { ...current, ...parsed.data };
     userPreferencesStore.set(identity.uid, updated);
+    void activePersistenceAdapter.governance.savePreferences(identity.uid, updated).catch(() => {});
     persistState();
     return sendOk(res, authReq.requestId, updated);
   });
@@ -1895,85 +2211,84 @@ export function createApiApp(options: ApiAppOptions = {}) {
   });
 
   // Complete Account & Project Data Export (GDPR / User Data Portability)
-  app.get('/api/v1/me/data-export', requireAuth, (req: Request, res: Response) => {
+  app.get('/api/v1/me/data-export', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
     const uid = authReq.authIdentity!.uid;
 
-    const ownedProjects = Array.from(projectsStore.values()).filter((p) => p.ownerUid === uid);
-    const ownedVariants = Array.from(templateVariantsStore.values()).filter(
-      (v) => v.ownerUid === uid
-    );
-    const ownedPrivateTemplates = Array.from(catalogStore.values()).filter(
-      (c) => c.ownerUid === uid
-    );
-    const ownedAssets = Array.from(assetsStore.values()).filter((a) => a.ownerUid === uid);
-    const ownedJobs = Array.from(jobsStore.values()).filter((j) => j.ownerUid === uid);
-    const ownedReferenceSessions = Array.from(referenceLabSessionsStore.values()).filter(
-      (s) => s.ownerUid === uid
-    );
-    const ownedProviderConnections = Array.from(providerConnectionsStore.values())
-      .filter((c) => c.ownerUid === uid)
-      .map(toPublicProviderConnectionView);
-    const ownedExtensions = Array.from(extensionPackagesStore.values()).filter(
-      (e) => e.ownerUid === uid
-    );
-    const ownedDirectorSessions = Array.from(aiDirectorSessionsStore.values()).filter(
-      (s) => s.ownerUid === uid
-    );
-    const ownedFactoryDrafts = Array.from(templateFactoryDraftsStore.values()).filter(
-      (d) => d.ownerUid === uid
-    );
-    const ownedPreferenceSignals = templatePreferenceSignalsStore.filter(
-      (s) => s.ownerUid === uid
-    );
-    const ownedRenderExportJobs = Array.from(renderExportJobsStore.values())
-      .filter((j) => j.ownerUid === uid)
-      .map(toPublicRenderJobView);
+    try {
+      const ownedProjects = await listAuthoritativeProjects(uid);
+      const ownedVariants = await listAuthoritativeVariantsByOwner(uid);
+      const allCatalog = await listAuthoritativeCatalogItems();
+      const ownedPrivateTemplates = allCatalog.filter((c) => c.ownerUid === uid);
+      const ownedAssets = Array.from(assetsStore.values()).filter((a) => a.ownerUid === uid);
+      const ownedJobs = Array.from(jobsStore.values()).filter((j) => j.ownerUid === uid);
+      const ownedReferenceSessions = await listAuthoritativeReferenceLabSessions(uid);
+      const ownedProviderConnections = (
+        await getOrSeedAuthoritativeUserProviderConnections(uid)
+      ).map(toPublicProviderConnectionView);
+      const ownedExtensions = await listAuthoritativeExtensions(uid, true);
+      const ownedDirectorSessions = await listAuthoritativeAiDirectorSessions(uid);
+      const ownedFactoryDrafts = await listAuthoritativeTemplateFactoryDrafts(uid);
+      const ownedPreferenceSignals = await listAuthoritativePreferenceSignals(uid);
+      const preferenceConsent =
+        await activePersistenceAdapter.templateFactoryDrafts.getPreferenceConsent(uid);
+      const ownedRenderExportJobs = (await listAuthoritativeRenderExportJobs(uid)).map(
+        toPublicRenderJobView
+      );
 
-    recordAudit(
-      uid,
-      authReq.authIdentity!.email,
-      'USER_DATA_EXPORTED',
-      uid,
-      `Exported user account data (${ownedProjects.length} projects, ${ownedDirectorSessions.length} AI Director sessions, ${ownedFactoryDrafts.length} Template Factory drafts)`,
-      authReq.requestId,
-      'user',
-      'success'
-    );
-
-    return sendOk(res, authReq.requestId, {
-      exportedAt: new Date().toISOString(),
-      schemaVersion: '2.4.0-canonical',
-      profile: {
+      recordAudit(
         uid,
-        email: authReq.authIdentity!.email,
-        displayName: authReq.authIdentity!.displayName || 'Studio User',
-        role: authReq.userRole || 'user',
-        preferences: userPreferencesStore.get(uid) || null,
-        telemetryOptIn: Boolean(userTelemetryOptInStore.get(uid)),
-        preferenceLearningConsent: userPreferenceConsentsStore.get(uid) || null,
-      },
-      favorites: Array.from(userFavoritesStore.get(uid) || []),
-      recentItems: userRecentStore.get(uid) || [],
-      projects: ownedProjects,
-      templateVariants: ownedVariants,
-      privateCatalogTemplates: ownedPrivateTemplates,
-      assets: ownedAssets,
-      legacyExportJobs: ownedJobs,
-      referenceLabSessions: ownedReferenceSessions,
-      providerConnectionsRedacted: ownedProviderConnections,
-      routingProfiles: routingProfilesStore.get(uid) || null,
-      extensions: ownedExtensions,
-      aiDirectorSessions: ownedDirectorSessions,
-      templateFactoryDrafts: ownedFactoryDrafts,
-      templatePreferenceSignals: ownedPreferenceSignals,
-      renderExportJobs: ownedRenderExportJobs,
-    });
+        authReq.authIdentity!.email,
+        'USER_DATA_EXPORTED',
+        uid,
+        `Exported user account data (${ownedProjects.length} projects, ${ownedDirectorSessions.length} AI Director sessions, ${ownedFactoryDrafts.length} Template Factory drafts)`,
+        authReq.requestId,
+        'user',
+        'success'
+      );
+
+      return sendOk(res, authReq.requestId, {
+        exportedAt: new Date().toISOString(),
+        schemaVersion: '2.4.0-canonical',
+        profile: {
+          uid,
+          email: authReq.authIdentity!.email,
+          displayName: authReq.authIdentity!.displayName || 'Studio User',
+          role: authReq.userRole || 'user',
+          preferences: userPreferencesStore.get(uid) || null,
+          telemetryOptIn: Boolean(userTelemetryOptInStore.get(uid)),
+          preferenceLearningConsent:
+            preferenceConsent || userPreferenceConsentsStore.get(uid) || null,
+        },
+        favorites: Array.from(userFavoritesStore.get(uid) || []),
+        recentItems: userRecentStore.get(uid) || [],
+        projects: ownedProjects,
+        templateVariants: ownedVariants,
+        privateCatalogTemplates: ownedPrivateTemplates,
+        assets: ownedAssets,
+        legacyExportJobs: ownedJobs,
+        referenceLabSessions: ownedReferenceSessions,
+        providerConnectionsRedacted: ownedProviderConnections,
+        routingProfiles: routingProfilesStore.get(uid) || null,
+        extensions: ownedExtensions,
+        aiDirectorSessions: ownedDirectorSessions,
+        templateFactoryDrafts: ownedFactoryDrafts,
+        templatePreferenceSignals: ownedPreferenceSignals,
+        renderExportJobs: ownedRenderExportJobs,
+      });
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to export user data.'
+      );
+    }
   });
 
   // Complete Account & Project Data Deletion across all durable stores + secret vault purge
-  app.delete('/api/v1/me/account-data', requireAuth, (req: Request, res: Response) => {
+  app.delete('/api/v1/me/account-data', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
     const uid = authReq.authIdentity!.uid;
@@ -2011,124 +2326,146 @@ export function createApiApp(options: ApiAppOptions = {}) {
       renderExportJobs: 0,
     };
 
-    for (const [id, proj] of projectsStore.entries()) {
-      if (proj.ownerUid === uid) {
-        projectsStore.delete(id);
-        canonicalProjectStores.delete(id);
+    try {
+      const ownedProjectsToDelete = await listAuthoritativeProjects(uid);
+      for (const proj of ownedProjectsToDelete) {
+        await deleteAuthoritativeProject(proj.id, uid);
         deletedCounts.projects += 1;
       }
-    }
-    for (const [id, v] of templateVariantsStore.entries()) {
-      if (v.ownerUid === uid) {
-        templateVariantsStore.delete(id);
+      const ownedVariantsToDelete = await listAuthoritativeVariantsByOwner(uid);
+      for (const v of ownedVariantsToDelete) {
+        await deleteAuthoritativeVariant(v.id, uid);
         deletedCounts.templateVariants += 1;
       }
-    }
-    for (const [id, item] of catalogStore.entries()) {
-      if (item.ownerUid === uid) {
-        catalogStore.delete(id);
-        deletedCounts.privateCatalogTemplates += 1;
+      const allCatalog = await listAuthoritativeCatalogItems();
+      for (const item of allCatalog) {
+        if (item.ownerUid === uid) {
+          await deleteAuthoritativeCatalogItem(item.id);
+          deletedCounts.privateCatalogTemplates += 1;
+        }
       }
-    }
-    for (const [id, asset] of assetsStore.entries()) {
-      if (asset.ownerUid === uid) {
-        assetsStore.delete(id);
-        deletedCounts.assets += 1;
+      for (const [id, asset] of assetsStore.entries()) {
+        if (asset.ownerUid === uid) {
+          assetsStore.delete(id);
+          deletedCounts.assets += 1;
+        }
       }
-    }
-    for (const [id, job] of jobsStore.entries()) {
-      if (job.ownerUid === uid) {
-        jobsStore.delete(id);
-        deletedCounts.legacyJobs += 1;
+      for (const [id, job] of jobsStore.entries()) {
+        if (job.ownerUid === uid) {
+          jobsStore.delete(id);
+          deletedCounts.legacyJobs += 1;
+        }
       }
-    }
-    for (const [id, dev] of devicesStore.entries()) {
-      if (dev.ownerUid === uid) {
-        devicesStore.delete(id);
-        deletedCounts.devices += 1;
+      for (const [id, dev] of devicesStore.entries()) {
+        if (dev.ownerUid === uid) {
+          devicesStore.delete(id);
+          deletedCounts.devices += 1;
+        }
       }
-    }
-    for (const [id, pt] of pairingTokensStore.entries()) {
-      if (pt.ownerUid === uid) {
-        pairingTokensStore.delete(id);
+      for (const [id, pt] of pairingTokensStore.entries()) {
+        if (pt.ownerUid === uid) {
+          pairingTokensStore.delete(id);
+        }
       }
-    }
-    for (const [id, sess] of referenceLabSessionsStore.entries()) {
-      if (sess.ownerUid === uid) {
-        referenceLabSessionsStore.delete(id);
+      const ownedRefSessions = await listAuthoritativeReferenceLabSessions(uid);
+      for (const sess of ownedRefSessions) {
+        await deleteAuthoritativeReferenceLabSession(sess.id, uid);
         deletedCounts.referenceLabSessions += 1;
       }
-    }
-    for (const [id, conn] of providerConnectionsStore.entries()) {
-      if (conn.ownerUid === uid) {
-        providerConnectionsStore.delete(id);
+      const ownedConns = await activePersistenceAdapter.providerConnections.listMetadataByOwner(uid);
+      for (const conn of ownedConns) {
+        await deleteAuthoritativeProviderConnection(conn.id, uid);
         deletedCounts.providerConnectionsAndVaultKeys += 1;
       }
-    }
-    routingProfilesStore.delete(uid);
+      for (const [id, conn] of providerConnectionsStore.entries()) {
+        if (conn.ownerUid === uid) {
+          providerConnectionsStore.delete(id);
+          deletedCounts.providerConnectionsAndVaultKeys += 1;
+        }
+      }
+      routingProfilesStore.delete(uid);
 
-    for (const [id, ext] of extensionPackagesStore.entries()) {
-      if (ext.ownerUid === uid) {
-        extensionPackagesStore.delete(id);
+      const ownedExts = await listAuthoritativeExtensions(uid, true);
+      for (const ext of ownedExts) {
+        await deleteAuthoritativeExtension(ext.id, uid);
         deletedCounts.extensions += 1;
       }
-    }
-    for (const [id, dirSess] of aiDirectorSessionsStore.entries()) {
-      if (dirSess.ownerUid === uid) {
-        aiDirectorSessionsStore.delete(id);
+      for (const [id, ext] of extensionPackagesStore.entries()) {
+        if (ext.ownerUid === uid) {
+          extensionPackagesStore.delete(id);
+          deletedCounts.extensions += 1;
+        }
+      }
+      const ownedDirSessions = await listAuthoritativeAiDirectorSessions(uid);
+      for (const dirSess of ownedDirSessions) {
+        await deleteAuthoritativeAiDirectorSession(dirSess.id, uid);
         deletedCounts.aiDirectorSessions += 1;
       }
-    }
-    for (const [id, draft] of templateFactoryDraftsStore.entries()) {
-      if (draft.ownerUid === uid) {
-        templateFactoryDraftsStore.delete(id);
+      const ownedDrafts = await listAuthoritativeTemplateFactoryDrafts(uid);
+      for (const draft of ownedDrafts) {
+        await deleteAuthoritativeTemplateFactoryDraft(draft.id, uid);
         deletedCounts.templateFactoryDrafts += 1;
       }
-    }
-    for (let i = templatePreferenceSignalsStore.length - 1; i >= 0; i--) {
-      if (templatePreferenceSignalsStore[i].ownerUid === uid) {
-        templatePreferenceSignalsStore.splice(i, 1);
-        deletedCounts.templatePreferenceSignals += 1;
+      const ownedSigs = await listAuthoritativePreferenceSignals(uid);
+      deletedCounts.templatePreferenceSignals = ownedSigs.length;
+      await activePersistenceAdapter.templateFactoryDrafts.savePreferenceSignals(uid, []);
+      for (let i = templatePreferenceSignalsStore.length - 1; i >= 0; i--) {
+        if (templatePreferenceSignalsStore[i].ownerUid === uid) {
+          templatePreferenceSignalsStore.splice(i, 1);
+        }
       }
-    }
-    userPreferenceConsentsStore.delete(uid);
+      userPreferenceConsentsStore.delete(uid);
 
-    for (const [id, rJob] of renderExportJobsStore.entries()) {
-      if (rJob.ownerUid === uid) {
-        renderExportJobsStore.delete(id);
+      const ownedRJobs = await listAuthoritativeRenderExportJobs(uid);
+      for (const rJob of ownedRJobs) {
+        await activePersistenceAdapter.renderExportJobs.deleteJob(rJob.id, uid);
+        renderExportJobsStore.delete(rJob.id);
         deletedCounts.renderExportJobs += 1;
       }
+      for (const [id, rJob] of renderExportJobsStore.entries()) {
+        if (rJob.ownerUid === uid) {
+          renderExportJobsStore.delete(id);
+          deletedCounts.renderExportJobs += 1;
+        }
+      }
+
+      userFavoritesStore.delete(uid);
+      userRecentStore.delete(uid);
+      userPreferencesStore.delete(uid);
+      userTelemetryOptInStore.delete(uid);
+      usersDirectoryStore.delete(uid);
+
+      persistState();
+
+      recordAudit(
+        uid,
+        authReq.authIdentity!.email,
+        'ACCOUNT_DATA_DELETED',
+        uid,
+        `Purged all user-scoped records and encrypted vault keys for uid=${uid}`,
+        authReq.requestId,
+        'user',
+        'success'
+      );
+
+      return sendOk(res, authReq.requestId, {
+        deletedUid: uid,
+        deletedAt: new Date().toISOString(),
+        deletedCounts,
+        secretVaultPurged: true,
+      });
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to delete account data.'
+      );
     }
-
-    userFavoritesStore.delete(uid);
-    userRecentStore.delete(uid);
-    userPreferencesStore.delete(uid);
-    userTelemetryOptInStore.delete(uid);
-    usersDirectoryStore.delete(uid);
-
-    persistState();
-
-    recordAudit(
-      uid,
-      authReq.authIdentity!.email,
-      'ACCOUNT_DATA_DELETED',
-      uid,
-      `Purged all user-scoped records and encrypted vault keys for uid=${uid}`,
-      authReq.requestId,
-      'user',
-      'success'
-    );
-
-    return sendOk(res, authReq.requestId, {
-      deletedUid: uid,
-      deletedAt: new Date().toISOString(),
-      deletedCounts,
-      secretVaultPurged: true,
-    });
   });
 
   // Template Variants (`Your edits` base-vs-instance persistence, strictly non-mutating on base template)
-  app.get('/api/v1/template-variants', requireAuth, (req: Request, res: Response) => {
+  app.get('/api/v1/template-variants', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const uid = authReq.authIdentity!.uid;
     const baseTemplateId =
@@ -2146,22 +2483,30 @@ export function createApiApp(options: ApiAppOptions = {}) {
       );
     }
 
-    const owned = Array.from(templateVariantsStore.values())
-      .filter((v) => {
-        if (v.ownerUid !== uid) return false;
-        if (baseTemplateId && v.baseTemplateId !== baseTemplateId) return false;
-        if (moduleId && v.moduleId !== moduleId) return false;
-        return true;
-      })
-      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    try {
+      const ownedAll = await listAuthoritativeVariantsByOwner(uid, baseTemplateId);
+      const owned = ownedAll
+        .filter((v) => {
+          if (moduleId && v.moduleId !== moduleId) return false;
+          return true;
+        })
+        .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 
-    return sendOk(res, authReq.requestId, {
-      items: owned,
-      total: owned.length,
-    });
+      return sendOk(res, authReq.requestId, {
+        items: owned,
+        total: owned.length,
+      });
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to list template variants.'
+      );
+    }
   });
 
-  app.post('/api/v1/template-variants', requireAuth, (req: Request, res: Response) => {
+  app.post('/api/v1/template-variants', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const uid = authReq.authIdentity!.uid;
 
@@ -2177,7 +2522,17 @@ export function createApiApp(options: ApiAppOptions = {}) {
       );
     }
 
-    const baseTemplate = catalogStore.get(parsed.data.baseTemplateId);
+    let baseTemplate: CatalogItem | null = null;
+    try {
+      baseTemplate = await getAuthoritativeCatalogItem(parsed.data.baseTemplateId);
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to load base template.'
+      );
+    }
     if (
       !baseTemplate ||
       !isCatalogItemVisibleToViewer(
@@ -2262,7 +2617,16 @@ export function createApiApp(options: ApiAppOptions = {}) {
       updatedAt: now,
     };
 
-    templateVariantsStore.set(variant.id, variant);
+    try {
+      await saveAuthoritativeVariant(variant);
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to save template variant.'
+      );
+    }
 
     for (const assetId of Object.values(assetOverrides)) {
       const asset = assetsStore.get(assetId);
@@ -2296,14 +2660,41 @@ export function createApiApp(options: ApiAppOptions = {}) {
     );
   });
 
-  app.get('/api/v1/template-variants/:id', requireAuth, (req: Request, res: Response) => {
+  app.get('/api/v1/template-variants/:id', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const uid = authReq.authIdentity!.uid;
-    const variant = templateVariantsStore.get(req.params.id);
+    const isAdmin = authReq.userRole === 'admin' || authReq.userRole === 'owner';
+
+    const inMem = templateVariantsStore.get(req.params.id);
+    if (inMem) {
+      await ensureMemoryVariantSeededInAdapter(inMem);
+    }
+    let variant: TemplateVariantInstance | null = null;
+    try {
+      variant = await activePersistenceAdapter.catalogAndVariants.getVariantById(
+        req.params.id,
+        isAdmin && inMem ? inMem.ownerUid : uid
+      );
+    } catch (err) {
+      if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+        return sendError(
+          res,
+          authReq.requestId,
+          403,
+          'CROSS_USER_ACCESS_FORBIDDEN',
+          'You do not have permission to access another user’s private template variant.'
+        );
+      }
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to read template variant.'
+      );
+    }
     if (!variant) {
       return sendError(res, authReq.requestId, 404, 'NOT_FOUND', 'Template variant not found.');
     }
-    const isAdmin = authReq.userRole === 'admin' || authReq.userRole === 'owner';
     if (variant.ownerUid !== uid && variant.visibility === 'private' && !isAdmin) {
       return sendError(
         res,
@@ -2313,7 +2704,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
         'You do not have permission to access another user’s private template variant.'
       );
     }
-    const baseTemplate = catalogStore.get(variant.baseTemplateId);
+    const baseTemplate = await getAuthoritativeCatalogItem(variant.baseTemplateId);
     const resolvedPreview = baseTemplate
       ? applyVariantOverridesToTemplate(baseTemplate, variant)
       : null;
@@ -2325,10 +2716,36 @@ export function createApiApp(options: ApiAppOptions = {}) {
     });
   });
 
-  app.patch('/api/v1/template-variants/:id', requireAuth, (req: Request, res: Response) => {
+  app.patch('/api/v1/template-variants/:id', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const uid = authReq.authIdentity!.uid;
-    const existing = templateVariantsStore.get(req.params.id);
+    const inMem = templateVariantsStore.get(req.params.id);
+    if (inMem) {
+      await ensureMemoryVariantSeededInAdapter(inMem);
+    }
+    let existing: TemplateVariantInstance | null = null;
+    try {
+      existing = await activePersistenceAdapter.catalogAndVariants.getVariantById(
+        req.params.id,
+        uid
+      );
+    } catch (err) {
+      if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+        return sendError(
+          res,
+          authReq.requestId,
+          403,
+          'CROSS_USER_ACCESS_FORBIDDEN',
+          'You do not have permission to modify another user’s template variant.'
+        );
+      }
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to load template variant.'
+      );
+    }
     if (!existing) {
       return sendError(res, authReq.requestId, 404, 'NOT_FOUND', 'Template variant not found.');
     }
@@ -2392,10 +2809,18 @@ export function createApiApp(options: ApiAppOptions = {}) {
       updatedAt: new Date().toISOString(),
     };
 
-    templateVariantsStore.set(updated.id, updated);
-    persistState();
+    try {
+      await saveAuthoritativeVariant(updated);
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to update template variant.'
+      );
+    }
 
-    const baseTemplate = catalogStore.get(updated.baseTemplateId);
+    const baseTemplate = await getAuthoritativeCatalogItem(updated.baseTemplateId);
     const resolvedPreview = baseTemplate
       ? applyVariantOverridesToTemplate(baseTemplate, updated)
       : null;
@@ -2407,33 +2832,50 @@ export function createApiApp(options: ApiAppOptions = {}) {
     });
   });
 
-  app.delete('/api/v1/template-variants/:id', requireAuth, (req: Request, res: Response) => {
+  app.delete('/api/v1/template-variants/:id', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const uid = authReq.authIdentity!.uid;
-    const existing = templateVariantsStore.get(req.params.id);
-    if (!existing) {
-      return sendError(res, authReq.requestId, 404, 'NOT_FOUND', 'Template variant not found.');
-    }
-    if (existing.ownerUid !== uid) {
-      return sendError(
+    try {
+      const removed = await deleteAuthoritativeVariant(req.params.id, uid);
+      if (!removed) {
+        return sendError(res, authReq.requestId, 404, 'NOT_FOUND', 'Template variant not found.');
+      }
+      return sendOk(res, authReq.requestId, { deletedId: req.params.id });
+    } catch (err) {
+      if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+        return sendError(
+          res,
+          authReq.requestId,
+          403,
+          'CROSS_USER_ACCESS_FORBIDDEN',
+          'You do not have permission to delete another user’s template variant.'
+        );
+      }
+      return sendPersistenceError(
         res,
         authReq.requestId,
-        403,
-        'CROSS_USER_ACCESS_FORBIDDEN',
-        'You do not have permission to delete another user’s template variant.'
+        err,
+        'Unable to delete template variant.'
       );
     }
-    templateVariantsStore.delete(existing.id);
-    persistState();
-    return sendOk(res, authReq.requestId, { deletedId: existing.id });
   });
 
   // Explicit `Fork template` operation — creates a standalone user-owned template without mutating the source
-  app.post('/api/v1/catalog/:id/fork', requireAuth, (req: Request, res: Response) => {
+  app.post('/api/v1/catalog/:id/fork', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const uid = authReq.authIdentity!.uid;
     const isAdmin = authReq.userRole === 'admin' || authReq.userRole === 'owner';
-    const baseTemplate = catalogStore.get(req.params.id);
+    let baseTemplate: CatalogItem | null = null;
+    try {
+      baseTemplate = await getAuthoritativeCatalogItem(req.params.id);
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to load source template.'
+      );
+    }
     if (!baseTemplate || !isCatalogItemVisibleToViewer(baseTemplate, uid, isAdmin)) {
       return sendError(res, authReq.requestId, 404, 'NOT_FOUND', 'Source template not found.');
     }
@@ -2516,9 +2958,16 @@ export function createApiApp(options: ApiAppOptions = {}) {
       licenseNote: parsed.data.licenseNote,
     });
 
-    catalogStore.set(forked.id, forked);
-    catalogCacheVersion += 1;
-    persistState();
+    try {
+      await saveAuthoritativeCatalogItem(forked);
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to persist forked template.'
+      );
+    }
 
     recordAudit(
       uid,
@@ -2545,11 +2994,21 @@ export function createApiApp(options: ApiAppOptions = {}) {
   });
 
   // Recorded Template Validation Runner (`Validated` state requires a real validation test run)
-  app.post('/api/v1/catalog/:id/validate', requireAuth, (req: Request, res: Response) => {
+  app.post('/api/v1/catalog/:id/validate', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const uid = authReq.authIdentity!.uid;
     const isAdmin = authReq.userRole === 'admin' || authReq.userRole === 'owner';
-    const existing = catalogStore.get(req.params.id);
+    let existing: CatalogItem | null = null;
+    try {
+      existing = await getAuthoritativeCatalogItem(req.params.id);
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to load catalog item for validation.'
+      );
+    }
     if (!existing) {
       return sendError(res, authReq.requestId, 404, 'NOT_FOUND', 'Catalog item not found.');
     }
@@ -2581,9 +3040,17 @@ export function createApiApp(options: ApiAppOptions = {}) {
       lastValidationRecord: evidence,
       updatedAt: new Date().toISOString(),
     };
-    catalogStore.set(updated.id, updated);
-    catalogCacheVersion += 1;
-    persistState();
+
+    try {
+      await saveAuthoritativeCatalogItem(updated);
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to persist validated catalog item.'
+      );
+    }
 
     recordAudit(
       uid,
@@ -3050,7 +3517,11 @@ export function createApiApp(options: ApiAppOptions = {}) {
   } {
     const existingStore = canonicalProjectStores.get(proj.id);
     if (existingStore) {
-      return { store: existingStore, migrated: false, warnings: [] };
+      const currentCanon = existingStore.getProject();
+      const targetRev = proj.revision || 1;
+      if (currentCanon.revision === targetRev && currentCanon.title === proj.title) {
+        return { store: existingStore, migrated: false, warnings: [] };
+      }
     }
 
     let migResult: ReturnType<typeof migrateToCanonicalProject>;
@@ -3071,6 +3542,9 @@ export function createApiApp(options: ApiAppOptions = {}) {
     migResult.project.id = proj.id;
     migResult.project.ownerUid = proj.ownerUid || migResult.project.ownerUid;
     migResult.project.title = proj.title || migResult.project.title;
+    if (typeof proj.revision === 'number' && proj.revision >= 1) {
+      migResult.project.revision = proj.revision;
+    }
 
     const store = new CanonicalProjectStore(migResult.project);
     canonicalProjectStores.set(proj.id, store);
@@ -3081,8 +3555,957 @@ export function createApiApp(options: ApiAppOptions = {}) {
     };
   }
 
-  // Projects (Strictly Owner-Scoped)
-  app.get('/api/v1/projects', requireAuth, (req: Request, res: Response) => {
+  function sendPersistenceError(
+    res: Response,
+    requestId: string,
+    err: unknown,
+    fallbackMessage: string
+  ) {
+    if (err instanceof PersistenceContractError) {
+      return sendError(
+        res,
+        requestId,
+        err.statusCode,
+        err.code,
+        err.message,
+        {
+          entity: err.entity,
+          operation: err.operation,
+          documentId: err.documentId,
+        }
+      );
+    }
+    return sendError(
+      res,
+      requestId,
+      400,
+      'PERSISTENCE_OPERATION_FAILED',
+      err instanceof Error ? err.message : fallbackMessage
+    );
+  }
+
+  async function ensureMemoryProjectSeededInAdapter(proj: ProjectLibraryItem): Promise<void> {
+    try {
+      const existing = await activePersistenceAdapter.projects.getById(
+        proj.id,
+        proj.ownerUid || 'user-local',
+        true
+      );
+      if (!existing) {
+        await activePersistenceAdapter.projects.create({
+          ...proj,
+          ownerUid: proj.ownerUid || 'user-local',
+        });
+      }
+    } catch {
+      // Ignore if already exists
+    }
+  }
+
+  async function getAuthoritativeProject(
+    id: string,
+    requesterUid: string,
+    isAdmin = false
+  ): Promise<ProjectLibraryItem | null> {
+    const inMem = projectsStore.get(id);
+    if (inMem) {
+      await ensureMemoryProjectSeededInAdapter(inMem);
+    }
+    const found = await activePersistenceAdapter.projects.getById(id, requesterUid, isAdmin);
+    if (found) {
+      projectsStore.set(found.id, found);
+      getOrInitCanonicalStore(found);
+    }
+    return found;
+  }
+
+  async function listAuthoritativeProjects(ownerUid: string): Promise<ProjectLibraryItem[]> {
+    for (const proj of projectsStore.values()) {
+      if (proj.ownerUid === ownerUid) {
+        await ensureMemoryProjectSeededInAdapter(proj);
+      }
+    }
+    const owned = await activePersistenceAdapter.projects.listByOwner(ownerUid);
+    for (const p of owned) {
+      projectsStore.set(p.id, p);
+    }
+    return owned.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
+  }
+
+  async function saveAuthoritativeNewProject(
+    record: ProjectLibraryItem
+  ): Promise<ProjectLibraryItem> {
+    const created = await activePersistenceAdapter.projects.create(record);
+    projectsStore.set(created.id, created);
+    getOrInitCanonicalStore(created);
+    persistState();
+    return created;
+  }
+
+  async function updateAuthoritativeProject(
+    id: string,
+    requesterUid: string,
+    patch: Partial<ProjectLibraryItem>,
+    updateOptions?: { expectedRevision?: number; isAdmin?: boolean }
+  ): Promise<ProjectLibraryItem> {
+    const inMem = projectsStore.get(id);
+    if (inMem) {
+      await ensureMemoryProjectSeededInAdapter(inMem);
+    }
+    const { createdAt: _ignoredCreatedAt, ...safePatch } = patch;
+    const updated = await activePersistenceAdapter.projects.update(
+      id,
+      requesterUid,
+      safePatch,
+      updateOptions
+    );
+    projectsStore.set(updated.id, updated);
+    getOrInitCanonicalStore(updated);
+    persistState();
+    return updated;
+  }
+
+  async function deleteAuthoritativeProject(
+    id: string,
+    requesterUid: string,
+    isAdmin = false
+  ): Promise<boolean> {
+    const inMem = projectsStore.get(id);
+    if (inMem) {
+      await ensureMemoryProjectSeededInAdapter(inMem);
+    }
+    const removed = await activePersistenceAdapter.projects.delete(id, requesterUid, isAdmin);
+    projectsStore.delete(id);
+    canonicalProjectStores.delete(id);
+    persistState();
+    return removed;
+  }
+
+  // --- Phase 2C Authoritative Helpers: Catalog, Variants, Reference Lab, AI Director & Template Factory ---
+
+  async function ensureMemoryCatalogItemSeededInAdapter(item: CatalogItem): Promise<void> {
+    try {
+      const existing = await activePersistenceAdapter.catalogAndVariants.getCatalogItemById(item.id);
+      if (!existing) {
+        await activePersistenceAdapter.catalogAndVariants.saveCatalogItem(item);
+      }
+    } catch {
+      // Ignore if already exists
+    }
+  }
+
+  async function getAuthoritativeCatalogItem(id: string): Promise<CatalogItem | null> {
+    const inMem = catalogStore.get(id);
+    if (inMem) {
+      await ensureMemoryCatalogItemSeededInAdapter(inMem);
+    }
+    const found = await activePersistenceAdapter.catalogAndVariants.getCatalogItemById(id);
+    if (found) {
+      catalogStore.set(found.id, found);
+    }
+    return found;
+  }
+
+  async function listAuthoritativeCatalogItems(): Promise<CatalogItem[]> {
+    for (const item of catalogStore.values()) {
+      await ensureMemoryCatalogItemSeededInAdapter(item);
+    }
+    const items = await activePersistenceAdapter.catalogAndVariants.listCatalogItems();
+    for (const item of items) {
+      catalogStore.set(item.id, item);
+    }
+    return items;
+  }
+
+  async function saveAuthoritativeCatalogItem(item: CatalogItem): Promise<CatalogItem> {
+    const saved = await activePersistenceAdapter.catalogAndVariants.saveCatalogItem(item);
+    catalogStore.set(saved.id, saved);
+    catalogCacheVersion += 1;
+    persistState();
+    return saved;
+  }
+
+  async function deleteAuthoritativeCatalogItem(id: string): Promise<boolean> {
+    const removed = await activePersistenceAdapter.catalogAndVariants.deleteCatalogItem(id);
+    catalogStore.delete(id);
+    catalogCacheVersion += 1;
+    persistState();
+    return removed;
+  }
+
+  async function ensureMemoryVariantSeededInAdapter(variant: TemplateVariantInstance): Promise<void> {
+    try {
+      const existing = await activePersistenceAdapter.catalogAndVariants.getVariantById(
+        variant.id,
+        variant.ownerUid
+      );
+      if (!existing) {
+        await activePersistenceAdapter.catalogAndVariants.saveVariant(variant);
+      }
+    } catch {
+      // Ignore if already exists
+    }
+  }
+
+  async function listAuthoritativeVariantsByOwner(
+    ownerUid: string,
+    baseTemplateId?: string
+  ): Promise<TemplateVariantInstance[]> {
+    for (const v of templateVariantsStore.values()) {
+      if (v.ownerUid === ownerUid) {
+        await ensureMemoryVariantSeededInAdapter(v);
+      }
+    }
+    const list = await activePersistenceAdapter.catalogAndVariants.listVariantsByOwner(
+      ownerUid,
+      baseTemplateId
+    );
+    for (const v of list) {
+      templateVariantsStore.set(v.id, v);
+    }
+    return list.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
+  }
+
+  async function saveAuthoritativeVariant(
+    variant: TemplateVariantInstance
+  ): Promise<TemplateVariantInstance> {
+    const saved = await activePersistenceAdapter.catalogAndVariants.saveVariant(variant);
+    templateVariantsStore.set(saved.id, saved);
+    persistState();
+    return saved;
+  }
+
+  async function deleteAuthoritativeVariant(
+    id: string,
+    requesterUid: string
+  ): Promise<boolean> {
+    const inMem = templateVariantsStore.get(id);
+    if (inMem) {
+      await ensureMemoryVariantSeededInAdapter(inMem);
+    }
+    const removed = await activePersistenceAdapter.catalogAndVariants.deleteVariant(
+      id,
+      requesterUid
+    );
+    templateVariantsStore.delete(id);
+    persistState();
+    return removed;
+  }
+
+  async function ensureMemoryReferenceLabSessionSeededInAdapter(
+    session: ReferenceLabSession
+  ): Promise<void> {
+    try {
+      const existing = await activePersistenceAdapter.referenceLabSessions.getById(
+        session.id,
+        session.ownerUid,
+        true
+      );
+      if (!existing) {
+        await activePersistenceAdapter.referenceLabSessions.save(session);
+      }
+    } catch {
+      // Ignore if already exists
+    }
+  }
+
+  async function getAuthoritativeReferenceLabSession(
+    id: string,
+    requesterUid: string,
+    isAdmin = false
+  ): Promise<ReferenceLabSession | null> {
+    const inMem = referenceLabSessionsStore.get(id);
+    if (inMem) {
+      await ensureMemoryReferenceLabSessionSeededInAdapter(inMem);
+    }
+    const found = await activePersistenceAdapter.referenceLabSessions.getById(
+      id,
+      requesterUid,
+      isAdmin
+    );
+    if (found) {
+      referenceLabSessionsStore.set(found.id, found);
+    }
+    return found;
+  }
+
+  async function listAuthoritativeReferenceLabSessions(
+    ownerUid: string,
+    includeAllForAdmin = false
+  ): Promise<ReferenceLabSession[]> {
+    for (const sess of referenceLabSessionsStore.values()) {
+      if (includeAllForAdmin || sess.ownerUid === ownerUid) {
+        await ensureMemoryReferenceLabSessionSeededInAdapter(sess);
+      }
+    }
+    const owned = await activePersistenceAdapter.referenceLabSessions.listByOwner(ownerUid);
+    for (const s of owned) {
+      referenceLabSessionsStore.set(s.id, s);
+    }
+    if (includeAllForAdmin) {
+      return Array.from(referenceLabSessionsStore.values()).sort((a, b) =>
+        (b.updatedAt || '').localeCompare(a.updatedAt || '')
+      );
+    }
+    return owned.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
+  }
+
+  async function saveAuthoritativeReferenceLabSession(
+    session: ReferenceLabSession
+  ): Promise<ReferenceLabSession> {
+    const saved = await activePersistenceAdapter.referenceLabSessions.save(session);
+    referenceLabSessionsStore.set(saved.id, saved);
+    persistState();
+    return saved;
+  }
+
+  async function deleteAuthoritativeReferenceLabSession(
+    id: string,
+    requesterUid: string
+  ): Promise<boolean> {
+    const inMem = referenceLabSessionsStore.get(id);
+    if (inMem) {
+      await ensureMemoryReferenceLabSessionSeededInAdapter(inMem);
+    }
+    const removed = await activePersistenceAdapter.referenceLabSessions.delete(id, requesterUid);
+    referenceLabSessionsStore.delete(id);
+    persistState();
+    return removed;
+  }
+
+  async function ensureMemoryAiDirectorSessionSeededInAdapter(
+    session: AiDirectorSessionRecord
+  ): Promise<void> {
+    try {
+      const existing = await activePersistenceAdapter.aiDirectorSessions.getById(
+        session.id,
+        session.ownerUid,
+        true
+      );
+      if (!existing) {
+        await activePersistenceAdapter.aiDirectorSessions.save(session);
+      }
+    } catch {
+      // Ignore if already exists
+    }
+  }
+
+  async function getAuthoritativeAiDirectorSession(
+    id: string,
+    requesterUid: string,
+    isAdmin = false
+  ): Promise<AiDirectorSessionRecord | null> {
+    const inMem = aiDirectorSessionsStore.get(id);
+    if (inMem) {
+      await ensureMemoryAiDirectorSessionSeededInAdapter(inMem);
+    }
+    const found = await activePersistenceAdapter.aiDirectorSessions.getById(
+      id,
+      requesterUid,
+      isAdmin
+    );
+    if (found) {
+      aiDirectorSessionsStore.set(found.id, found);
+    }
+    return found;
+  }
+
+  async function listAuthoritativeAiDirectorSessions(
+    ownerUid: string,
+    includeAllForAdmin = false
+  ): Promise<AiDirectorSessionRecord[]> {
+    for (const sess of aiDirectorSessionsStore.values()) {
+      if (includeAllForAdmin || sess.ownerUid === ownerUid) {
+        await ensureMemoryAiDirectorSessionSeededInAdapter(sess);
+      }
+    }
+    const owned = await activePersistenceAdapter.aiDirectorSessions.listByOwner(ownerUid);
+    for (const s of owned) {
+      aiDirectorSessionsStore.set(s.id, s);
+    }
+    if (includeAllForAdmin) {
+      return Array.from(aiDirectorSessionsStore.values()).sort((a, b) =>
+        (b.updatedAt || '').localeCompare(a.updatedAt || '')
+      );
+    }
+    return owned.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
+  }
+
+  async function saveAuthoritativeAiDirectorSession(
+    session: AiDirectorSessionRecord
+  ): Promise<AiDirectorSessionRecord> {
+    const saved = await activePersistenceAdapter.aiDirectorSessions.save(session);
+    aiDirectorSessionsStore.set(saved.id, saved);
+    persistState();
+    return saved;
+  }
+
+  async function deleteAuthoritativeAiDirectorSession(
+    id: string,
+    requesterUid: string
+  ): Promise<boolean> {
+    const inMem = aiDirectorSessionsStore.get(id);
+    if (inMem) {
+      await ensureMemoryAiDirectorSessionSeededInAdapter(inMem);
+    }
+    const removed = await activePersistenceAdapter.aiDirectorSessions.delete(id, requesterUid);
+    aiDirectorSessionsStore.delete(id);
+    persistState();
+    return removed;
+  }
+
+  async function ensureMemoryTemplateFactoryDraftSeededInAdapter(
+    draft: TemplateFactoryDraftRecord
+  ): Promise<void> {
+    try {
+      const existing = await activePersistenceAdapter.templateFactoryDrafts.getById(
+        draft.id,
+        draft.ownerUid,
+        true
+      );
+      if (!existing) {
+        await activePersistenceAdapter.templateFactoryDrafts.save(draft);
+      }
+    } catch {
+      // Ignore if already exists
+    }
+  }
+
+  async function getAuthoritativeTemplateFactoryDraft(
+    id: string,
+    requesterUid: string,
+    isAdmin = false
+  ): Promise<TemplateFactoryDraftRecord | null> {
+    const inMem = templateFactoryDraftsStore.get(id);
+    if (inMem) {
+      await ensureMemoryTemplateFactoryDraftSeededInAdapter(inMem);
+    }
+    const found = await activePersistenceAdapter.templateFactoryDrafts.getById(
+      id,
+      requesterUid,
+      isAdmin
+    );
+    if (found) {
+      templateFactoryDraftsStore.set(found.id, found);
+    }
+    return found;
+  }
+
+  async function listAuthoritativeTemplateFactoryDrafts(
+    ownerUid: string
+  ): Promise<TemplateFactoryDraftRecord[]> {
+    for (const draft of templateFactoryDraftsStore.values()) {
+      if (draft.ownerUid === ownerUid) {
+        await ensureMemoryTemplateFactoryDraftSeededInAdapter(draft);
+      }
+    }
+    const owned = await activePersistenceAdapter.templateFactoryDrafts.listByOwner(ownerUid);
+    for (const d of owned) {
+      templateFactoryDraftsStore.set(d.id, d);
+    }
+    return owned.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
+  }
+
+  async function saveAuthoritativeTemplateFactoryDraft(
+    draft: TemplateFactoryDraftRecord
+  ): Promise<TemplateFactoryDraftRecord> {
+    const saved = await activePersistenceAdapter.templateFactoryDrafts.save(draft);
+    templateFactoryDraftsStore.set(saved.id, saved);
+    persistState();
+    return saved;
+  }
+
+  async function publishAuthoritativeTemplateFactoryDraft(
+    draft: TemplateFactoryDraftRecord,
+    catalogItem: CatalogItem
+  ): Promise<{
+    draft: TemplateFactoryDraftRecord;
+    catalogItem: CatalogItem;
+    idempotentNoOp: boolean;
+  }> {
+    const inMem = templateFactoryDraftsStore.get(draft.id);
+    if (inMem) {
+      await ensureMemoryTemplateFactoryDraftSeededInAdapter(inMem);
+    }
+    const inMemCat = catalogStore.get(catalogItem.id);
+    if (inMemCat) {
+      await ensureMemoryCatalogItemSeededInAdapter(inMemCat);
+    }
+    const result = await activePersistenceAdapter.templateFactoryDrafts.publishDraftToCatalog(
+      draft,
+      catalogItem
+    );
+    templateFactoryDraftsStore.set(result.draft.id, result.draft);
+    catalogStore.set(result.catalogItem.id, result.catalogItem);
+    if (!result.idempotentNoOp) {
+      catalogCacheVersion += 1;
+    }
+    persistState();
+    return result;
+  }
+
+  async function deleteAuthoritativeTemplateFactoryDraft(
+    id: string,
+    requesterUid: string
+  ): Promise<boolean> {
+    const inMem = templateFactoryDraftsStore.get(id);
+    if (inMem) {
+      await ensureMemoryTemplateFactoryDraftSeededInAdapter(inMem);
+    }
+    const removed = await activePersistenceAdapter.templateFactoryDrafts.delete(id, requesterUid);
+    templateFactoryDraftsStore.delete(id);
+    persistState();
+    return removed;
+  }
+
+  async function getOrInitAuthoritativeUserPreferenceConsent(
+    uid: string
+  ): Promise<UserPreferenceConsentConfig> {
+    const fromAdapter = await activePersistenceAdapter.templateFactoryDrafts.getPreferenceConsent(
+      uid
+    );
+    if (fromAdapter) {
+      userPreferenceConsentsStore.set(uid, fromAdapter);
+      return fromAdapter;
+    }
+    const inMem = userPreferenceConsentsStore.get(uid);
+    if (inMem) {
+      await activePersistenceAdapter.templateFactoryDrafts.savePreferenceConsent(inMem);
+      return inMem;
+    }
+    const def = createDefaultPreferenceConsent(uid);
+    await activePersistenceAdapter.templateFactoryDrafts.savePreferenceConsent(def);
+    userPreferenceConsentsStore.set(uid, def);
+    persistState();
+    return def;
+  }
+
+  async function saveAuthoritativeUserPreferenceConsent(
+    consent: UserPreferenceConsentConfig
+  ): Promise<UserPreferenceConsentConfig> {
+    const saved = await activePersistenceAdapter.templateFactoryDrafts.savePreferenceConsent(
+      consent
+    );
+    userPreferenceConsentsStore.set(saved.ownerUid, saved);
+    persistState();
+    return saved;
+  }
+
+  async function listAuthoritativePreferenceSignals(
+    uid: string
+  ): Promise<TemplatePreferenceSignal[]> {
+    const fromAdapter = await activePersistenceAdapter.templateFactoryDrafts.listPreferenceSignals(
+      uid
+    );
+    if (fromAdapter.length > 0) {
+      return fromAdapter;
+    }
+    const inMem = templatePreferenceSignalsStore.filter((s) => s.ownerUid === uid);
+    if (inMem.length > 0) {
+      await activePersistenceAdapter.templateFactoryDrafts.savePreferenceSignals(uid, inMem);
+    }
+    return inMem;
+  }
+
+  async function saveAuthoritativePreferenceSignals(
+    uid: string,
+    allSignals: TemplatePreferenceSignal[]
+  ): Promise<TemplatePreferenceSignal[]> {
+    const userSignals = allSignals.filter((s) => s.ownerUid === uid);
+    await activePersistenceAdapter.templateFactoryDrafts.savePreferenceSignals(uid, userSignals);
+    templatePreferenceSignalsStore.splice(
+      0,
+      templatePreferenceSignalsStore.length,
+      ...allSignals
+    );
+    persistState();
+    return userSignals;
+  }
+
+  // --- PHASE 2D: AUTHORITATIVE PROVIDER CONNECTIONS, VAULT, EXTENSIONS & RENDER JOBS HELPERS ---
+
+  async function ensureMemoryProviderConnectionSeededInAdapter(
+    conn: ProviderConnectionRecord
+  ): Promise<void> {
+    try {
+      const existing = await activePersistenceAdapter.providerConnections.getMetadataById(
+        conn.id,
+        conn.ownerUid,
+        true
+      );
+      if (!existing) {
+        await activePersistenceAdapter.providerConnections.saveMetadata(conn);
+      }
+    } catch {
+      // Ignore if already seeded
+    }
+  }
+
+  async function hydrateAndInspectProviderConnection(
+    dto: Omit<ProviderConnectionRecord, 'encryptedCredential'>,
+    ownerUid: string
+  ): Promise<ProviderConnectionRecord> {
+    let encryptedCredential = undefined;
+    try {
+      const vaultRec = await activePersistenceAdapter.credentialVault.getVaultSecret(
+        dto.id,
+        ownerUid
+      );
+      if (vaultRec?.encryptedCredential) {
+        encryptedCredential = vaultRec.encryptedCredential;
+      }
+    } catch {
+      // If vault lookup fails, inspectPersistedConnectionVaultHealth handles status
+    }
+
+    const fullRecord: ProviderConnectionRecord = {
+      ...dto,
+      encryptedCredential: encryptedCredential ?? null,
+    };
+
+    const inspected = inspectPersistedConnectionVaultHealth(fullRecord);
+    if (
+      inspected.credentialStatus !== dto.credentialStatus ||
+      inspected.lastTestStatus !== dto.lastTestStatus
+    ) {
+      // Persist updated health metadata (e.g. requires-reentry) while keeping ciphertext intact in vault
+      await activePersistenceAdapter.providerConnections.saveMetadata(inspected);
+    }
+    providerConnectionsStore.set(inspected.id, inspected);
+    return inspected;
+  }
+
+  async function getAuthoritativeProviderConnection(
+    id: string,
+    requesterUid: string,
+    isAdmin = false
+  ): Promise<ProviderConnectionRecord | null> {
+    const inMem = providerConnectionsStore.get(id);
+    if (inMem) {
+      await ensureMemoryProviderConnectionSeededInAdapter(inMem);
+    }
+    const dto = await activePersistenceAdapter.providerConnections.getMetadataById(
+      id,
+      requesterUid,
+      isAdmin
+    );
+    if (!dto) return null;
+    return hydrateAndInspectProviderConnection(dto, dto.ownerUid);
+  }
+
+  async function saveAuthoritativeProviderConnection(
+    conn: ProviderConnectionRecord
+  ): Promise<ProviderConnectionRecord> {
+    await activePersistenceAdapter.providerConnections.saveMetadata(conn);
+    if (!conn.encryptedCredential && conn.credentialStatus === 'revoked') {
+      await activePersistenceAdapter.credentialVault
+        .deleteVaultSecret(conn.id, conn.ownerUid)
+        .catch(() => {});
+    }
+    providerConnectionsStore.set(conn.id, conn);
+    persistState();
+    return conn;
+  }
+
+  async function deleteAuthoritativeProviderConnection(
+    id: string,
+    requesterUid: string
+  ): Promise<boolean> {
+    const inMem = providerConnectionsStore.get(id);
+    if (inMem) {
+      await ensureMemoryProviderConnectionSeededInAdapter(inMem);
+    }
+    const removed = await activePersistenceAdapter.providerConnections.deleteMetadata(
+      id,
+      requesterUid
+    );
+    providerConnectionsStore.delete(id);
+    persistState();
+    return removed;
+  }
+
+  async function getOrSeedAuthoritativeUserProviderConnections(
+    uid: string
+  ): Promise<ProviderConnectionRecord[]> {
+    for (const c of providerConnectionsStore.values()) {
+      if (c.ownerUid === uid) {
+        await ensureMemoryProviderConnectionSeededInAdapter(c);
+      }
+    }
+    const dtos = await activePersistenceAdapter.providerConnections.listMetadataByOwner(uid);
+    if (dtos.length > 0) {
+      const hydrated: ProviderConnectionRecord[] = [];
+      for (const dto of dtos) {
+        hydrated.push(await hydrateAndInspectProviderConnection(dto, uid));
+      }
+      return hydrated.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    }
+
+    // Seed 2 starter prepopulated connections (Argon & Flash) with capabilities strictly in 'Not tested' state
+    const argonConn = createProviderConnectionRecord({
+      ownerUid: uid,
+      label: 'Gemini 4 Argon (Architecture & Director)',
+      providerBrand: 'Google Gemini',
+      protocol: 'google-gemini',
+      baseUrl: 'https://generativelanguage.googleapis.com',
+      endpointSettings: {
+        apiPath: '/v1beta/models/gemini-4-argon:generateContent',
+        thinkingLevel: 'HIGH',
+      },
+      modelId: 'gemini-4-argon',
+      authMode: 'server-env',
+      storageMode: 'server-encrypted-vault',
+      allowedTaskTypes: ['script-analysis', 'planning', 'code', 'vision', 'evaluation'],
+    });
+    const flashConn = createProviderConnectionRecord({
+      ownerUid: uid,
+      label: 'Gemini 3.8 Flash (Fast Routine & Tagging)',
+      providerBrand: 'Google Gemini',
+      protocol: 'google-gemini',
+      baseUrl: 'https://generativelanguage.googleapis.com',
+      endpointSettings: {
+        apiPath: '/v1beta/models/gemini-3.8-flash:generateContent',
+        thinkingLevel: 'LOW',
+      },
+      modelId: 'gemini-3.8-flash',
+      authMode: 'server-env',
+      storageMode: 'server-encrypted-vault',
+      allowedTaskTypes: ['routine-tasks', 'asset-research', 'script-analysis'],
+      fallbackConnectionId: argonConn.id,
+    });
+    await saveAuthoritativeProviderConnection(argonConn);
+    await saveAuthoritativeProviderConnection(flashConn);
+    return [argonConn, flashConn];
+  }
+
+  async function getOrInitAuthoritativeRoutingProfiles(
+    uid: string,
+    userConnections: ProviderConnectionRecord[]
+  ): Promise<Record<HubTaskType, TaskRoutingProfile>> {
+    const fromAdapter = await activePersistenceAdapter.routingAndExtensions.getRoutingProfiles(uid);
+    if (fromAdapter) {
+      routingProfilesStore.set(uid, fromAdapter);
+      return fromAdapter;
+    }
+    const inMem = routingProfilesStore.get(uid);
+    if (inMem) {
+      await activePersistenceAdapter.routingAndExtensions.saveRoutingProfiles(uid, inMem);
+      return inMem;
+    }
+    const defaults = buildDefaultRoutingProfiles(userConnections);
+    await activePersistenceAdapter.routingAndExtensions.saveRoutingProfiles(uid, defaults);
+    routingProfilesStore.set(uid, defaults);
+    persistState();
+    return defaults;
+  }
+
+  async function saveAuthoritativeRoutingProfiles(
+    uid: string,
+    profiles: Record<HubTaskType, TaskRoutingProfile>
+  ): Promise<Record<HubTaskType, TaskRoutingProfile>> {
+    const saved = await activePersistenceAdapter.routingAndExtensions.saveRoutingProfiles(
+      uid,
+      profiles
+    );
+    routingProfilesStore.set(uid, saved);
+    persistState();
+    return saved;
+  }
+
+  async function ensureMemoryExtensionSeededInAdapter(ext: ExtensionPackageRecord): Promise<void> {
+    try {
+      const owned = await activePersistenceAdapter.routingAndExtensions.listExtensionsByOwner(
+        ext.ownerUid
+      );
+      if (!owned.some((e) => e.id === ext.id)) {
+        await activePersistenceAdapter.routingAndExtensions.saveExtension(ext);
+      }
+    } catch {
+      // Ignore
+    }
+  }
+
+  async function listAuthoritativeExtensions(
+    ownerUid: string,
+    includeUninstalled = false
+  ): Promise<ExtensionPackageRecord[]> {
+    for (const ext of extensionPackagesStore.values()) {
+      if (ext.ownerUid === ownerUid) {
+        await ensureMemoryExtensionSeededInAdapter(ext);
+      }
+    }
+    const list = await activePersistenceAdapter.routingAndExtensions.listExtensionsByOwner(
+      ownerUid
+    );
+    for (const ext of list) {
+      extensionPackagesStore.set(ext.id, ext);
+    }
+    return list
+      .filter((e) => includeUninstalled || e.installState !== 'uninstalled')
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  async function getAuthoritativeExtension(
+    id: string,
+    requesterUid: string
+  ): Promise<ExtensionPackageRecord | null> {
+    const inMem = extensionPackagesStore.get(id);
+    if (inMem) {
+      await ensureMemoryExtensionSeededInAdapter(inMem);
+    }
+    const list = await activePersistenceAdapter.routingAndExtensions.listExtensionsByOwner(
+      requesterUid
+    );
+    const found = list.find((e) => e.id === id) || null;
+    if (found) {
+      extensionPackagesStore.set(found.id, found);
+      return found;
+    }
+    // Check if owned by someone else for 403 vs 404 distinction
+    if (inMem && inMem.ownerUid !== requesterUid) {
+      throw new PersistenceContractError({
+        code: 'CROSS_USER_ACCESS_FORBIDDEN',
+        message: `User "${requesterUid}" cannot access extension "${id}".`,
+        entity: 'extensionPackages',
+        operation: 'get',
+        documentId: id,
+      });
+    }
+    return null;
+  }
+
+  async function saveAuthoritativeExtension(
+    ext: ExtensionPackageRecord
+  ): Promise<ExtensionPackageRecord> {
+    const saved = await activePersistenceAdapter.routingAndExtensions.saveExtension(ext);
+    extensionPackagesStore.set(saved.id, saved);
+    persistState();
+    return saved;
+  }
+
+  async function deleteAuthoritativeExtension(
+    id: string,
+    requesterUid: string
+  ): Promise<boolean> {
+    const inMem = extensionPackagesStore.get(id);
+    if (inMem) {
+      await ensureMemoryExtensionSeededInAdapter(inMem);
+    }
+    const removed = await activePersistenceAdapter.routingAndExtensions.deleteExtension(
+      id,
+      requesterUid
+    );
+    extensionPackagesStore.delete(id);
+    persistState();
+    return removed;
+  }
+
+  async function appendAuthoritativeToolAudit(
+    record: ToolExecutionAuditRecord
+  ): Promise<ToolExecutionAuditRecord> {
+    const saved = await activePersistenceAdapter.routingAndExtensions.appendToolAudit(record);
+    toolAuditRecordsStore.unshift(saved);
+    persistState();
+    return saved;
+  }
+
+  async function listAuthoritativeToolAudits(
+    ownerUid: string
+  ): Promise<ToolExecutionAuditRecord[]> {
+    const fromAdapter = await activePersistenceAdapter.routingAndExtensions.listToolAuditsByOwner(
+      ownerUid
+    );
+    if (fromAdapter.length > 0) {
+      return fromAdapter.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    }
+    return toolAuditRecordsStore.filter((a) => a.ownerUid === ownerUid);
+  }
+
+  async function ensureMemoryRenderExportJobSeededInAdapter(
+    job: DurableRenderExportJobRecord
+  ): Promise<void> {
+    try {
+      const existing = await activePersistenceAdapter.renderExportJobs.getJobById(
+        job.id,
+        job.ownerUid,
+        true
+      );
+      if (!existing) {
+        await activePersistenceAdapter.renderExportJobs.saveJob(job, {
+          cloudStorageEnabled: storageEnabled,
+        });
+      }
+    } catch {
+      // Ignore
+    }
+  }
+
+  async function saveAuthoritativeRenderExportJob(
+    job: DurableRenderExportJobRecord
+  ): Promise<DurableRenderExportJobRecord> {
+    const saved = await activePersistenceAdapter.renderExportJobs.saveJob(job, {
+      cloudStorageEnabled: storageEnabled,
+    });
+    // Preserve in-process artifactBytesBase64 on the returned/cached object for immediate download
+    const merged: DurableRenderExportJobRecord = {
+      ...saved,
+      ...(job.artifactBytesBase64 ? { artifactBytesBase64: job.artifactBytesBase64 } : {}),
+    };
+    renderExportJobsStore.set(merged.id, merged);
+    persistState();
+    return merged;
+  }
+
+  async function getAuthoritativeRenderExportJob(
+    id: string,
+    requesterUid: string,
+    isAdmin = false
+  ): Promise<DurableRenderExportJobRecord | null> {
+    const inMem = renderExportJobsStore.get(id);
+    if (inMem) {
+      await ensureMemoryRenderExportJobSeededInAdapter(inMem);
+    }
+    const found = await activePersistenceAdapter.renderExportJobs.getJobById(
+      id,
+      requesterUid,
+      isAdmin
+    );
+    if (!found) return null;
+    const merged: DurableRenderExportJobRecord = {
+      ...found,
+      ...(inMem?.artifactBytesBase64 && !found.artifactBytesBase64
+        ? { artifactBytesBase64: inMem.artifactBytesBase64 }
+        : {}),
+    };
+    renderExportJobsStore.set(merged.id, merged);
+    return merged;
+  }
+
+  async function listAuthoritativeRenderExportJobs(
+    ownerUid: string
+  ): Promise<DurableRenderExportJobRecord[]> {
+    for (const j of renderExportJobsStore.values()) {
+      if (j.ownerUid === ownerUid) {
+        await ensureMemoryRenderExportJobSeededInAdapter(j);
+      }
+    }
+    const list = await activePersistenceAdapter.renderExportJobs.listJobsByOwner(ownerUid);
+    const mergedList = list.map((found) => {
+      const inMem = renderExportJobsStore.get(found.id);
+      const merged: DurableRenderExportJobRecord = {
+        ...found,
+        ...(inMem?.artifactBytesBase64 && !found.artifactBytesBase64
+          ? { artifactBytesBase64: inMem.artifactBytesBase64 }
+          : {}),
+      };
+      renderExportJobsStore.set(merged.id, merged);
+      return merged;
+    });
+    return mergedList.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  // Projects (Strictly Owner-Scoped via Authoritative Persistence Adapter)
+  app.get('/api/v1/projects', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const uid = authReq.authIdentity!.uid;
     const { limit, offset } = parsePagination(req);
@@ -3097,15 +4520,22 @@ export function createApiApp(options: ApiAppOptions = {}) {
       );
     }
 
-    const owned = Array.from(projectsStore.values())
-      .filter((p) => p.ownerUid === uid)
-      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-    return sendOk(res, authReq.requestId, {
-      items: owned.slice(offset, offset + limit),
-      total: owned.length,
-      limit,
-      offset,
-    });
+    try {
+      const owned = await listAuthoritativeProjects(uid);
+      return sendOk(res, authReq.requestId, {
+        items: owned.slice(offset, offset + limit),
+        total: owned.length,
+        limit,
+        offset,
+      });
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to list projects.'
+      );
+    }
   });
 
   app.get('/api/v1/projects/fixtures/canonical', requireAuth, (req: Request, res: Response) => {
@@ -3137,7 +4567,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
     }
   });
 
-  app.post('/api/v1/projects', requireAuth, (req: Request, res: Response) => {
+  app.post('/api/v1/projects', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const uid = authReq.authIdentity!.uid;
 
@@ -3182,7 +4612,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
     }
 
     const now = new Date().toISOString();
-    const projId = `proj_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+    let requestedId = parsed.data.id;
 
     let canonicalProjectJson = parsed.data.canonicalProjectJson;
     let revision = parsed.data.revision || 1;
@@ -3201,12 +4631,21 @@ export function createApiApp(options: ApiAppOptions = {}) {
             check.errors.join('; ')
           );
         }
+        if (
+          !requestedId &&
+          check.project.id &&
+          /^[a-zA-Z0-9_\-]{1,128}$/.test(check.project.id)
+        ) {
+          requestedId = check.project.id;
+        }
+        const projId =
+          requestedId || `proj_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
         check.project.id = projId;
         check.project.ownerUid = uid;
         canonicalProjectJson = serializeCanonicalProject(check.project);
         revision = check.project.revision;
         activeBranch = check.project.activeBranch;
-        canonicalProjectStores.set(projId, new CanonicalProjectStore(check.project));
+        requestedId = projId;
       } catch {
         return sendError(
           res,
@@ -3216,7 +4655,12 @@ export function createApiApp(options: ApiAppOptions = {}) {
           'canonicalProjectJson is not valid JSON.'
         );
       }
-    } else if (parsed.data.projectFileStatus === 'sowveil-native') {
+    }
+
+    const projId =
+      requestedId || `proj_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+
+    if (!canonicalProjectJson && parsed.data.projectFileStatus === 'sowveil-native') {
       const initDoc = parsed.data.sowveilSpecJson
         ? migrateToCanonicalProject(JSON.parse(parsed.data.sowveilSpecJson), uid).project
         : createMinimalCanonicalProject({
@@ -3233,61 +4677,81 @@ export function createApiApp(options: ApiAppOptions = {}) {
       canonicalProjectJson = serializeCanonicalProject(initDoc);
       revision = initDoc.revision;
       activeBranch = initDoc.activeBranch;
-      canonicalProjectStores.set(projId, new CanonicalProjectStore(initDoc));
-    }
-
-    const record: ProjectLibraryItem = {
-      id: projId,
-      ownerUid: uid,
-      ...parsed.data,
-      ...(canonicalProjectJson ? { canonicalProjectJson } : {}),
-      revision,
-      activeBranch,
-      createdAt: now,
-      updatedAt: now,
-    };
-    projectsStore.set(record.id, record);
-    persistState();
-    return sendOk(res, authReq.requestId, record, 201);
-  });
-
-  app.get('/api/v1/projects/:id', requireAuth, (req: Request, res: Response) => {
-    const authReq = req as AuthenticatedRequest;
-    const uid = authReq.authIdentity!.uid;
-    const proj = projectsStore.get(req.params.id);
-    if (!proj) {
-      return sendError(res, authReq.requestId, 404, 'NOT_FOUND', 'Project not found.');
-    }
-    if (proj.ownerUid !== uid && authReq.userRole === 'user') {
-      return sendError(
-        res,
-        authReq.requestId,
-        403,
-        'CROSS_USER_ACCESS_FORBIDDEN',
-        'You do not have permission to read another user’s project.'
-      );
-    }
-    return sendOk(res, authReq.requestId, proj);
-  });
-
-  app.get('/api/v1/projects/:id/canonical', requireAuth, (req: Request, res: Response) => {
-    const authReq = req as AuthenticatedRequest;
-    const uid = authReq.authIdentity!.uid;
-    const proj = projectsStore.get(req.params.id);
-    if (!proj) {
-      return sendError(res, authReq.requestId, 404, 'NOT_FOUND', 'Project not found.');
-    }
-    if (proj.ownerUid !== uid && authReq.userRole === 'user') {
-      return sendError(
-        res,
-        authReq.requestId,
-        403,
-        'CROSS_USER_ACCESS_FORBIDDEN',
-        'You do not have permission to inspect another user’s project.'
-      );
     }
 
     try {
+      const existing = await getAuthoritativeProject(projId, uid);
+      if (existing) {
+        const updated = await updateAuthoritativeProject(projId, uid, {
+          ...parsed.data,
+          id: projId,
+          ownerUid: uid,
+          ...(canonicalProjectJson ? { canonicalProjectJson } : {}),
+          revision: Math.max(revision, (existing.revision || 1) + 1),
+          activeBranch,
+          updatedAt: now,
+        });
+        return sendOk(res, authReq.requestId, updated, 200);
+      }
+
+      const record: ProjectLibraryItem = {
+        ...parsed.data,
+        id: projId,
+        ownerUid: uid,
+        ...(canonicalProjectJson ? { canonicalProjectJson } : {}),
+        revision,
+        activeBranch,
+        createdAt: parsed.data.createdAt || now,
+        updatedAt: now,
+      };
+      const saved = await saveAuthoritativeNewProject(record);
+      return sendOk(res, authReq.requestId, saved, 201);
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to persist project.'
+      );
+    }
+  });
+
+  app.get('/api/v1/projects/:id', requireAuth, async (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const uid = authReq.authIdentity!.uid;
+    try {
+      const proj = await getAuthoritativeProject(
+        req.params.id,
+        uid,
+        authReq.userRole !== 'user'
+      );
+      if (!proj) {
+        return sendError(res, authReq.requestId, 404, 'NOT_FOUND', 'Project not found.');
+      }
+      return sendOk(res, authReq.requestId, proj);
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to read project.'
+      );
+    }
+  });
+
+  app.get('/api/v1/projects/:id/canonical', requireAuth, async (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const uid = authReq.authIdentity!.uid;
+    try {
+      const proj = await getAuthoritativeProject(
+        req.params.id,
+        uid,
+        authReq.userRole !== 'user'
+      );
+      if (!proj) {
+        return sendError(res, authReq.requestId, 404, 'NOT_FOUND', 'Project not found.');
+      }
+
       const { store, migrated, warnings } = getOrInitCanonicalStore(proj);
       const canonicalDoc = store.getProject();
       return sendOk(res, authReq.requestId, {
@@ -3298,6 +4762,14 @@ export function createApiApp(options: ApiAppOptions = {}) {
         canRedo: store.canRedo(),
       });
     } catch (err) {
+      if (err instanceof PersistenceContractError) {
+        return sendPersistenceError(
+          res,
+          authReq.requestId,
+          err,
+          'Unable to load canonical project.'
+        );
+      }
       return sendError(
         res,
         authReq.requestId,
@@ -3308,24 +4780,50 @@ export function createApiApp(options: ApiAppOptions = {}) {
     }
   });
 
-  app.post('/api/v1/projects/:id/commands', requireAuth, (req: Request, res: Response) => {
+  app.post('/api/v1/projects/:id/commands', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const uid = authReq.authIdentity!.uid;
-    const proj = projectsStore.get(req.params.id);
+
+    let proj: ProjectLibraryItem | null = null;
+    try {
+      proj = await getAuthoritativeProject(req.params.id, uid);
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to access project for command execution.'
+      );
+    }
     if (!proj) {
       return sendError(res, authReq.requestId, 404, 'NOT_FOUND', 'Project not found.');
     }
-    if (proj.ownerUid !== uid) {
+
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const expectedRevision =
+      typeof body.expectedRevision === 'number'
+        ? body.expectedRevision
+        : typeof body.command?.expectedRevision === 'number'
+        ? body.command.expectedRevision
+        : undefined;
+
+    if (
+      expectedRevision !== undefined &&
+      expectedRevision !== (proj.revision || 1)
+    ) {
       return sendError(
         res,
         authReq.requestId,
-        403,
-        'CROSS_USER_ACCESS_FORBIDDEN',
-        'You do not have permission to execute editing commands on another user’s project.'
+        409,
+        'REVISION_CONFLICT',
+        `Stale revision on project "${proj.id}": expected revision ${expectedRevision}, but current stored revision is ${proj.revision || 1}.`,
+        {
+          expectedRevision,
+          currentRevision: proj.revision || 1,
+        }
       );
     }
 
-    const body = req.body && typeof req.body === 'object' ? req.body : {};
     const commandPayload = body.command ? body.command : body;
     if (!commandPayload || typeof commandPayload.type !== 'string') {
       return sendError(
@@ -3370,43 +4868,56 @@ export function createApiApp(options: ApiAppOptions = {}) {
       );
     }
 
-    const updatedCanonical = store.getProject();
-    const libUpdate = canonicalProjectToLibraryRecord(updatedCanonical);
-    const updatedProj: ProjectLibraryItem = {
-      ...proj,
-      ...libUpdate,
-      id: proj.id,
-      ownerUid: proj.ownerUid,
-      checkpoints: proj.checkpoints,
-      updatedAt: updatedCanonical.updatedAt,
-    };
-    projectsStore.set(proj.id, updatedProj);
-    persistState();
+    try {
+      const updatedCanonical = store.getProject();
+      const libUpdate = canonicalProjectToLibraryRecord(updatedCanonical);
+      const updatedProj = await updateAuthoritativeProject(
+        proj.id,
+        uid,
+        {
+          ...libUpdate,
+          id: proj.id,
+          ownerUid: proj.ownerUid,
+          checkpoints: proj.checkpoints,
+          revision: updatedCanonical.revision,
+          updatedAt: updatedCanonical.updatedAt,
+        },
+        { expectedRevision: proj.revision || 1 }
+      );
 
-    return sendOk(res, authReq.requestId, {
-      project: updatedCanonical,
-      receipt,
-      canUndo: store.canUndo(),
-      canRedo: store.canRedo(),
-      libraryRecord: updatedProj,
-    });
-  });
-
-  app.patch('/api/v1/projects/:id', requireAuth, (req: Request, res: Response) => {
-    const authReq = req as AuthenticatedRequest;
-    const uid = authReq.authIdentity!.uid;
-    const proj = projectsStore.get(req.params.id);
-    if (!proj) {
-      return sendError(res, authReq.requestId, 404, 'NOT_FOUND', 'Project not found.');
-    }
-    if (proj.ownerUid !== uid) {
-      return sendError(
+      return sendOk(res, authReq.requestId, {
+        project: updatedCanonical,
+        receipt,
+        canUndo: store.canUndo(),
+        canRedo: store.canRedo(),
+        libraryRecord: updatedProj,
+      });
+    } catch (err) {
+      return sendPersistenceError(
         res,
         authReq.requestId,
-        403,
-        'CROSS_USER_ACCESS_FORBIDDEN',
-        'You do not have permission to modify another user’s project.'
+        err,
+        'Failed to commit canonical project command.'
       );
+    }
+  });
+
+  app.patch('/api/v1/projects/:id', requireAuth, async (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const uid = authReq.authIdentity!.uid;
+    let proj: ProjectLibraryItem | null = null;
+    try {
+      proj = await getAuthoritativeProject(req.params.id, uid);
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to access project.'
+      );
+    }
+    if (!proj) {
+      return sendError(res, authReq.requestId, 404, 'NOT_FOUND', 'Project not found.');
     }
 
     const parsed = ProjectPatchSchema.safeParse(req.body);
@@ -3421,9 +4932,11 @@ export function createApiApp(options: ApiAppOptions = {}) {
       );
     }
 
-    if (parsed.data.canonicalProjectJson) {
+    const { expectedRevision, ...patchFields } = parsed.data;
+
+    if (patchFields.canonicalProjectJson) {
       try {
-        const parsedCanon = JSON.parse(parsed.data.canonicalProjectJson);
+        const parsedCanon = JSON.parse(patchFields.canonicalProjectJson);
         const check = validateCanonicalProject(parsedCanon);
         if (!check.valid || !check.project) {
           return sendError(
@@ -3436,7 +4949,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
         }
         check.project.id = proj.id;
         check.project.ownerUid = uid;
-        canonicalProjectStores.set(proj.id, new CanonicalProjectStore(check.project));
+        patchFields.canonicalProjectJson = serializeCanonicalProject(check.project);
       } catch {
         return sendError(
           res,
@@ -3448,48 +4961,55 @@ export function createApiApp(options: ApiAppOptions = {}) {
       }
     }
 
-    const updated: ProjectLibraryItem = {
-      ...proj,
-      ...parsed.data,
-      id: proj.id,
-      ownerUid: proj.ownerUid,
-      updatedAt: new Date().toISOString(),
-    };
-    projectsStore.set(proj.id, updated);
-    persistState();
-    return sendOk(res, authReq.requestId, updated);
-  });
-
-  app.delete('/api/v1/projects/:id', requireAuth, (req: Request, res: Response) => {
-    const authReq = req as AuthenticatedRequest;
-    const uid = authReq.authIdentity!.uid;
-    const proj = projectsStore.get(req.params.id);
-    if (!proj) {
-      return sendError(res, authReq.requestId, 404, 'NOT_FOUND', 'Project not found.');
-    }
-    if (proj.ownerUid !== uid) {
-      return sendError(
+    try {
+      const updated = await updateAuthoritativeProject(
+        proj.id,
+        uid,
+        {
+          ...patchFields,
+          updatedAt: new Date().toISOString(),
+        },
+        { expectedRevision }
+      );
+      return sendOk(res, authReq.requestId, updated);
+    } catch (err) {
+      return sendPersistenceError(
         res,
         authReq.requestId,
-        403,
-        'CROSS_USER_ACCESS_FORBIDDEN',
-        'You do not have permission to delete another user’s project.'
+        err,
+        'Unable to update project.'
       );
     }
-    projectsStore.delete(proj.id);
-    canonicalProjectStores.delete(proj.id);
-    persistState();
-    recordAudit(
-      uid,
-      authReq.authIdentity!.email,
-      'PROJECT_DELETED',
-      proj.id,
-      `Deleted project "${proj.title}"`,
-      authReq.requestId,
-      'user',
-      'success'
-    );
-    return sendOk(res, authReq.requestId, { deletedId: proj.id });
+  });
+
+  app.delete('/api/v1/projects/:id', requireAuth, async (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const uid = authReq.authIdentity!.uid;
+    try {
+      const proj = await getAuthoritativeProject(req.params.id, uid);
+      if (!proj) {
+        return sendError(res, authReq.requestId, 404, 'NOT_FOUND', 'Project not found.');
+      }
+      await deleteAuthoritativeProject(proj.id, uid);
+      recordAudit(
+        uid,
+        authReq.authIdentity!.email,
+        'PROJECT_DELETED',
+        proj.id,
+        `Deleted project "${proj.title}"`,
+        authReq.requestId,
+        'user',
+        'success'
+      );
+      return sendOk(res, authReq.requestId, { deletedId: proj.id });
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to delete project.'
+      );
+    }
   });
 
   // Cloud Object Storage Gate
@@ -4309,94 +5829,183 @@ export function createApiApp(options: ApiAppOptions = {}) {
   );
 
   // --- SAFE ONE-TIME OWNER BOOTSTRAP ---
-  app.post('/api/v1/admin/bootstrap-owner', requireAuth, (req: Request, res: Response) => {
-    const authReq = req as AuthenticatedRequest;
-    const identity = authReq.authIdentity!;
-    if (!configuredBootstrapSecret) {
-      return sendError(
-        res,
-        authReq.requestId,
-        503,
-        'BOOTSTRAP_NOT_CONFIGURED',
-        'Owner bootstrap is disabled because OWNER_BOOTSTRAP_SECRET is not configured on the server.'
-      );
+  app.post(
+    ['/api/v1/admin/bootstrap-owner', '/api/v1/auth/bootstrap-owner'],
+    requireAuth,
+    async (req: Request, res: Response) => {
+      const authReq = req as AuthenticatedRequest;
+      const identity = authReq.authIdentity!;
+
+      if (isProductionBootstrapLockUnsafe) {
+        recordAudit(
+          identity.uid,
+          identity.email,
+          'OWNER_BOOTSTRAP_DENIED_NON_DURABLE_LOCK',
+          identity.uid,
+          'Bootstrap disabled in production because local disk snapshot lock is not durable or race-safe across container instances',
+          authReq.requestId,
+          'role',
+          'denied'
+        );
+        return sendError(
+          res,
+          authReq.requestId,
+          503,
+          'BOOTSTRAP_DISABLED_IN_PRODUCTION',
+          'Owner bootstrap is disabled in production because the local snapshot lock (ownerBootstrappedUid) is not persistent or race-safe on Cloud Run. Provision a durable Firestore transactional lock or assign admin/owner roles via server administration.'
+        );
+      }
+
+      if (!configuredOwnerEmail) {
+        return sendError(
+          res,
+          authReq.requestId,
+          503,
+          'BOOTSTRAP_NOT_CONFIGURED',
+          'Owner bootstrap is disabled because OWNER_BOOTSTRAP_EMAIL is not configured on the server.'
+        );
+      }
+
+      if (!configuredBootstrapSecret) {
+        return sendError(
+          res,
+          authReq.requestId,
+          503,
+          'BOOTSTRAP_NOT_CONFIGURED',
+          'Owner bootstrap is disabled because OWNER_BOOTSTRAP_SECRET is not configured on the server.'
+        );
+      }
+
+      if (!isBootstrapSecretSufficient) {
+        return sendError(
+          res,
+          authReq.requestId,
+          503,
+          'BOOTSTRAP_SECRET_TOO_WEAK',
+          'Owner bootstrap is disabled because OWNER_BOOTSTRAP_SECRET must be at least 16 characters of high-entropy random secret (never a weak or sample string).'
+        );
+      }
+
+      try {
+        const existingLock = await activePersistenceAdapter.governance.getOwnerBootstrapLock();
+        if (ownerBootstrappedUid || existingLock?.bootstrapped) {
+          if (existingLock?.ownerUid) {
+            ownerBootstrappedUid = existingLock.ownerUid;
+          }
+          return sendError(
+            res,
+            authReq.requestId,
+            409,
+            'OWNER_ALREADY_BOOTSTRAPPED',
+            'One-time owner bootstrap has already been completed and is permanently locked.'
+          );
+        }
+      } catch (err) {
+        return sendError(
+          res,
+          authReq.requestId,
+          503,
+          'BOOTSTRAP_LOCK_UNAVAILABLE',
+          err instanceof Error
+            ? `Persistence adapter cannot guarantee an atomic durable bootstrap lock: ${err.message}`
+            : 'Persistence adapter cannot guarantee an atomic durable bootstrap lock.'
+        );
+      }
+
+      if (!identity.emailVerified || identity.email.toLowerCase() !== configuredOwnerEmail) {
+        recordAudit(
+          identity.uid,
+          identity.email,
+          'OWNER_BOOTSTRAP_DENIED_EMAIL_MISMATCH',
+          identity.uid,
+          'Denied bootstrap attempt from non-owner or unverified email',
+          authReq.requestId,
+          'role',
+          'denied'
+        );
+        return sendError(
+          res,
+          authReq.requestId,
+          403,
+          'OWNER_EMAIL_MISMATCH',
+          'Only the designated verified project owner email can execute one-time owner bootstrap.'
+        );
+      }
+
+      const suppliedSecret =
+        typeof req.body?.bootstrapSecret === 'string' && req.body.bootstrapSecret.trim()
+          ? req.body.bootstrapSecret.trim()
+          : (req.header('x-bootstrap-secret') || '').trim();
+      if (!suppliedSecret || suppliedSecret !== configuredBootstrapSecret) {
+        recordAudit(
+          identity.uid,
+          identity.email,
+          'OWNER_BOOTSTRAP_DENIED_INVALID_SECRET',
+          identity.uid,
+          'Invalid or missing one-time owner bootstrap secret',
+          authReq.requestId,
+          'role',
+          'denied'
+        );
+        return sendError(
+          res,
+          authReq.requestId,
+          403,
+          'INVALID_BOOTSTRAP_SECRET',
+          'Invalid one-time bootstrap confirmation secret.'
+        );
+      }
+
+      try {
+        const lockDto = await activePersistenceAdapter.governance.claimOwnerBootstrapLock(
+          identity.uid,
+          runtimeNodeEnv
+        );
+        await activePersistenceAdapter.governance.setAccountStatus(identity.uid, 'active');
+
+        ownerBootstrappedUid = identity.uid;
+        roleStore.set(identity.uid, 'owner');
+        userStatusStore.set(identity.uid, 'active');
+        syncUserIntoDirectory(identity, 'owner');
+        persistState();
+
+        recordAudit(
+          identity.uid,
+          identity.email,
+          'OWNER_BOOTSTRAP_COMPLETED',
+          identity.uid,
+          'Promoted verified project owner account via one-time atomic bootstrap lock',
+          authReq.requestId,
+          'role',
+          'success'
+        );
+
+        return sendOk(res, authReq.requestId, {
+          uid: identity.uid,
+          email: identity.email,
+          role: 'owner' as UserRole,
+          bootstrappedAt: lockDto.lockedAt,
+        });
+      } catch (err: any) {
+        if (err?.code === 'BOOTSTRAP_LOCK_ALREADY_CLAIMED') {
+          return sendError(
+            res,
+            authReq.requestId,
+            409,
+            'OWNER_ALREADY_BOOTSTRAPPED',
+            'One-time owner bootstrap has already been completed and is permanently locked.'
+          );
+        }
+        return sendError(
+          res,
+          authReq.requestId,
+          503,
+          'BOOTSTRAP_LOCK_TRANSACTION_FAILED',
+          err?.message || 'Persistence adapter failed to commit atomic owner bootstrap lock.'
+        );
+      }
     }
-
-    if (ownerBootstrappedUid) {
-      return sendError(
-        res,
-        authReq.requestId,
-        409,
-        'OWNER_ALREADY_BOOTSTRAPPED',
-        'One-time owner bootstrap has already been completed and is permanently locked.'
-      );
-    }
-
-    if (identity.email.toLowerCase() !== configuredOwnerEmail) {
-      recordAudit(
-        identity.uid,
-        identity.email,
-        'OWNER_BOOTSTRAP_DENIED_EMAIL_MISMATCH',
-        identity.uid,
-        'Denied bootstrap attempt from non-owner email',
-        authReq.requestId,
-        'role',
-        'denied'
-      );
-      return sendError(
-        res,
-        authReq.requestId,
-        403,
-        'OWNER_EMAIL_MISMATCH',
-        'Only the designated project owner email can execute one-time owner bootstrap.'
-      );
-    }
-
-    const suppliedSecret =
-      typeof req.body?.bootstrapSecret === 'string' ? req.body.bootstrapSecret.trim() : '';
-    if (!suppliedSecret || suppliedSecret !== configuredBootstrapSecret) {
-      recordAudit(
-        identity.uid,
-        identity.email,
-        'OWNER_BOOTSTRAP_DENIED_INVALID_SECRET',
-        identity.uid,
-        'Invalid or missing one-time owner bootstrap secret',
-        authReq.requestId,
-        'role',
-        'denied'
-      );
-      return sendError(
-        res,
-        authReq.requestId,
-        403,
-        'INVALID_BOOTSTRAP_SECRET',
-        'Invalid one-time bootstrap confirmation secret.'
-      );
-    }
-
-    ownerBootstrappedUid = identity.uid;
-    roleStore.set(identity.uid, 'owner');
-    userStatusStore.set(identity.uid, 'active');
-    syncUserIntoDirectory(identity, 'owner');
-
-    recordAudit(
-      identity.uid,
-      identity.email,
-      'OWNER_BOOTSTRAP_COMPLETED',
-      identity.uid,
-      'Promoted verified project owner account via one-time bootstrap',
-      authReq.requestId,
-      'role',
-      'success'
-    );
-
-    return sendOk(res, authReq.requestId, {
-      uid: identity.uid,
-      email: identity.email,
-      role: 'owner' as UserRole,
-      bootstrappedAt: new Date().toISOString(),
-    });
-  });
+  );
 
   // --- ADMIN & OWNER PROTECTED ROUTES ---
 
@@ -4482,7 +6091,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
   app.post(
     '/api/v1/catalog',
     requireAuth,
-    (req: Request, res: Response) => {
+    async (req: Request, res: Response) => {
       const authReq = req as AuthenticatedRequest;
       const uid = authReq.authIdentity!.uid;
       const isAdmin = authReq.userRole === 'admin' || authReq.userRole === 'owner';
@@ -4520,7 +6129,8 @@ export function createApiApp(options: ApiAppOptions = {}) {
         );
       }
 
-      if (catalogStore.has(parsed.data.id)) {
+      const existingItem = await getAuthoritativeCatalogItem(parsed.data.id);
+      if (existingItem) {
         return sendError(
           res,
           authReq.requestId,
@@ -4590,9 +6200,16 @@ export function createApiApp(options: ApiAppOptions = {}) {
         updatedAt: now,
       };
       const created = enrichCatalogItemWithMarketplaceDefaults(rawCreated);
-      catalogStore.set(created.id, created);
-      catalogCacheVersion += 1;
-      persistState();
+      try {
+        await saveAuthoritativeCatalogItem(created);
+      } catch (err) {
+        return sendPersistenceError(
+          res,
+          authReq.requestId,
+          err,
+          'Unable to create catalog item.'
+        );
+      }
 
       recordAudit(
         uid,
@@ -4611,11 +6228,11 @@ export function createApiApp(options: ApiAppOptions = {}) {
   app.patch(
     '/api/v1/catalog/:id',
     requireAuth,
-    (req: Request, res: Response) => {
+    async (req: Request, res: Response) => {
       const authReq = req as AuthenticatedRequest;
       const uid = authReq.authIdentity!.uid;
       const isAdmin = authReq.userRole === 'admin' || authReq.userRole === 'owner';
-      const existing = catalogStore.get(req.params.id);
+      const existing = await getAuthoritativeCatalogItem(req.params.id);
       if (!existing) {
         return sendError(res, authReq.requestId, 404, 'NOT_FOUND', 'Catalog item not found.');
       }
@@ -4717,9 +6334,16 @@ export function createApiApp(options: ApiAppOptions = {}) {
         id: existing.id,
         updatedAt: now,
       });
-      catalogStore.set(updated.id, updated);
-      catalogCacheVersion += 1;
-      persistState();
+      try {
+        await saveAuthoritativeCatalogItem(updated);
+      } catch (err) {
+        return sendPersistenceError(
+          res,
+          authReq.requestId,
+          err,
+          'Unable to update catalog item.'
+        );
+      }
 
       const auditAction =
         parsed.data.visibility === 'published' && prevVis !== 'published'
@@ -4746,9 +6370,9 @@ export function createApiApp(options: ApiAppOptions = {}) {
     '/api/v1/catalog/:id',
     requireAuth,
     requireRole(['admin', 'owner']),
-    (req: Request, res: Response) => {
+    async (req: Request, res: Response) => {
       const authReq = req as AuthenticatedRequest;
-      const existing = catalogStore.get(req.params.id);
+      const existing = await getAuthoritativeCatalogItem(req.params.id);
       if (!existing) {
         return sendError(res, authReq.requestId, 404, 'NOT_FOUND', 'Catalog item not found.');
       }
@@ -4782,9 +6406,16 @@ export function createApiApp(options: ApiAppOptions = {}) {
         validationState: 'Archived',
         updatedAt: new Date().toISOString(),
       };
-      catalogStore.set(existing.id, archived);
-      catalogCacheVersion += 1;
-      persistState();
+      try {
+        await saveAuthoritativeCatalogItem(archived);
+      } catch (err) {
+        return sendPersistenceError(
+          res,
+          authReq.requestId,
+          err,
+          'Unable to archive catalog item.'
+        );
+      }
 
       recordAudit(
         authReq.authIdentity!.uid,
@@ -5082,7 +6713,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
     '/api/v1/admin/users/:uid/role',
     requireAuth,
     requireRole(['admin', 'owner']),
-    (req: Request, res: Response) => {
+    async (req: Request, res: Response) => {
       const authReq = req as AuthenticatedRequest;
       const actorUid = authReq.authIdentity!.uid;
       const actorRole = authReq.userRole!;
@@ -5101,7 +6732,10 @@ export function createApiApp(options: ApiAppOptions = {}) {
       }
 
       const nextRole = parsed.data.role;
-      const currentTargetRole = roleStore.get(targetUid) || 'user';
+      let currentTargetRole = roleStore.get(targetUid);
+      if (!currentTargetRole) {
+        currentTargetRole = await activePersistenceAdapter.governance.getRole(targetUid);
+      }
 
       // Guard 1: Only an owner can assign or modify the 'owner' role
       if ((nextRole === 'owner' || currentTargetRole === 'owner') && actorRole !== 'owner') {
@@ -5169,6 +6803,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
         }
       }
 
+      await activePersistenceAdapter.governance.setRole(targetUid, nextRole, actorUid);
       roleStore.set(targetUid, nextRole);
       const existingDir = usersDirectoryStore.get(targetUid);
       const now = new Date().toISOString();
@@ -5182,6 +6817,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
         createdAt: existingDir?.createdAt || now,
         updatedAt: now,
       });
+      persistState();
 
       recordAudit(
         actorUid,
@@ -5205,7 +6841,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
     '/api/v1/admin/users/:uid/status',
     requireAuth,
     requireRole(['admin', 'owner']),
-    (req: Request, res: Response) => {
+    async (req: Request, res: Response) => {
       const authReq = req as AuthenticatedRequest;
       const actorUid = authReq.authIdentity!.uid;
       const targetUid = req.params.uid;
@@ -5222,7 +6858,8 @@ export function createApiApp(options: ApiAppOptions = {}) {
         );
       }
 
-      const targetRole = roleStore.get(targetUid) || 'user';
+      const targetRole =
+        roleStore.get(targetUid) || (await activePersistenceAdapter.governance.getRole(targetUid));
       if (targetRole === 'owner' && parsed.data.status !== 'active') {
         if (countActiveOwners() <= 1) {
           recordAudit(
@@ -5245,6 +6882,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
         }
       }
 
+      await activePersistenceAdapter.governance.setAccountStatus(targetUid, parsed.data.status);
       userStatusStore.set(targetUid, parsed.data.status);
       const existingDir = usersDirectoryStore.get(targetUid);
       const now = new Date().toISOString();
@@ -5258,6 +6896,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
         createdAt: existingDir?.createdAt || now,
         updatedAt: now,
       });
+      persistState();
 
       recordAudit(
         actorUid,
@@ -5538,7 +7177,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
     '/api/v1/admin/audit-events',
     requireAuth,
     requireRole(['admin', 'owner']),
-    (req: Request, res: Response) => {
+    async (req: Request, res: Response) => {
       const authReq = req as AuthenticatedRequest;
       const actionFilter = typeof req.query.action === 'string' ? req.query.action : undefined;
       const targetTypeFilter =
@@ -5547,6 +7186,20 @@ export function createApiApp(options: ApiAppOptions = {}) {
         typeof req.query.outcome === 'string' ? req.query.outcome : undefined;
       const q = typeof req.query.q === 'string' ? req.query.q.trim().toLowerCase() : '';
       const { limit, offset } = parsePagination(req);
+
+      try {
+        const persistedEvents = await activePersistenceAdapter.governance.listAuditEvents(500);
+        const existingIds = new Set(auditLog.map((e) => e.id));
+        for (const pe of persistedEvents) {
+          if (!existingIds.has(pe.id)) {
+            auditLog.push(pe);
+            existingIds.add(pe.id);
+          }
+        }
+        auditLog.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+      } catch {
+        // Ignore
+      }
 
       const filtered = auditLog.filter((ev) => {
         if (actionFilter && ev.action !== actionFilter) return false;
@@ -5569,6 +7222,184 @@ export function createApiApp(options: ApiAppOptions = {}) {
         limit,
         offset,
       });
+    }
+  );
+
+  // 11. Admin Persistence Migration & Cutover Routes (Phase 2D)
+  app.get(
+    '/api/v1/admin/migration/status',
+    requireAuth,
+    requireRole(['admin', 'owner']),
+    (req: Request, res: Response) => {
+      const authReq = req as AuthenticatedRequest;
+      return sendOk(
+        res,
+        authReq.requestId,
+        getMigrationCutoverDiagnostics({
+          persistenceAdapter: activePersistenceAdapter,
+          snapshotFilePath: persistenceFilePath,
+        })
+      );
+    }
+  );
+
+  app.post(
+    '/api/v1/admin/migration/dry-run',
+    requireAuth,
+    requireRole(['admin', 'owner']),
+    async (req: Request, res: Response) => {
+      const authReq = req as AuthenticatedRequest;
+      const requestedPath =
+        typeof req.body?.snapshotFilePath === 'string' && req.body.snapshotFilePath.trim()
+          ? req.body.snapshotFilePath.trim()
+          : persistenceFilePath;
+      if (!requestedPath) {
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          'SNAPSHOT_PATH_NOT_CONFIGURED',
+          'No snapshotFilePath configured or provided for dry-run migration.'
+        );
+      }
+
+      try {
+        const report = await executeMigrationDryRun({
+          snapshotFilePath: requestedPath,
+          persistenceAdapter: activePersistenceAdapter,
+        });
+        recordAudit(
+          authReq.authIdentity!.uid,
+          authReq.authIdentity!.email,
+          'MIGRATION_DRY_RUN_EXECUTED',
+          report.dryRunId,
+          `Executed migration dry-run (${report.totalRecordsToMigrate} records, vaultRequiresReentry=${report.vaultHealth.requiresReentryCount})`,
+          authReq.requestId,
+          'system',
+          'success'
+        );
+        return sendOk(res, authReq.requestId, { report });
+      } catch (err: any) {
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          err?.code || 'MIGRATION_DRY_RUN_FAILED',
+          err?.message || 'Migration dry-run failed.'
+        );
+      }
+    }
+  );
+
+  app.post(
+    '/api/v1/admin/migration/apply',
+    requireAuth,
+    requireRole(['admin', 'owner']),
+    async (req: Request, res: Response) => {
+      const authReq = req as AuthenticatedRequest;
+      const body = req.body || {};
+      const requestedPath =
+        typeof body.snapshotFilePath === 'string' && body.snapshotFilePath.trim()
+          ? body.snapshotFilePath.trim()
+          : persistenceFilePath;
+      if (!requestedPath) {
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          'SNAPSHOT_PATH_NOT_CONFIGURED',
+          'No snapshotFilePath configured or provided for migration apply.'
+        );
+      }
+
+      try {
+        const result = await executeMigrationApply({
+          snapshotFilePath: requestedPath,
+          persistenceAdapter: activePersistenceAdapter,
+          dryRunId: typeof body.dryRunId === 'string' ? body.dryRunId : '',
+          confirmationToken:
+            typeof body.confirmationToken === 'string' ? body.confirmationToken : '',
+          confirmApply: Boolean(body.confirmApply),
+          disableLegacyWriters: body.disableLegacyWriters !== false,
+        });
+        recordAudit(
+          authReq.authIdentity!.uid,
+          authReq.authIdentity!.email,
+          'MIGRATION_CUTOVER_APPLIED',
+          result.dryRunId,
+          `Applied migration cutover (totalMigrated=${result.totalMigrated}, legacyWritersDisabled=${result.legacyWritersDisabled})`,
+          authReq.requestId,
+          'system',
+          'success'
+        );
+        return sendOk(res, authReq.requestId, { result });
+      } catch (err: any) {
+        const code = err?.code || 'MIGRATION_APPLY_FAILED';
+        const status =
+          code === 'OPERATOR_CONFIRMATION_REQUIRED' ||
+          code === 'CONFIRMATION_TOKEN_REQUIRED' ||
+          code === 'INVALID_CONFIRMATION_TOKEN' ||
+          code === 'DRY_RUN_ID_MISMATCH'
+            ? 400
+            : 500;
+        return sendError(
+          res,
+          authReq.requestId,
+          status,
+          code,
+          err?.message || 'Migration apply failed.'
+        );
+      }
+    }
+  );
+
+  app.post(
+    '/api/v1/admin/migration/rollback',
+    requireAuth,
+    requireRole(['admin', 'owner']),
+    async (req: Request, res: Response) => {
+      const authReq = req as AuthenticatedRequest;
+      const body = req.body || {};
+      const backupPath = typeof body.backupPath === 'string' ? body.backupPath.trim() : '';
+      const targetSnapshotPath =
+        typeof body.targetSnapshotPath === 'string' && body.targetSnapshotPath.trim()
+          ? body.targetSnapshotPath.trim()
+          : persistenceFilePath;
+      if (!backupPath || !targetSnapshotPath) {
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          'ROLLBACK_PATHS_REQUIRED',
+          'Both backupPath and targetSnapshotPath are required to execute a migration rollback.'
+        );
+      }
+
+      try {
+        const rollbackResult = await executeMigrationRollback({
+          backupPath,
+          targetSnapshotPath,
+        });
+        recordAudit(
+          authReq.authIdentity!.uid,
+          authReq.authIdentity!.email,
+          'MIGRATION_CUTOVER_ROLLED_BACK',
+          rollbackResult.rollbackId,
+          `Restored snapshot from backup (legacyWritersRestored=${rollbackResult.legacyWritersRestored})`,
+          authReq.requestId,
+          'system',
+          'success'
+        );
+        return sendOk(res, authReq.requestId, { rollbackResult });
+      } catch (err: any) {
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          err?.code || 'MIGRATION_ROLLBACK_FAILED',
+          err?.message || 'Migration rollback failed.'
+        );
+      }
     }
   );
 
@@ -5672,20 +7503,36 @@ export function createApiApp(options: ApiAppOptions = {}) {
     recordAudit(
       authReq.authIdentity!.uid,
       authReq.authIdentity!.email,
-      'AI_PROVIDER_TESTED',
+      'AI_PROVIDER_TEST_DEPRECATED_REJECTED',
       providerId || 'custom-provider',
-      `Validated provider test configuration (key: ${masked || 'none'}, endpoint verified)`,
+      `Rejected legacy unprobed provider test request (key: ${masked || 'none'}); directed caller to Provider Hub live probe`,
       authReq.requestId,
       'system',
-      'success'
+      'denied'
     );
 
-    return sendOk(res, authReq.requestId, {
-      verified: true,
-      providerId: providerId || 'custom-provider',
-      maskedApiKey: masked,
-      status: 'healthy',
-      latencyMs: 18,
+    const code = 'LEGACY_PROVIDER_TEST_DEPRECATED';
+    const safeMsg =
+      'Legacy endpoint /api/v1/ai/providers/test is deprecated and disabled because it does not perform an upstream provider request. Use POST /api/v1/provider-hub/connections/:id/test for real authenticated upstream verification.';
+    lastErrorTimestamp = new Date().toISOString();
+    lastErrorRedactedSummary = `[${code}] ${safeMsg}`;
+    errorCountsByCode.set(code, (errorCountsByCode.get(code) || 0) + 1);
+
+    return res.status(410).json({
+      ok: false,
+      error: {
+        code,
+        message: safeMsg,
+      },
+      data: {
+        verified: false,
+        providerId: providerId || 'custom-provider',
+        maskedApiKey: masked,
+        status: 'deprecated-unsupported',
+        latencyMs: null,
+        replacementEndpoint: '/api/v1/provider-hub/connections/:id/test',
+      },
+      requestId: authReq.requestId,
     });
   });
 
@@ -5845,46 +7692,68 @@ export function createApiApp(options: ApiAppOptions = {}) {
     return sendOk(res, authReq.requestId, { inspection });
   });
 
-  app.get('/api/v1/reference-lab/sessions', requireAuth, (req: Request, res: Response) => {
+  app.get('/api/v1/reference-lab/sessions', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const uid = authReq.authIdentity!.uid;
     const isPrivileged = authReq.userRole === 'admin' || authReq.userRole === 'owner';
-    const items = Array.from(referenceLabSessionsStore.values())
-      .filter((s) => s.ownerUid === uid || (isPrivileged && req.query.all === 'true'))
-      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-
-    return sendOk(res, authReq.requestId, {
-      items,
-      total: items.length,
-    });
+    try {
+      const items = await listAuthoritativeReferenceLabSessions(
+        uid,
+        isPrivileged && req.query.all === 'true'
+      );
+      return sendOk(res, authReq.requestId, {
+        items,
+        total: items.length,
+      });
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to list Reference Lab sessions.'
+      );
+    }
   });
 
-  app.get('/api/v1/reference-lab/sessions/:id', requireAuth, (req: Request, res: Response) => {
+  app.get('/api/v1/reference-lab/sessions/:id', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
-    const session = referenceLabSessionsStore.get(req.params.id);
-    if (!session) {
-      return sendError(
-        res,
-        authReq.requestId,
-        404,
-        'SESSION_NOT_FOUND',
-        'Reference Lab session not found.'
-      );
-    }
     const isPrivileged = authReq.userRole === 'admin' || authReq.userRole === 'owner';
-    if (session.ownerUid !== authReq.authIdentity!.uid && !isPrivileged) {
-      return sendError(
+    try {
+      const session = await getAuthoritativeReferenceLabSession(
+        req.params.id,
+        authReq.authIdentity!.uid,
+        isPrivileged
+      );
+      if (!session) {
+        return sendError(
+          res,
+          authReq.requestId,
+          404,
+          'SESSION_NOT_FOUND',
+          'Reference Lab session not found.'
+        );
+      }
+      return sendOk(res, authReq.requestId, { session });
+    } catch (err) {
+      if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+        return sendError(
+          res,
+          authReq.requestId,
+          403,
+          'FORBIDDEN_SESSION_ACCESS',
+          'You do not have permission to access this Reference Lab session.'
+        );
+      }
+      return sendPersistenceError(
         res,
         authReq.requestId,
-        403,
-        'FORBIDDEN_SESSION_ACCESS',
-        'You do not have permission to access this Reference Lab session.'
+        err,
+        'Unable to load Reference Lab session.'
       );
     }
-    return sendOk(res, authReq.requestId, { session });
   });
 
-  app.post('/api/v1/reference-lab/sessions', requireAuth, (req: Request, res: Response) => {
+  app.post('/api/v1/reference-lab/sessions', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const body = req.body || {};
     const usageMode = body.usageMode as ReferenceUsageMode;
@@ -5902,7 +7771,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
       body.sourceKind || 'uploaded-video';
 
     try {
-      const session = createReferenceLabSession({
+      const created = createReferenceLabSession({
         ownerUid: authReq.authIdentity!.uid,
         title: typeof body.title === 'string' ? body.title : undefined,
         usageMode,
@@ -5912,6 +7781,10 @@ export function createApiApp(options: ApiAppOptions = {}) {
         suppliedFileNames: Array.isArray(body.suppliedFileNames)
           ? body.suppliedFileNames
           : undefined,
+        parsedMediaMetadata:
+          body.parsedMediaMetadata && typeof body.parsedMediaMetadata === 'object'
+            ? body.parsedMediaMetadata
+            : undefined,
         customHeadline:
           typeof body.customHeadline === 'string' ? body.customHeadline : undefined,
         customSubheadline:
@@ -5936,15 +7809,14 @@ export function createApiApp(options: ApiAppOptions = {}) {
           typeof body.attributionText === 'string' ? body.attributionText : undefined,
       });
 
-      referenceLabSessionsStore.set(session.id, session);
-      persistState();
+      const session = await saveAuthoritativeReferenceLabSession(created);
 
       recordAudit(
         authReq.authIdentity!.uid,
         authReq.authIdentity!.email,
         'REFERENCE_LAB_SESSION_CREATED',
         session.id,
-        `Created Reference Lab session (${session.rightsDeclaration.usageMode}, sourceKind=${session.sourceKind}, remoteUpload=${session.rightsDeclaration.allowRemoteModelUpload})`,
+        `Created Reference Lab session (${session.rightsDeclaration.usageMode}, sourceKind=${session.sourceKind}, analysisState=${session.mediaSpecs.mediaAnalysisState})`,
         authReq.requestId,
         'user',
         'success'
@@ -5952,6 +7824,14 @@ export function createApiApp(options: ApiAppOptions = {}) {
 
       return sendOk(res, authReq.requestId, { session }, 201);
     } catch (err: any) {
+      if (err instanceof PersistenceContractError) {
+        return sendPersistenceError(
+          res,
+          authReq.requestId,
+          err,
+          'Failed to persist Reference Lab session.'
+        );
+      }
       return sendError(
         res,
         authReq.requestId,
@@ -5963,11 +7843,33 @@ export function createApiApp(options: ApiAppOptions = {}) {
   });
 
   app.post(
-    '/api/v1/reference-lab/sessions/:id/actions',
+    ['/api/v1/reference-lab/sessions/:id/actions', '/api/v1/reference-lab/sessions/:id/action'],
     requireAuth,
-    (req: Request, res: Response) => {
+    async (req: Request, res: Response) => {
       const authReq = req as AuthenticatedRequest;
-      const existing = referenceLabSessionsStore.get(req.params.id);
+      let existing: ReferenceLabSession | null = null;
+      try {
+        existing = await getAuthoritativeReferenceLabSession(
+          req.params.id,
+          authReq.authIdentity!.uid
+        );
+      } catch (err) {
+        if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+          return sendError(
+            res,
+            authReq.requestId,
+            403,
+            'FORBIDDEN_SESSION_ACCESS',
+            'Only the session owner can apply refinement actions.'
+          );
+        }
+        return sendPersistenceError(
+          res,
+          authReq.requestId,
+          err,
+          'Unable to load Reference Lab session.'
+        );
+      }
       if (!existing) {
         return sendError(
           res,
@@ -5998,7 +7900,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
         );
       }
 
-      const updated = applyReferenceCorrectionAction(existing, {
+      const nextSession = applyReferenceCorrectionAction(existing, {
         actionType: body.actionType as ReferenceCorrectionActionRecord['actionType'],
         shotId: typeof body.shotId === 'string' ? body.shotId : existing.shots[0]?.id || 'shot_01',
         targetClipId: typeof body.targetClipId === 'string' ? body.targetClipId : undefined,
@@ -6020,33 +7922,62 @@ export function createApiApp(options: ApiAppOptions = {}) {
           typeof body.observationId === 'string' ? body.observationId : undefined,
         correctedValue: body.correctedValue,
       });
-      referenceLabSessionsStore.set(updated.id, updated);
-      persistState();
 
-      recordAudit(
-        authReq.authIdentity!.uid,
-        authReq.authIdentity!.email,
-        'REFERENCE_LAB_ACTION_APPLIED',
-        updated.id,
-        `Applied Reference Lab correction ${body.actionType} on shot ${body.shotId || 'default'}`,
-        authReq.requestId,
-        'user',
-        'success'
-      );
+      try {
+        const updated = await saveAuthoritativeReferenceLabSession(nextSession);
 
-      return sendOk(res, authReq.requestId, {
-        session: updated,
-        localChecks: updated.fidelityReport.localCheckResult,
-      });
+        recordAudit(
+          authReq.authIdentity!.uid,
+          authReq.authIdentity!.email,
+          'REFERENCE_LAB_ACTION_APPLIED',
+          updated.id,
+          `Applied Reference Lab correction ${body.actionType} on shot ${body.shotId || 'default'}`,
+          authReq.requestId,
+          'user',
+          'success'
+        );
+
+        return sendOk(res, authReq.requestId, {
+          session: updated,
+          localChecks: updated.fidelityReport.localCheckResult,
+        });
+      } catch (err) {
+        return sendPersistenceError(
+          res,
+          authReq.requestId,
+          err,
+          'Unable to persist Reference Lab correction.'
+        );
+      }
     }
   );
 
   app.post(
     '/api/v1/reference-lab/sessions/:id/save-project',
     requireAuth,
-    (req: Request, res: Response) => {
+    async (req: Request, res: Response) => {
       const authReq = req as AuthenticatedRequest;
-      const existing = referenceLabSessionsStore.get(req.params.id);
+      const uid = authReq.authIdentity!.uid;
+      let existing: ReferenceLabSession | null = null;
+      try {
+        existing = await getAuthoritativeReferenceLabSession(req.params.id, uid);
+      } catch (err) {
+        if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+          return sendError(
+            res,
+            authReq.requestId,
+            403,
+            'FORBIDDEN_SESSION_ACCESS',
+            'Only the session owner can save this reconstruction to Project Library.'
+          );
+        }
+        return sendPersistenceError(
+          res,
+          authReq.requestId,
+          err,
+          'Unable to load Reference Lab session.'
+        );
+      }
       if (!existing) {
         return sendError(
           res,
@@ -6056,7 +7987,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
           'Reference Lab session not found.'
         );
       }
-      if (existing.ownerUid !== authReq.authIdentity!.uid) {
+      if (existing.ownerUid !== uid) {
         return sendError(
           res,
           authReq.requestId,
@@ -6066,52 +7997,111 @@ export function createApiApp(options: ApiAppOptions = {}) {
         );
       }
 
-      const partialRecord = convertReferenceSessionToProjectRecord(existing);
       const now = new Date().toISOString();
-      const projectRecord: ProjectLibraryItem = {
-        ...partialRecord,
-        id: `proj_ref_${existing.id}`,
-        updatedAt: now,
+      const stableProjectId = existing.savedProjectId || `proj_ref_${existing.id}`;
+      const synchronizedCanon: CanonicalProjectDocument = {
+        ...existing.canonicalProject,
+        id: stableProjectId,
+        ownerUid: uid,
       };
-      projectsStore.set(projectRecord.id, projectRecord);
-
-      const updatedSession: ReferenceLabSession = {
+      const sessionForConversion: ReferenceLabSession = {
         ...existing,
-        savedProjectId: projectRecord.id,
-        updatedAt: now,
+        canonicalProject: synchronizedCanon,
+        savedProjectId: stableProjectId,
       };
-      referenceLabSessionsStore.set(updatedSession.id, updatedSession);
-      persistState();
+      const partialRecord = convertReferenceSessionToProjectRecord(sessionForConversion);
 
-      recordAudit(
-        authReq.authIdentity!.uid,
-        authReq.authIdentity!.email,
-        'REFERENCE_RECONSTRUCTION_SAVED_TO_PROJECTS',
-        projectRecord.id,
-        `Saved Reference Lab session ${existing.id} (${existing.rightsDeclaration.usageMode}) to Project Library`,
-        authReq.requestId,
-        'user',
-        'success'
-      );
+      try {
+        const existingProj = await getAuthoritativeProject(stableProjectId, uid);
+        let projectRecord: ProjectLibraryItem;
+        if (existingProj) {
+          projectRecord = await updateAuthoritativeProject(stableProjectId, uid, {
+            ...partialRecord,
+            id: stableProjectId,
+            ownerUid: uid,
+            revision: Math.max(
+              partialRecord.revision || 1,
+              (existingProj.revision || 1) + 1
+            ),
+            updatedAt: now,
+          });
+        } else {
+          projectRecord = await saveAuthoritativeNewProject({
+            ...partialRecord,
+            id: stableProjectId,
+            ownerUid: uid,
+            createdAt: now,
+            updatedAt: now,
+          });
+        }
 
-      return sendOk(
-        res,
-        authReq.requestId,
-        {
-          project: projectRecord,
-          session: updatedSession,
-        },
-        201
-      );
+        const updatedSession = await saveAuthoritativeReferenceLabSession({
+          ...existing,
+          canonicalProject: {
+            ...synchronizedCanon,
+            revision: projectRecord.revision || synchronizedCanon.revision,
+          },
+          savedProjectId: projectRecord.id,
+          updatedAt: now,
+        });
+
+        recordAudit(
+          uid,
+          authReq.authIdentity!.email,
+          'REFERENCE_RECONSTRUCTION_SAVED_TO_PROJECTS',
+          projectRecord.id,
+          `Saved Reference Lab session ${existing.id} (${existing.rightsDeclaration.usageMode}) to Project Library`,
+          authReq.requestId,
+          'user',
+          'success'
+        );
+
+        return sendOk(
+          res,
+          authReq.requestId,
+          {
+            project: projectRecord,
+            session: updatedSession,
+          },
+          201
+        );
+      } catch (err) {
+        return sendPersistenceError(
+          res,
+          authReq.requestId,
+          err,
+          'Unable to save Reference Lab reconstruction to Project Library.'
+        );
+      }
     }
   );
 
   app.post(
     '/api/v1/reference-lab/sessions/:id/save-template',
     requireAuth,
-    (req: Request, res: Response) => {
+    async (req: Request, res: Response) => {
       const authReq = req as AuthenticatedRequest;
-      const existing = referenceLabSessionsStore.get(req.params.id);
+      const uid = authReq.authIdentity!.uid;
+      let existing: ReferenceLabSession | null = null;
+      try {
+        existing = await getAuthoritativeReferenceLabSession(req.params.id, uid);
+      } catch (err) {
+        if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+          return sendError(
+            res,
+            authReq.requestId,
+            403,
+            'FORBIDDEN_SESSION_ACCESS',
+            'Only the session owner can save a template from this Reference Lab session.'
+          );
+        }
+        return sendPersistenceError(
+          res,
+          authReq.requestId,
+          err,
+          'Unable to load Reference Lab session.'
+        );
+      }
       if (!existing) {
         return sendError(
           res,
@@ -6121,7 +8111,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
           'Reference Lab session not found.'
         );
       }
-      if (existing.ownerUid !== authReq.authIdentity!.uid) {
+      if (existing.ownerUid !== uid) {
         return sendError(
           res,
           authReq.requestId,
@@ -6133,6 +8123,14 @@ export function createApiApp(options: ApiAppOptions = {}) {
 
       const promoteToValidated = Boolean(req.body?.promoteToValidated);
       let templateItem = buildDraftTemplateFromReferenceSession(existing);
+      if (existing.savedDraftTemplateId) {
+        const existingCat = await getAuthoritativeCatalogItem(existing.savedDraftTemplateId);
+        templateItem = {
+          ...templateItem,
+          id: existing.savedDraftTemplateId,
+          ...(existingCat ? { createdAt: existingCat.createdAt } : {}),
+        };
+      }
       let promotionResult:
         | ReturnType<typeof validateAndPromoteReferenceTemplate>
         | undefined;
@@ -6142,43 +8140,49 @@ export function createApiApp(options: ApiAppOptions = {}) {
         templateItem = promotionResult.template;
       }
 
-      catalogStore.set(templateItem.id, templateItem);
-      catalogCacheVersion += 1;
+      try {
+        await saveAuthoritativeCatalogItem(templateItem);
 
-      const updatedSession: ReferenceLabSession = {
-        ...existing,
-        savedDraftTemplateId: templateItem.id,
-        ...(promotionResult?.promoted
-          ? { promotedValidatedTemplateId: templateItem.id }
-          : {}),
-        updatedAt: new Date().toISOString(),
-      };
-      referenceLabSessionsStore.set(updatedSession.id, updatedSession);
-      persistState();
+        const updatedSession = await saveAuthoritativeReferenceLabSession({
+          ...existing,
+          savedDraftTemplateId: templateItem.id,
+          ...(promotionResult?.promoted
+            ? { promotedValidatedTemplateId: templateItem.id }
+            : {}),
+          updatedAt: new Date().toISOString(),
+        });
 
-      recordAudit(
-        authReq.authIdentity!.uid,
-        authReq.authIdentity!.email,
-        promoteToValidated
-          ? 'REFERENCE_TEMPLATE_VALIDATED_AND_SAVED'
-          : 'REFERENCE_DRAFT_TEMPLATE_SAVED',
-        templateItem.id,
-        `Saved Reference Lab template (${templateItem.validationState}, rights=${templateItem.licenseType}, mode=${existing.rightsDeclaration.usageMode})`,
-        authReq.requestId,
-        'catalog',
-        'success'
-      );
+        recordAudit(
+          uid,
+          authReq.authIdentity!.email,
+          promoteToValidated
+            ? 'REFERENCE_TEMPLATE_VALIDATED_AND_SAVED'
+            : 'REFERENCE_DRAFT_TEMPLATE_SAVED',
+          templateItem.id,
+          `Saved Reference Lab template (${templateItem.validationState}, rights=${templateItem.licenseType}, mode=${existing.rightsDeclaration.usageMode})`,
+          authReq.requestId,
+          'catalog',
+          'success'
+        );
 
-      return sendOk(
-        res,
-        authReq.requestId,
-        {
-          template: templateItem,
-          promotionResult: promotionResult || null,
-          session: updatedSession,
-        },
-        201
-      );
+        return sendOk(
+          res,
+          authReq.requestId,
+          {
+            template: templateItem,
+            promotionResult: promotionResult || null,
+            session: updatedSession,
+          },
+          201
+        );
+      } catch (err) {
+        return sendPersistenceError(
+          res,
+          authReq.requestId,
+          err,
+          'Unable to save Reference Lab template.'
+        );
+      }
     }
   );
 
@@ -6248,18 +8252,27 @@ export function createApiApp(options: ApiAppOptions = {}) {
     });
   });
 
-  app.get('/api/v1/provider-hub/connections', requireAuth, (req: Request, res: Response) => {
+  app.get('/api/v1/provider-hub/connections', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const uid = authReq.authIdentity!.uid;
-    const connections = getOrSeedUserProviderConnections(uid);
-    return sendOk(res, authReq.requestId, {
-      items: connections.map(toPublicProviderConnectionView),
-      total: connections.length,
-      vaultStatus: getVaultConfigurationDiagnostics(),
-    });
+    try {
+      const connections = await getOrSeedAuthoritativeUserProviderConnections(uid);
+      return sendOk(res, authReq.requestId, {
+        items: connections.map(toPublicProviderConnectionView),
+        total: connections.length,
+        vaultStatus: getVaultConfigurationDiagnostics(),
+      });
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to list provider connections.'
+      );
+    }
   });
 
-  app.post('/api/v1/provider-hub/connections', requireAuth, (req: Request, res: Response) => {
+  app.post('/api/v1/provider-hub/connections', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const uid = authReq.authIdentity!.uid;
     const body = req.body || {};
@@ -6326,15 +8339,14 @@ export function createApiApp(options: ApiAppOptions = {}) {
             : undefined,
       });
 
-      providerConnectionsStore.set(conn.id, conn);
-      persistState();
+      const saved = await saveAuthoritativeProviderConnection(conn);
 
       recordAudit(
         uid,
         authReq.authIdentity!.email,
         'PROVIDER_CONNECTION_CREATED',
-        conn.id,
-        `Created provider connection "${conn.label}" (${conn.protocol}, model=${conn.modelId}, key=${conn.maskedCredential})`,
+        saved.id,
+        `Created provider connection "${saved.label}" (${saved.protocol}, model=${saved.modelId}, key=${saved.maskedCredential})`,
         authReq.requestId,
         'system',
         'success'
@@ -6343,10 +8355,18 @@ export function createApiApp(options: ApiAppOptions = {}) {
       return sendOk(
         res,
         authReq.requestId,
-        { connection: toPublicProviderConnectionView(conn) },
+        { connection: toPublicProviderConnectionView(saved) },
         201
       );
     } catch (err: any) {
+      if (err instanceof PersistenceContractError) {
+        return sendPersistenceError(
+          res,
+          authReq.requestId,
+          err,
+          'Failed to persist provider connection.'
+        );
+      }
       const code = err?.code || 'CONNECTION_CREATE_FAILED';
       const status =
         err instanceof VaultConfigurationError &&
@@ -6368,7 +8388,26 @@ export function createApiApp(options: ApiAppOptions = {}) {
   const handleProbeConnection = async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const uid = authReq.authIdentity!.uid;
-    const existing = providerConnectionsStore.get(req.params.id);
+    let existing: ProviderConnectionRecord | null = null;
+    try {
+      existing = await getAuthoritativeProviderConnection(req.params.id, uid);
+    } catch (err) {
+      if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+        return sendError(
+          res,
+          authReq.requestId,
+          403,
+          'FORBIDDEN_CONNECTION_ACCESS',
+          'Workspace isolation violation: cannot test another user’s provider connection.'
+        );
+      }
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to load provider connection.'
+      );
+    }
     if (!existing) {
       return sendError(
         res,
@@ -6400,8 +8439,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
       fetchImpl: options.providerProbeFetchImpl,
     });
 
-    providerConnectionsStore.set(existing.id, probeResult.updatedConnection);
-    persistState();
+    await saveAuthoritativeProviderConnection(probeResult.updatedConnection);
 
     recordAudit(
       uid,
@@ -6442,10 +8480,29 @@ export function createApiApp(options: ApiAppOptions = {}) {
   app.patch(
     '/api/v1/provider-hub/connections/:id/capabilities',
     requireAuth,
-    (req: Request, res: Response) => {
+    async (req: Request, res: Response) => {
       const authReq = req as AuthenticatedRequest;
       const uid = authReq.authIdentity!.uid;
-      const existing = providerConnectionsStore.get(req.params.id);
+      let existing: ProviderConnectionRecord | null = null;
+      try {
+        existing = await getAuthoritativeProviderConnection(req.params.id, uid);
+      } catch (err) {
+        if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+          return sendError(
+            res,
+            authReq.requestId,
+            403,
+            'FORBIDDEN_CONNECTION_ACCESS',
+            'Cannot modify capabilities on another user’s connection.'
+          );
+        }
+        return sendPersistenceError(
+          res,
+          authReq.requestId,
+          err,
+          'Unable to load provider connection.'
+        );
+      }
       if (!existing) {
         return sendError(
           res,
@@ -6491,8 +8548,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
         state,
         typeof reason === 'string' ? reason : undefined
       );
-      providerConnectionsStore.set(updated.id, updated);
-      persistState();
+      await saveAuthoritativeProviderConnection(updated);
 
       return sendOk(res, authReq.requestId, {
         connection: toPublicProviderConnectionView(updated),
@@ -6503,10 +8559,29 @@ export function createApiApp(options: ApiAppOptions = {}) {
   app.post(
     '/api/v1/provider-hub/connections/:id/rotate-key',
     requireAuth,
-    (req: Request, res: Response) => {
+    async (req: Request, res: Response) => {
       const authReq = req as AuthenticatedRequest;
       const uid = authReq.authIdentity!.uid;
-      const existing = providerConnectionsStore.get(req.params.id);
+      let existing: ProviderConnectionRecord | null = null;
+      try {
+        existing = await getAuthoritativeProviderConnection(req.params.id, uid);
+      } catch (err) {
+        if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+          return sendError(
+            res,
+            authReq.requestId,
+            403,
+            'FORBIDDEN_CONNECTION_ACCESS',
+            'Cannot rotate another user’s credential.'
+          );
+        }
+        return sendPersistenceError(
+          res,
+          authReq.requestId,
+          err,
+          'Unable to load provider connection.'
+        );
+      }
       if (!existing) {
         return sendError(res, authReq.requestId, 404, 'CONNECTION_NOT_FOUND', 'Not found.');
       }
@@ -6534,8 +8609,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
 
       try {
         const updated = rotateConnectionCredential(existing, newCredential);
-        providerConnectionsStore.set(updated.id, updated);
-        persistState();
+        await saveAuthoritativeProviderConnection(updated);
 
         recordAudit(
           uid,
@@ -6552,6 +8626,14 @@ export function createApiApp(options: ApiAppOptions = {}) {
           connection: toPublicProviderConnectionView(updated),
         });
       } catch (err: any) {
+        if (err instanceof PersistenceContractError) {
+          return sendPersistenceError(
+            res,
+            authReq.requestId,
+            err,
+            'Failed to persist rotated credential.'
+          );
+        }
         const code = err?.code || 'CREDENTIAL_ROTATION_FAILED';
         const status =
           err instanceof VaultConfigurationError &&
@@ -6574,10 +8656,29 @@ export function createApiApp(options: ApiAppOptions = {}) {
   app.post(
     '/api/v1/provider-hub/connections/:id/revoke-key',
     requireAuth,
-    (req: Request, res: Response) => {
+    async (req: Request, res: Response) => {
       const authReq = req as AuthenticatedRequest;
       const uid = authReq.authIdentity!.uid;
-      const existing = providerConnectionsStore.get(req.params.id);
+      let existing: ProviderConnectionRecord | null = null;
+      try {
+        existing = await getAuthoritativeProviderConnection(req.params.id, uid);
+      } catch (err) {
+        if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+          return sendError(
+            res,
+            authReq.requestId,
+            403,
+            'FORBIDDEN_CONNECTION_ACCESS',
+            'Cannot revoke another user’s credential.'
+          );
+        }
+        return sendPersistenceError(
+          res,
+          authReq.requestId,
+          err,
+          'Unable to load provider connection.'
+        );
+      }
       if (!existing) {
         return sendError(res, authReq.requestId, 404, 'CONNECTION_NOT_FOUND', 'Not found.');
       }
@@ -6592,8 +8693,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
       }
 
       const updated = revokeConnectionCredential(existing);
-      providerConnectionsStore.set(updated.id, updated);
-      persistState();
+      await saveAuthoritativeProviderConnection(updated);
 
       recordAudit(
         uid,
@@ -6615,10 +8715,29 @@ export function createApiApp(options: ApiAppOptions = {}) {
   app.delete(
     '/api/v1/provider-hub/connections/:id',
     requireAuth,
-    (req: Request, res: Response) => {
+    async (req: Request, res: Response) => {
       const authReq = req as AuthenticatedRequest;
       const uid = authReq.authIdentity!.uid;
-      const existing = providerConnectionsStore.get(req.params.id);
+      let existing: ProviderConnectionRecord | null = null;
+      try {
+        existing = await getAuthoritativeProviderConnection(req.params.id, uid);
+      } catch (err) {
+        if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+          return sendError(
+            res,
+            authReq.requestId,
+            403,
+            'FORBIDDEN_CONNECTION_ACCESS',
+            'Cannot delete another user’s provider connection.'
+          );
+        }
+        return sendPersistenceError(
+          res,
+          authReq.requestId,
+          err,
+          'Unable to load provider connection.'
+        );
+      }
       if (!existing) {
         return sendError(res, authReq.requestId, 404, 'CONNECTION_NOT_FOUND', 'Not found.');
       }
@@ -6632,8 +8751,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
         );
       }
 
-      providerConnectionsStore.delete(existing.id);
-      persistState();
+      await deleteAuthoritativeProviderConnection(existing.id, uid);
 
       recordAudit(
         uid,
@@ -6650,32 +8768,36 @@ export function createApiApp(options: ApiAppOptions = {}) {
     }
   );
 
-  app.get('/api/v1/provider-hub/routing', requireAuth, (req: Request, res: Response) => {
+  app.get('/api/v1/provider-hub/routing', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const uid = authReq.authIdentity!.uid;
-    const userConnections = getOrSeedUserProviderConnections(uid);
-    let profiles = routingProfilesStore.get(uid);
-    if (!profiles) {
-      profiles = buildDefaultRoutingProfiles(userConnections);
-      routingProfilesStore.set(uid, profiles);
-      persistState();
+    try {
+      const userConnections = await getOrSeedAuthoritativeUserProviderConnections(uid);
+      const profiles = await getOrInitAuthoritativeRoutingProfiles(uid, userConnections);
+
+      const connMap = new Map(userConnections.map((c) => [c.id, c]));
+      const evaluations = Object.fromEntries(
+        ALL_HUB_TASK_TYPES.map((t) => [t, evaluateRoutingReadiness(profiles[t], connMap)])
+      );
+
+      return sendOk(res, authReq.requestId, {
+        profiles,
+        evaluations,
+      });
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to load routing profiles.'
+      );
     }
-
-    const connMap = new Map(userConnections.map((c) => [c.id, c]));
-    const evaluations = Object.fromEntries(
-      ALL_HUB_TASK_TYPES.map((t) => [t, evaluateRoutingReadiness(profiles![t], connMap)])
-    );
-
-    return sendOk(res, authReq.requestId, {
-      profiles,
-      evaluations,
-    });
   });
 
   app.put(
     '/api/v1/provider-hub/routing/:taskType',
     requireAuth,
-    (req: Request, res: Response) => {
+    async (req: Request, res: Response) => {
       const authReq = req as AuthenticatedRequest;
       const uid = authReq.authIdentity!.uid;
       const taskType = req.params.taskType as HubTaskType;
@@ -6689,55 +8811,60 @@ export function createApiApp(options: ApiAppOptions = {}) {
         );
       }
 
-      const userConnections = getOrSeedUserProviderConnections(uid);
-      let profiles = routingProfilesStore.get(uid);
-      if (!profiles) {
-        profiles = buildDefaultRoutingProfiles(userConnections);
+      try {
+        const userConnections = await getOrSeedAuthoritativeUserProviderConnections(uid);
+        let profiles = await getOrInitAuthoritativeRoutingProfiles(uid, userConnections);
+
+        const current = profiles[taskType];
+        const body = req.body || {};
+        const updatedProfile: TaskRoutingProfile = {
+          ...current,
+          primaryConnectionId:
+            body.primaryConnectionId !== undefined
+              ? body.primaryConnectionId
+              : current.primaryConnectionId,
+          fallbackConnectionId:
+            body.fallbackConnectionId !== undefined
+              ? body.fallbackConnectionId
+              : current.fallbackConnectionId,
+          maxBudgetPerRunUsd:
+            typeof body.maxBudgetPerRunUsd === 'number'
+              ? Math.max(0.01, Math.min(10, body.maxBudgetPerRunUsd))
+              : current.maxBudgetPerRunUsd,
+          temperature:
+            typeof body.temperature === 'number'
+              ? Math.max(0, Math.min(2, body.temperature))
+              : current.temperature,
+          updatedAt: new Date().toISOString(),
+        };
+
+        profiles = { ...profiles, [taskType]: updatedProfile };
+        await saveAuthoritativeRoutingProfiles(uid, profiles);
+
+        const connMap = new Map(userConnections.map((c) => [c.id, c]));
+        return sendOk(res, authReq.requestId, {
+          profile: updatedProfile,
+          evaluation: evaluateRoutingReadiness(updatedProfile, connMap),
+        });
+      } catch (err) {
+        return sendPersistenceError(
+          res,
+          authReq.requestId,
+          err,
+          'Unable to save routing profile.'
+        );
       }
-
-      const current = profiles[taskType];
-      const body = req.body || {};
-      const updatedProfile: TaskRoutingProfile = {
-        ...current,
-        primaryConnectionId:
-          body.primaryConnectionId !== undefined
-            ? body.primaryConnectionId
-            : current.primaryConnectionId,
-        fallbackConnectionId:
-          body.fallbackConnectionId !== undefined
-            ? body.fallbackConnectionId
-            : current.fallbackConnectionId,
-        maxBudgetPerRunUsd:
-          typeof body.maxBudgetPerRunUsd === 'number'
-            ? Math.max(0.01, Math.min(10, body.maxBudgetPerRunUsd))
-            : current.maxBudgetPerRunUsd,
-        temperature:
-          typeof body.temperature === 'number'
-            ? Math.max(0, Math.min(2, body.temperature))
-            : current.temperature,
-        updatedAt: new Date().toISOString(),
-      };
-
-      profiles = { ...profiles, [taskType]: updatedProfile };
-      routingProfilesStore.set(uid, profiles);
-      persistState();
-
-      const connMap = new Map(userConnections.map((c) => [c.id, c]));
-      return sendOk(res, authReq.requestId, {
-        profile: updatedProfile,
-        evaluation: evaluateRoutingReadiness(updatedProfile, connMap),
-      });
     }
   );
 
   // --- EXTENSIONS WORKSPACE (REPOSITORIES, SKILLS, DOCS WEBSITES, APIS) ---
 
-  function getOrSeedUserExtensions(uid: string): ExtensionPackageRecord[] {
-    const existing = Array.from(extensionPackagesStore.values()).filter(
-      (e) => e.ownerUid === uid && e.installState !== 'uninstalled'
-    );
+  async function getOrSeedAuthoritativeUserExtensions(
+    uid: string
+  ): Promise<ExtensionPackageRecord[]> {
+    const existing = await listAuthoritativeExtensions(uid, false);
     if (existing.length > 0) {
-      return existing.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+      return existing;
     }
     const seedSkill = registerExtensionPackage({
       ownerUid: uid,
@@ -6754,22 +8881,30 @@ export function createApiApp(options: ApiAppOptions = {}) {
         'Provides deterministic spring easing presets and word-by-word highlight timing rules for vertical 9:16 reels.',
       explicitApprovalGranted: true,
     });
-    extensionPackagesStore.set(seedSkill.id, seedSkill);
-    persistState();
-    return [seedSkill];
+    const saved = await saveAuthoritativeExtension(seedSkill);
+    return [saved];
   }
 
-  app.get('/api/v1/extensions', requireAuth, (req: Request, res: Response) => {
+  app.get('/api/v1/extensions', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const uid = authReq.authIdentity!.uid;
-    const items = getOrSeedUserExtensions(uid);
-    return sendOk(res, authReq.requestId, {
-      items,
-      total: items.length,
-    });
+    try {
+      const items = await getOrSeedAuthoritativeUserExtensions(uid);
+      return sendOk(res, authReq.requestId, {
+        items,
+        total: items.length,
+      });
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to list extensions.'
+      );
+    }
   });
 
-  app.post('/api/v1/extensions', requireAuth, (req: Request, res: Response) => {
+  app.post('/api/v1/extensions', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const uid = authReq.authIdentity!.uid;
     const body = req.body || {};
@@ -6807,24 +8942,31 @@ export function createApiApp(options: ApiAppOptions = {}) {
         explicitApprovalGranted: Boolean(body.explicitApprovalGranted),
       });
 
-      extensionPackagesStore.set(ext.id, ext);
-      persistState();
+      const saved = await saveAuthoritativeExtension(ext);
 
       recordAudit(
         uid,
         authReq.authIdentity!.email,
-        ext.installState === 'quarantined'
+        saved.installState === 'quarantined'
           ? 'EXTENSION_QUARANTINED_BY_SANDBOX'
           : 'EXTENSION_REGISTERED',
-        ext.id,
-        `Registered extension "${ext.name}" (${ext.kind}, pin=${ext.commitOrReleasePin}, state=${ext.installState})`,
+        saved.id,
+        `Registered extension "${saved.name}" (${saved.kind}, pin=${saved.commitOrReleasePin}, state=${saved.installState})`,
         authReq.requestId,
         'system',
-        ext.installState === 'quarantined' ? 'denied' : 'success'
+        saved.installState === 'quarantined' ? 'denied' : 'success'
       );
 
-      return sendOk(res, authReq.requestId, { extension: ext }, 201);
+      return sendOk(res, authReq.requestId, { extension: saved }, 201);
     } catch (err: any) {
+      if (err instanceof PersistenceContractError) {
+        return sendPersistenceError(
+          res,
+          authReq.requestId,
+          err,
+          'Failed to persist extension package.'
+        );
+      }
       return sendError(
         res,
         authReq.requestId,
@@ -6835,10 +8977,24 @@ export function createApiApp(options: ApiAppOptions = {}) {
     }
   });
 
-  app.patch('/api/v1/extensions/:id', requireAuth, (req: Request, res: Response) => {
+  app.patch('/api/v1/extensions/:id', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const uid = authReq.authIdentity!.uid;
-    const existing = extensionPackagesStore.get(req.params.id);
+    let existing: ExtensionPackageRecord | null = null;
+    try {
+      existing = await getAuthoritativeExtension(req.params.id, uid);
+    } catch (err) {
+      if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+        return sendError(
+          res,
+          authReq.requestId,
+          403,
+          'FORBIDDEN_EXTENSION_ACCESS',
+          'Cannot modify another user’s extension.'
+        );
+      }
+      return sendPersistenceError(res, authReq.requestId, err, 'Unable to load extension.');
+    }
     if (!existing || existing.installState === 'uninstalled') {
       return sendError(res, authReq.requestId, 404, 'EXTENSION_NOT_FOUND', 'Extension not found.');
     }
@@ -6853,27 +9009,40 @@ export function createApiApp(options: ApiAppOptions = {}) {
     }
 
     const updated = updateExtensionPackage(existing, req.body || {});
-    extensionPackagesStore.set(updated.id, updated);
-    persistState();
+    const saved = await saveAuthoritativeExtension(updated);
 
     recordAudit(
       uid,
       authReq.authIdentity!.email,
       'EXTENSION_UPDATED',
-      updated.id,
-      `Updated extension "${updated.name}" (version=${updated.version}, state=${updated.installState})`,
+      saved.id,
+      `Updated extension "${saved.name}" (version=${saved.version}, state=${saved.installState})`,
       authReq.requestId,
       'system',
       'success'
     );
 
-    return sendOk(res, authReq.requestId, { extension: updated });
+    return sendOk(res, authReq.requestId, { extension: saved });
   });
 
-  app.post('/api/v1/extensions/:id/rollback', requireAuth, (req: Request, res: Response) => {
+  app.post('/api/v1/extensions/:id/rollback', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const uid = authReq.authIdentity!.uid;
-    const existing = extensionPackagesStore.get(req.params.id);
+    let existing: ExtensionPackageRecord | null = null;
+    try {
+      existing = await getAuthoritativeExtension(req.params.id, uid);
+    } catch (err) {
+      if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+        return sendError(
+          res,
+          authReq.requestId,
+          403,
+          'FORBIDDEN_EXTENSION_ACCESS',
+          'Cannot rollback another user’s extension.'
+        );
+      }
+      return sendPersistenceError(res, authReq.requestId, err, 'Unable to load extension.');
+    }
     if (!existing) {
       return sendError(res, authReq.requestId, 404, 'EXTENSION_NOT_FOUND', 'Extension not found.');
     }
@@ -6894,21 +9063,20 @@ export function createApiApp(options: ApiAppOptions = {}) {
           ? req.body.targetCommitOrVersion
           : undefined
       );
-      extensionPackagesStore.set(rolledBack.id, rolledBack);
-      persistState();
+      const saved = await saveAuthoritativeExtension(rolledBack);
 
       recordAudit(
         uid,
         authReq.authIdentity!.email,
         'EXTENSION_ROLLED_BACK',
-        rolledBack.id,
-        `Rolled back extension "${rolledBack.name}" to version=${rolledBack.version} (${rolledBack.commitOrReleasePin})`,
+        saved.id,
+        `Rolled back extension "${saved.name}" to version=${saved.version} (${saved.commitOrReleasePin})`,
         authReq.requestId,
         'system',
         'success'
       );
 
-      return sendOk(res, authReq.requestId, { extension: rolledBack });
+      return sendOk(res, authReq.requestId, { extension: saved });
     } catch (err: any) {
       return sendError(
         res,
@@ -6920,50 +9088,81 @@ export function createApiApp(options: ApiAppOptions = {}) {
     }
   });
 
-  app.post('/api/v1/extensions/:id/sandbox-verify', requireAuth, (req: Request, res: Response) => {
+  app.post(
+    '/api/v1/extensions/:id/sandbox-verify',
+    requireAuth,
+    async (req: Request, res: Response) => {
+      const authReq = req as AuthenticatedRequest;
+      const uid = authReq.authIdentity!.uid;
+      let existing: ExtensionPackageRecord | null = null;
+      try {
+        existing = await getAuthoritativeExtension(req.params.id, uid);
+      } catch (err) {
+        if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+          return sendError(
+            res,
+            authReq.requestId,
+            403,
+            'FORBIDDEN_EXTENSION_ACCESS',
+            'Cannot run sandbox on another user’s extension.'
+          );
+        }
+        return sendPersistenceError(res, authReq.requestId, err, 'Unable to load extension.');
+      }
+      if (!existing) {
+        return sendError(res, authReq.requestId, 404, 'EXTENSION_NOT_FOUND', 'Extension not found.');
+      }
+      if (existing.ownerUid !== uid) {
+        return sendError(
+          res,
+          authReq.requestId,
+          403,
+          'FORBIDDEN_EXTENSION_ACCESS',
+          'Cannot run sandbox on another user’s extension.'
+        );
+      }
+
+      const run = inspectAndSandboxExtensionContent({
+        extensionId: existing.id,
+        rawContent: existing.untrustedContentEnvelope,
+        dependencies: existing.dependencies,
+        requestedPermissions: existing.requestedPermissions,
+        explicitApprovalGranted: existing.explicitApprovalGranted,
+      });
+
+      const updated: ExtensionPackageRecord = {
+        ...existing,
+        installState: run.passed ? existing.installState : 'quarantined',
+        validationRuns: [run, ...existing.validationRuns].slice(0, 20),
+        updatedAt: new Date().toISOString(),
+      };
+      const saved = await saveAuthoritativeExtension(updated);
+
+      return sendOk(res, authReq.requestId, {
+        extension: saved,
+        validationRun: run,
+      });
+    }
+  );
+
+  app.delete('/api/v1/extensions/:id', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const uid = authReq.authIdentity!.uid;
-    const existing = extensionPackagesStore.get(req.params.id);
-    if (!existing) {
-      return sendError(res, authReq.requestId, 404, 'EXTENSION_NOT_FOUND', 'Extension not found.');
+    let existing: ExtensionPackageRecord | null = null;
+    try {
+      existing = await getAuthoritativeExtension(req.params.id, uid);
+    } catch (err) {
+      if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+        return sendError(
+          res,
+          authReq.requestId,
+          403,
+          'FORBIDDEN_EXTENSION_ACCESS',
+          'Cannot uninstall another user’s extension.'
+        );
+      }
+      return sendPersistenceError(res, authReq.requestId, err, 'Unable to load extension.');
     }
-    if (existing.ownerUid !== uid) {
-      return sendError(
-        res,
-        authReq.requestId,
-        403,
-        'FORBIDDEN_EXTENSION_ACCESS',
-        'Cannot run sandbox on another user’s extension.'
-      );
-    }
-
-    const run = inspectAndSandboxExtensionContent({
-      extensionId: existing.id,
-      rawContent: existing.untrustedContentEnvelope,
-      dependencies: existing.dependencies,
-      requestedPermissions: existing.requestedPermissions,
-      explicitApprovalGranted: existing.explicitApprovalGranted,
-    });
-
-    const updated: ExtensionPackageRecord = {
-      ...existing,
-      installState: run.passed ? existing.installState : 'quarantined',
-      validationRuns: [run, ...existing.validationRuns].slice(0, 20),
-      updatedAt: new Date().toISOString(),
-    };
-    extensionPackagesStore.set(updated.id, updated);
-    persistState();
-
-    return sendOk(res, authReq.requestId, {
-      extension: updated,
-      validationRun: run,
-    });
-  });
-
-  app.delete('/api/v1/extensions/:id', requireAuth, (req: Request, res: Response) => {
-    const authReq = req as AuthenticatedRequest;
-    const uid = authReq.authIdentity!.uid;
-    const existing = extensionPackagesStore.get(req.params.id);
     if (!existing) {
       return sendError(res, authReq.requestId, 404, 'EXTENSION_NOT_FOUND', 'Extension not found.');
     }
@@ -6977,8 +9176,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
       );
     }
 
-    extensionPackagesStore.delete(existing.id);
-    persistState();
+    await deleteAuthoritativeExtension(existing.id, uid);
 
     recordAudit(
       uid,
@@ -6996,10 +9194,10 @@ export function createApiApp(options: ApiAppOptions = {}) {
 
   // --- TYPED AI TOOL REGISTRY & POLICY-ENFORCED INVOCATION ---
 
-  app.get('/api/v1/tools/registry', requireAuth, (req: Request, res: Response) => {
+  app.get('/api/v1/tools/registry', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const uid = authReq.authIdentity!.uid;
-    const auditItems = toolAuditRecordsStore.filter((a) => a.ownerUid === uid).slice(0, 50);
+    const auditItems = await listAuthoritativeToolAudits(uid);
     return sendOk(res, authReq.requestId, {
       tools: REGISTERED_AI_TOOLS,
       total: REGISTERED_AI_TOOLS.length,
@@ -7009,7 +9207,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
     });
   });
 
-  app.post('/api/v1/tools/invoke', requireAuth, (req: Request, res: Response) => {
+  app.post('/api/v1/tools/invoke', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const uid = authReq.authIdentity!.uid;
     const body = req.body || {};
@@ -7035,8 +9233,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
         : undefined,
     });
 
-    toolAuditRecordsStore.unshift(result.auditRecord);
-    persistState();
+    await appendAuthoritativeToolAudit(result.auditRecord);
 
     recordAudit(
       uid,
@@ -7079,22 +9276,31 @@ export function createApiApp(options: ApiAppOptions = {}) {
     });
   });
 
-  app.get('/api/v1/ai-director/sessions', requireAuth, (req: Request, res: Response) => {
+  app.get('/api/v1/ai-director/sessions', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     res.setHeader('Cache-Control', 'private, no-store');
     const uid = authReq.authIdentity!.uid;
     const isAdmin = authReq.userRole === 'owner' || authReq.userRole === 'admin';
     const includeAll = isAdmin && req.query.scope === 'all';
-    const items = Array.from(aiDirectorSessionsStore.values())
-      .filter((s) => (includeAll ? true : s.ownerUid === uid))
-      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-    return sendOk(res, authReq.requestId, {
-      items,
-      total: items.length,
-    });
+    try {
+      const items = (await listAuthoritativeAiDirectorSessions(uid, includeAll)).sort((a, b) =>
+        b.updatedAt.localeCompare(a.updatedAt)
+      );
+      return sendOk(res, authReq.requestId, {
+        items,
+        total: items.length,
+      });
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to list AI Director sessions.'
+      );
+    }
   });
 
-  app.post('/api/v1/ai-director/sessions', requireAuth, (req: Request, res: Response) => {
+  app.post('/api/v1/ai-director/sessions', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     res.setHeader('Cache-Control', 'private, no-store');
     const uid = authReq.authIdentity!.uid;
@@ -7159,20 +9365,27 @@ export function createApiApp(options: ApiAppOptions = {}) {
         autonomyMode: intakeObj.autonomyMode,
       });
 
-      aiDirectorSessionsStore.set(session.id, session);
-      persistState();
+      const saved = await saveAuthoritativeAiDirectorSession(session);
       recordAudit(
         uid,
         authReq.authIdentity!.email,
         'AI_DIRECTOR_SESSION_CREATE',
-        `/aiDirectorSessions/${session.id}`,
-        `Created AI Director session "${session.intake.title}" (${session.segments.length} segments, stage=${session.stage})`,
+        `/aiDirectorSessions/${saved.id}`,
+        `Created AI Director session "${saved.intake.title}" (${saved.segments.length} segments, stage=${saved.stage})`,
         authReq.requestId,
         'user',
         'success'
       );
-      return sendOk(res, authReq.requestId, { session }, 201);
+      return sendOk(res, authReq.requestId, { session: saved }, 201);
     } catch (err) {
+      if (err instanceof PersistenceContractError) {
+        return sendPersistenceError(
+          res,
+          authReq.requestId,
+          err,
+          'Failed to persist AI Director session.'
+        );
+      }
       return sendError(
         res,
         authReq.requestId,
@@ -7183,39 +9396,84 @@ export function createApiApp(options: ApiAppOptions = {}) {
     }
   });
 
-  app.get('/api/v1/ai-director/sessions/:id', requireAuth, (req: Request, res: Response) => {
+  app.get('/api/v1/ai-director/sessions/:id', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     res.setHeader('Cache-Control', 'private, no-store');
-    const session = aiDirectorSessionsStore.get(req.params.id);
-    if (!session) {
-      return sendError(res, authReq.requestId, 404, 'DIRECTOR_SESSION_NOT_FOUND', 'AI Director session not found.');
-    }
     const isAdmin = authReq.userRole === 'owner' || authReq.userRole === 'admin';
-    if (session.ownerUid !== authReq.authIdentity!.uid && !isAdmin) {
-      recordAudit(
+    try {
+      const session = await getAuthoritativeAiDirectorSession(
+        req.params.id,
         authReq.authIdentity!.uid,
-        authReq.authIdentity!.email,
-        'AI_DIRECTOR_IDOR_DENIED',
-        `/aiDirectorSessions/${session.id}`,
-        'Blocked cross-user access to AI Director session',
-        authReq.requestId,
-        'system',
-        'denied'
+        isAdmin
       );
-      return sendError(res, authReq.requestId, 403, 'FORBIDDEN_DIRECTOR_SESSION', 'You do not own this AI Director session.');
+      if (!session) {
+        return sendError(
+          res,
+          authReq.requestId,
+          404,
+          'DIRECTOR_SESSION_NOT_FOUND',
+          'AI Director session not found.'
+        );
+      }
+      return sendOk(res, authReq.requestId, { session });
+    } catch (err) {
+      if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+        recordAudit(
+          authReq.authIdentity!.uid,
+          authReq.authIdentity!.email,
+          'AI_DIRECTOR_IDOR_DENIED',
+          `/aiDirectorSessions/${req.params.id}`,
+          'Blocked cross-user access to AI Director session',
+          authReq.requestId,
+          'system',
+          'denied'
+        );
+        return sendError(
+          res,
+          authReq.requestId,
+          403,
+          'FORBIDDEN_DIRECTOR_SESSION',
+          'You do not own this AI Director session.'
+        );
+      }
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to read AI Director session.'
+      );
     }
-    return sendOk(res, authReq.requestId, { session });
   });
 
-  app.post('/api/v1/ai-director/sessions/:id/questions', requireAuth, (req: Request, res: Response) => {
+  app.post('/api/v1/ai-director/sessions/:id/questions', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     res.setHeader('Cache-Control', 'private, no-store');
-    const session = aiDirectorSessionsStore.get(req.params.id);
+    let session: AiDirectorSessionRecord | null = null;
+    try {
+      session = await getAuthoritativeAiDirectorSession(
+        req.params.id,
+        authReq.authIdentity!.uid,
+        false
+      );
+    } catch (err) {
+      if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+        return sendError(
+          res,
+          authReq.requestId,
+          403,
+          'FORBIDDEN_DIRECTOR_SESSION',
+          'You do not own this AI Director session.'
+        );
+      }
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to load AI Director session.'
+      );
+    }
     if (!session) {
       return sendError(res, authReq.requestId, 404, 'DIRECTOR_SESSION_NOT_FOUND', 'AI Director session not found.');
-    }
-    if (session.ownerUid !== authReq.authIdentity!.uid) {
-      return sendError(res, authReq.requestId, 403, 'FORBIDDEN_DIRECTOR_SESSION', 'You do not own this AI Director session.');
     }
 
     const body = (req.body || {}) as {
@@ -7223,24 +9481,52 @@ export function createApiApp(options: ApiAppOptions = {}) {
       applyDefaultsToUnanswered?: boolean;
     };
 
-    const updated = answerDirectorQuestions(session, {
-      answers: body.answers,
-      applyDefaultsToUnanswered: body.applyDefaultsToUnanswered !== false,
-    });
-    aiDirectorSessionsStore.set(updated.id, updated);
-    persistState();
-    return sendOk(res, authReq.requestId, { session: updated });
+    try {
+      const updated = answerDirectorQuestions(session, {
+        answers: body.answers,
+        applyDefaultsToUnanswered: body.applyDefaultsToUnanswered !== false,
+      });
+      const saved = await saveAuthoritativeAiDirectorSession(updated);
+      return sendOk(res, authReq.requestId, { session: saved });
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to persist AI Director questions stage.'
+      );
+    }
   });
 
-  app.post('/api/v1/ai-director/sessions/:id/plan', requireAuth, (req: Request, res: Response) => {
+  app.post('/api/v1/ai-director/sessions/:id/plan', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     res.setHeader('Cache-Control', 'private, no-store');
-    const session = aiDirectorSessionsStore.get(req.params.id);
+    let session: AiDirectorSessionRecord | null = null;
+    try {
+      session = await getAuthoritativeAiDirectorSession(
+        req.params.id,
+        authReq.authIdentity!.uid,
+        false
+      );
+    } catch (err) {
+      if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+        return sendError(
+          res,
+          authReq.requestId,
+          403,
+          'FORBIDDEN_DIRECTOR_SESSION',
+          'You do not own this AI Director session.'
+        );
+      }
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to load AI Director session.'
+      );
+    }
     if (!session) {
       return sendError(res, authReq.requestId, 404, 'DIRECTOR_SESSION_NOT_FOUND', 'AI Director session not found.');
-    }
-    if (session.ownerUid !== authReq.authIdentity!.uid) {
-      return sendError(res, authReq.requestId, 403, 'FORBIDDEN_DIRECTOR_SESSION', 'You do not own this AI Director session.');
     }
 
     const body = (req.body || {}) as Parameters<typeof updateDirectorShotPlanAndApprovals>[1];
@@ -7249,20 +9535,27 @@ export function createApiApp(options: ApiAppOptions = {}) {
         ...body,
         actorUid: authReq.authIdentity!.uid,
       });
-      aiDirectorSessionsStore.set(updated.id, updated);
-      persistState();
+      const saved = await saveAuthoritativeAiDirectorSession(updated);
       recordAudit(
         authReq.authIdentity!.uid,
         authReq.authIdentity!.email,
         'AI_DIRECTOR_PLAN_UPDATE',
-        `/aiDirectorSessions/${session.id}`,
-        `Updated shot plan/approvals for "${session.intake.title}" (action=${body.action}, revisions=${updated.planRevisions.length})`,
+        `/aiDirectorSessions/${saved.id}`,
+        `Updated shot plan/approvals for "${saved.intake.title}" (action=${body.action}, revisions=${saved.planRevisions.length})`,
         authReq.requestId,
         'user',
         'success'
       );
-      return sendOk(res, authReq.requestId, { session: updated });
+      return sendOk(res, authReq.requestId, { session: saved });
     } catch (err) {
+      if (err instanceof PersistenceContractError) {
+        return sendPersistenceError(
+          res,
+          authReq.requestId,
+          err,
+          'Unable to persist AI Director shot plan.'
+        );
+      }
       return sendError(
         res,
         authReq.requestId,
@@ -7273,15 +9566,35 @@ export function createApiApp(options: ApiAppOptions = {}) {
     }
   });
 
-  app.post('/api/v1/ai-director/sessions/:id/produce', requireAuth, (req: Request, res: Response) => {
+  app.post('/api/v1/ai-director/sessions/:id/produce', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     res.setHeader('Cache-Control', 'private, no-store');
-    const session = aiDirectorSessionsStore.get(req.params.id);
+    let session: AiDirectorSessionRecord | null = null;
+    try {
+      session = await getAuthoritativeAiDirectorSession(
+        req.params.id,
+        authReq.authIdentity!.uid,
+        false
+      );
+    } catch (err) {
+      if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+        return sendError(
+          res,
+          authReq.requestId,
+          403,
+          'FORBIDDEN_DIRECTOR_SESSION',
+          'You do not own this AI Director session.'
+        );
+      }
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to load AI Director session.'
+      );
+    }
     if (!session) {
       return sendError(res, authReq.requestId, 404, 'DIRECTOR_SESSION_NOT_FOUND', 'AI Director session not found.');
-    }
-    if (session.ownerUid !== authReq.authIdentity!.uid) {
-      return sendError(res, authReq.requestId, 403, 'FORBIDDEN_DIRECTOR_SESSION', 'You do not own this AI Director session.');
     }
 
     const body = (req.body || {}) as {
@@ -7295,11 +9608,11 @@ export function createApiApp(options: ApiAppOptions = {}) {
           : [],
         onlyApprovedShots: body.onlyApprovedShots,
       });
-      aiDirectorSessionsStore.set(updated.id, updated);
+      const savedSession = await saveAuthoritativeAiDirectorSession(updated);
 
       // Automatically save AI-generated assets & reusable scene components as private Drafts
       const callerUid = authReq.authIdentity!.uid;
-      for (const genAsset of updated.generatedAssetRecords || []) {
+      for (const genAsset of savedSession.generatedAssetRecords || []) {
         if (!assetsStore.has(genAsset.assetTaskId)) {
           const nowIso = new Date().toISOString();
           const hash = computeDeterministicSnapshotHash(genAsset);
@@ -7345,25 +9658,24 @@ export function createApiApp(options: ApiAppOptions = {}) {
         }
       }
 
-      if (updated.canonicalProject && updated.canonicalProject.scenes.length > 0) {
-        const userDrafts = Array.from(templateFactoryDraftsStore.values()).filter(
-          (d) => d.ownerUid === callerUid
-        );
+      if (savedSession.canonicalProject && savedSession.canonicalProject.scenes.length > 0) {
+        const userDrafts = await listAuthoritativeTemplateFactoryDrafts(callerUid);
+        const existingCatalog = await listAuthoritativeCatalogItems();
         const autoDraft = runTemplateFactoryPipeline({
           ownerUid: callerUid,
           sourceKind: 'canonical-project',
-          title: `${updated.intake.title} · Reusable Scene 1 Rig`,
-          description: `Auto-captured reusable scene component from AI Director session "${updated.intake.title}".`,
+          title: `${savedSession.intake.title} · Reusable Scene 1 Rig`,
+          description: `Auto-captured reusable scene component from AI Director session "${savedSession.intake.title}".`,
           moduleId: 'templates',
           licenseType: 'Sowveil Original',
-          sourceProject: updated.canonicalProject,
-          selectedSceneIds: [updated.canonicalProject.scenes[0].id],
+          sourceProject: savedSession.canonicalProject,
+          selectedSceneIds: [savedSession.canonicalProject.scenes[0].id],
           autoSavedFromAiComponent: true,
-          existingCatalog: Array.from(catalogStore.values()),
+          existingCatalog,
           existingFactoryDrafts: userDrafts,
           assetsMap: assetsStore,
         });
-        templateFactoryDraftsStore.set(autoDraft.id, autoDraft);
+        await saveAuthoritativeTemplateFactoryDraft(autoDraft);
       }
 
       persistState();
@@ -7371,14 +9683,22 @@ export function createApiApp(options: ApiAppOptions = {}) {
         authReq.authIdentity!.uid,
         authReq.authIdentity!.email,
         'AI_DIRECTOR_PRODUCE_TIMELINE',
-        `/aiDirectorSessions/${session.id}`,
-        `Compiled canonical project v2.0.0 for "${session.intake.title}" (${updated.commandReceipts.length} commands, gate=${updated.acceptanceGate.passed})`,
+        `/aiDirectorSessions/${savedSession.id}`,
+        `Compiled canonical project v2.0.0 for "${savedSession.intake.title}" (${savedSession.commandReceipts.length} commands, gate=${savedSession.acceptanceGate.passed})`,
         authReq.requestId,
         'user',
         'success'
       );
-      return sendOk(res, authReq.requestId, { session: updated });
+      return sendOk(res, authReq.requestId, { session: savedSession });
     } catch (err) {
+      if (err instanceof PersistenceContractError) {
+        return sendPersistenceError(
+          res,
+          authReq.requestId,
+          err,
+          'Unable to persist AI Director production stage.'
+        );
+      }
       return sendError(
         res,
         authReq.requestId,
@@ -7389,15 +9709,35 @@ export function createApiApp(options: ApiAppOptions = {}) {
     }
   });
 
-  app.post('/api/v1/ai-director/sessions/:id/refine', requireAuth, (req: Request, res: Response) => {
+  app.post('/api/v1/ai-director/sessions/:id/refine', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     res.setHeader('Cache-Control', 'private, no-store');
-    const session = aiDirectorSessionsStore.get(req.params.id);
+    let session: AiDirectorSessionRecord | null = null;
+    try {
+      session = await getAuthoritativeAiDirectorSession(
+        req.params.id,
+        authReq.authIdentity!.uid,
+        false
+      );
+    } catch (err) {
+      if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+        return sendError(
+          res,
+          authReq.requestId,
+          403,
+          'FORBIDDEN_DIRECTOR_SESSION',
+          'You do not own this AI Director session.'
+        );
+      }
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to load AI Director session.'
+      );
+    }
     if (!session) {
       return sendError(res, authReq.requestId, 404, 'DIRECTOR_SESSION_NOT_FOUND', 'AI Director session not found.');
-    }
-    if (session.ownerUid !== authReq.authIdentity!.uid) {
-      return sendError(res, authReq.requestId, 403, 'FORBIDDEN_DIRECTOR_SESSION', 'You do not own this AI Director session.');
     }
 
     const body = (req.body || {}) as { suggestionId?: string };
@@ -7413,10 +9753,17 @@ export function createApiApp(options: ApiAppOptions = {}) {
 
     try {
       const updated = applyAdaptiveRefinement(session, body.suggestionId);
-      aiDirectorSessionsStore.set(updated.id, updated);
-      persistState();
-      return sendOk(res, authReq.requestId, { session: updated });
+      const saved = await saveAuthoritativeAiDirectorSession(updated);
+      return sendOk(res, authReq.requestId, { session: saved });
     } catch (err) {
+      if (err instanceof PersistenceContractError) {
+        return sendPersistenceError(
+          res,
+          authReq.requestId,
+          err,
+          'Unable to persist AI Director refinement.'
+        );
+      }
       return sendError(
         res,
         authReq.requestId,
@@ -7427,15 +9774,35 @@ export function createApiApp(options: ApiAppOptions = {}) {
     }
   });
 
-  app.post('/api/v1/ai-director/sessions/:id/rollback', requireAuth, (req: Request, res: Response) => {
+  app.post('/api/v1/ai-director/sessions/:id/rollback', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     res.setHeader('Cache-Control', 'private, no-store');
-    const session = aiDirectorSessionsStore.get(req.params.id);
+    let session: AiDirectorSessionRecord | null = null;
+    try {
+      session = await getAuthoritativeAiDirectorSession(
+        req.params.id,
+        authReq.authIdentity!.uid,
+        false
+      );
+    } catch (err) {
+      if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+        return sendError(
+          res,
+          authReq.requestId,
+          403,
+          'FORBIDDEN_DIRECTOR_SESSION',
+          'You do not own this AI Director session.'
+        );
+      }
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to load AI Director session.'
+      );
+    }
     if (!session) {
       return sendError(res, authReq.requestId, 404, 'DIRECTOR_SESSION_NOT_FOUND', 'AI Director session not found.');
-    }
-    if (session.ownerUid !== authReq.authIdentity!.uid) {
-      return sendError(res, authReq.requestId, 403, 'FORBIDDEN_DIRECTOR_SESSION', 'You do not own this AI Director session.');
     }
 
     const body = (req.body || {}) as { checkpointId?: string };
@@ -7445,20 +9812,27 @@ export function createApiApp(options: ApiAppOptions = {}) {
 
     try {
       const updated = rollbackDirectorToCheckpoint(session, body.checkpointId);
-      aiDirectorSessionsStore.set(updated.id, updated);
-      persistState();
+      const saved = await saveAuthoritativeAiDirectorSession(updated);
       recordAudit(
         authReq.authIdentity!.uid,
         authReq.authIdentity!.email,
         'AI_DIRECTOR_CHECKPOINT_ROLLBACK',
-        `/aiDirectorSessions/${session.id}`,
-        `Rolled back AI Director session "${session.intake.title}" to checkpoint ${body.checkpointId}`,
+        `/aiDirectorSessions/${saved.id}`,
+        `Rolled back AI Director session "${saved.intake.title}" to checkpoint ${body.checkpointId}`,
         authReq.requestId,
         'user',
         'success'
       );
-      return sendOk(res, authReq.requestId, { session: updated });
+      return sendOk(res, authReq.requestId, { session: saved });
     } catch (err) {
+      if (err instanceof PersistenceContractError) {
+        return sendPersistenceError(
+          res,
+          authReq.requestId,
+          err,
+          'Unable to persist AI Director rollback.'
+        );
+      }
       return sendError(
         res,
         authReq.requestId,
@@ -7469,79 +9843,185 @@ export function createApiApp(options: ApiAppOptions = {}) {
     }
   });
 
-  app.post('/api/v1/ai-director/sessions/:id/save-project', requireAuth, (req: Request, res: Response) => {
-    const authReq = req as AuthenticatedRequest;
-    res.setHeader('Cache-Control', 'private, no-store');
-    const session = aiDirectorSessionsStore.get(req.params.id);
-    if (!session) {
-      return sendError(res, authReq.requestId, 404, 'DIRECTOR_SESSION_NOT_FOUND', 'AI Director session not found.');
+  app.post(
+    '/api/v1/ai-director/sessions/:id/save-project',
+    requireAuth,
+    async (req: Request, res: Response) => {
+      const authReq = req as AuthenticatedRequest;
+      const uid = authReq.authIdentity!.uid;
+      res.setHeader('Cache-Control', 'private, no-store');
+      let session: AiDirectorSessionRecord | null = null;
+      try {
+        session = await getAuthoritativeAiDirectorSession(req.params.id, uid, false);
+      } catch (err) {
+        if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+          return sendError(
+            res,
+            authReq.requestId,
+            403,
+            'FORBIDDEN_DIRECTOR_SESSION',
+            'You do not own this AI Director session.'
+          );
+        }
+        return sendPersistenceError(
+          res,
+          authReq.requestId,
+          err,
+          'Unable to load AI Director session.'
+        );
+      }
+      if (!session) {
+        return sendError(
+          res,
+          authReq.requestId,
+          404,
+          'DIRECTOR_SESSION_NOT_FOUND',
+          'AI Director session not found.'
+        );
+      }
+      if (!session.canonicalProject) {
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          'CANONICAL_PROJECT_NOT_COMPILED',
+          'Execute the production plan first to compile the Canonical Project v2.0.0 before saving to Project Library.'
+        );
+      }
+
+      const now = new Date().toISOString();
+      const projectId =
+        session.savedProjectId || session.canonicalProject.id || `proj_dir_${session.id}`;
+      const synchronizedCanon: CanonicalProjectDocument = {
+        ...session.canonicalProject,
+        id: projectId,
+        ownerUid: uid,
+      };
+      const gate = evaluateDirectorAcceptanceGate({
+        ...session,
+        canonicalProject: synchronizedCanon,
+      });
+      const partialRecord = canonicalProjectToLibraryRecord(synchronizedCanon);
+
+      try {
+        const existingProj = await getAuthoritativeProject(projectId, uid);
+        let projectRecord: ProjectLibraryItem;
+        if (existingProj) {
+          projectRecord = await updateAuthoritativeProject(projectId, uid, {
+            ...partialRecord,
+            id: projectId,
+            ownerUid: uid,
+            revision: Math.max(
+              partialRecord.revision || 1,
+              (existingProj.revision || 1) + 1
+            ),
+            updatedAt: now,
+          });
+        } else {
+          projectRecord = await saveAuthoritativeNewProject({
+            ...partialRecord,
+            id: projectId,
+            ownerUid: uid,
+            createdAt: now,
+            updatedAt: now,
+          });
+        }
+
+        const updatedSession: AiDirectorSessionRecord = {
+          ...session,
+          savedProjectId: projectRecord.id,
+          canonicalProject: {
+            ...synchronizedCanon,
+            revision: projectRecord.revision || synchronizedCanon.revision,
+          },
+          acceptanceGate: gate,
+          updatedAt: now,
+        };
+        const savedSession = await saveAuthoritativeAiDirectorSession(updatedSession);
+
+        recordAudit(
+          uid,
+          authReq.authIdentity!.email,
+          'AI_DIRECTOR_SAVE_PROJECT',
+          `/projects/${projectRecord.id}`,
+          `Saved AI Director canonical project "${projectRecord.title}" to Project Library`,
+          authReq.requestId,
+          'user',
+          'success'
+        );
+
+        return sendOk(res, authReq.requestId, {
+          project: projectRecord,
+          session: savedSession,
+        });
+      } catch (err) {
+        return sendPersistenceError(
+          res,
+          authReq.requestId,
+          err,
+          'Unable to save AI Director project to Project Library.'
+        );
+      }
     }
-    if (session.ownerUid !== authReq.authIdentity!.uid) {
-      return sendError(res, authReq.requestId, 403, 'FORBIDDEN_DIRECTOR_SESSION', 'You do not own this AI Director session.');
-    }
-    if (!session.canonicalProject) {
-      return sendError(
-        res,
-        authReq.requestId,
-        400,
-        'CANONICAL_PROJECT_NOT_COMPILED',
-        'Execute the production plan first to compile the Canonical Project v2.0.0 before saving to Project Library.'
-      );
-    }
-
-    const now = new Date().toISOString();
-    const projectId = session.canonicalProject.id || `proj_dir_${session.id}`;
-    const gate = evaluateDirectorAcceptanceGate(session);
-    const partialRecord = canonicalProjectToLibraryRecord(session.canonicalProject);
-    const projectRecord: ProjectLibraryItem = {
-      ...partialRecord,
-      id: projectId,
-      updatedAt: now,
-    };
-
-    projectsStore.set(projectRecord.id, projectRecord);
-    const updatedSession: AiDirectorSessionRecord = {
-      ...session,
-      acceptanceGate: gate,
-      updatedAt: now,
-    };
-    aiDirectorSessionsStore.set(session.id, updatedSession);
-    persistState();
-
-    recordAudit(
-      authReq.authIdentity!.uid,
-      authReq.authIdentity!.email,
-      'AI_DIRECTOR_SAVE_PROJECT',
-      `/projects/${projectRecord.id}`,
-      `Saved AI Director canonical project "${projectRecord.title}" to Project Library`,
-      authReq.requestId,
-      'user',
-      'success'
-    );
-
-    return sendOk(res, authReq.requestId, {
-      project: projectRecord,
-      session: updatedSession,
-    });
-  });
+  );
 
   // =========================================================================
   // PHASE 11: PROFESSIONAL MOBILE EDITOR & AI CO-EDITING ENDPOINTS
   // =========================================================================
 
-  const resolveEditableCanonicalProject = (
+  const resolveEditableCanonicalProject = async (
     authUid: string,
     body: {
       project?: CanonicalProjectDocument;
       projectId?: string;
       directorSessionId?: string;
+      expectedRevision?: number;
     }
-  ): {
+  ): Promise<{
     doc: CanonicalProjectDocument | null;
+    storedProjectRecord?: ProjectLibraryItem | null;
     errorStatus?: number;
     errorCode?: string;
     errorMessage?: string;
-  } => {
+  }> => {
+    const candidateId = body.projectId || body.project?.id;
+    let storedRecord: ProjectLibraryItem | null = null;
+
+    if (candidateId) {
+      try {
+        storedRecord = await getAuthoritativeProject(candidateId, authUid);
+      } catch (err) {
+        if (err instanceof PersistenceContractError) {
+          return {
+            doc: null,
+            errorStatus: err.statusCode,
+            errorCode: err.code === 'CROSS_USER_ACCESS_FORBIDDEN' ? 'FORBIDDEN_PROJECT' : err.code,
+            errorMessage: err.message,
+          };
+        }
+        return {
+          doc: null,
+          errorStatus: 400,
+          errorCode: 'PROJECT_ACCESS_FAILED',
+          errorMessage: err instanceof Error ? err.message : 'Unable to access project.',
+        };
+      }
+    }
+
+    if (
+      storedRecord &&
+      body.expectedRevision !== undefined &&
+      body.expectedRevision !== (storedRecord.revision || 1)
+    ) {
+      return {
+        doc: null,
+        storedProjectRecord: storedRecord,
+        errorStatus: 409,
+        errorCode: 'REVISION_CONFLICT',
+        errorMessage: `Stale project revision for "${storedRecord.id}": expected revision ${body.expectedRevision}, but stored revision is ${storedRecord.revision || 1}.`,
+      };
+    }
+
     if (body.project) {
       const validation = validateCanonicalProject(body.project);
       if (!validation.valid || !validation.project) {
@@ -7552,24 +10032,50 @@ export function createApiApp(options: ApiAppOptions = {}) {
           errorMessage: validation.errors.join(' '),
         };
       }
-      return { doc: validation.project };
+      if (
+        storedRecord &&
+        typeof validation.project.revision === 'number' &&
+        validation.project.revision < (storedRecord.revision || 1)
+      ) {
+        return {
+          doc: null,
+          storedProjectRecord: storedRecord,
+          errorStatus: 409,
+          errorCode: 'REVISION_CONFLICT',
+          errorMessage: `Incoming canonical project payload has stale revision ${validation.project.revision} < stored revision ${storedRecord.revision || 1}.`,
+        };
+      }
+      return {
+        doc: validation.project,
+        storedProjectRecord: storedRecord,
+      };
     }
     if (body.directorSessionId) {
-      const sess = aiDirectorSessionsStore.get(body.directorSessionId);
+      let sess: AiDirectorSessionRecord | null = null;
+      try {
+        sess = await getAuthoritativeAiDirectorSession(body.directorSessionId, authUid, false);
+      } catch (err) {
+        if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+          return {
+            doc: null,
+            errorStatus: 403,
+            errorCode: 'FORBIDDEN_DIRECTOR_SESSION',
+            errorMessage: 'You do not own this AI Director session.',
+          };
+        }
+        return {
+          doc: null,
+          errorStatus: 503,
+          errorCode: 'DIRECTOR_SESSION_ACCESS_FAILED',
+          errorMessage: err instanceof Error ? err.message : 'Unable to access AI Director session.',
+        };
+      }
       if (!sess) {
         return {
           doc: null,
           errorStatus: 404,
           errorCode: 'DIRECTOR_SESSION_NOT_FOUND',
           errorMessage: 'AI Director session not found.',
-        };
-      }
-      if (sess.ownerUid !== authUid) {
-        return {
-          doc: null,
-          errorStatus: 403,
-          errorCode: 'FORBIDDEN_DIRECTOR_SESSION',
-          errorMessage: 'You do not own this AI Director session.',
         };
       }
       if (!sess.canonicalProject) {
@@ -7583,8 +10089,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
       return { doc: sess.canonicalProject };
     }
     if (body.projectId) {
-      const stored = projectsStore.get(body.projectId);
-      if (!stored) {
+      if (!storedRecord) {
         return {
           doc: null,
           errorStatus: 404,
@@ -7592,16 +10097,11 @@ export function createApiApp(options: ApiAppOptions = {}) {
           errorMessage: 'Project not found.',
         };
       }
-      if (stored.ownerUid && stored.ownerUid !== authUid) {
-        return {
-          doc: null,
-          errorStatus: 403,
-          errorCode: 'FORBIDDEN_PROJECT',
-          errorMessage: 'You do not own this project.',
-        };
-      }
-      const migrated = migrateToCanonicalProject(stored, authUid);
-      return { doc: migrated.project };
+      const { store } = getOrInitCanonicalStore(storedRecord);
+      return {
+        doc: store.getProject(),
+        storedProjectRecord: storedRecord,
+      };
     }
     return {
       doc: null,
@@ -7611,47 +10111,82 @@ export function createApiApp(options: ApiAppOptions = {}) {
     };
   };
 
-  const persistUpdatedCanonicalProject = (
+  const persistUpdatedCanonicalProject = async (
     authUid: string,
     updatedDoc: CanonicalProjectDocument,
     body: {
       projectId?: string;
       directorSessionId?: string;
-    }
-  ) => {
+      expectedRevision?: number;
+    },
+    storedProjectRecord?: ProjectLibraryItem | null
+  ): Promise<ProjectLibraryItem | null> => {
     const now = new Date().toISOString();
     if (body.directorSessionId) {
-      const sess = aiDirectorSessionsStore.get(body.directorSessionId);
+      const sess = await getAuthoritativeAiDirectorSession(body.directorSessionId, authUid, false);
       if (sess && sess.ownerUid === authUid) {
-        aiDirectorSessionsStore.set(sess.id, {
+        await saveAuthoritativeAiDirectorSession({
           ...sess,
           canonicalProject: updatedDoc,
           updatedAt: now,
         });
       }
     }
-    if (body.projectId) {
-      const existing = projectsStore.get(body.projectId);
-      if (!existing || !existing.ownerUid || existing.ownerUid === authUid) {
-        const partial = canonicalProjectToLibraryRecord(updatedDoc);
-        projectsStore.set(body.projectId, {
+
+    const targetProjectId = body.projectId || (storedProjectRecord ? storedProjectRecord.id : undefined);
+    let committedLibraryRecord: ProjectLibraryItem | null = null;
+
+    if (targetProjectId) {
+      const partial = canonicalProjectToLibraryRecord({
+        ...updatedDoc,
+        id: targetProjectId,
+        ownerUid: authUid,
+      });
+      const existing =
+        storedProjectRecord ?? (await getAuthoritativeProject(targetProjectId, authUid));
+      if (existing) {
+        committedLibraryRecord = await updateAuthoritativeProject(
+          targetProjectId,
+          authUid,
+          {
+            ...partial,
+            id: targetProjectId,
+            ownerUid: authUid,
+            checkpoints: existing.checkpoints,
+            revision: updatedDoc.revision,
+            updatedAt: now,
+          },
+          {
+            expectedRevision:
+              body.expectedRevision !== undefined
+                ? body.expectedRevision
+                : existing.revision || 1,
+          }
+        );
+      } else {
+        committedLibraryRecord = await saveAuthoritativeNewProject({
           ...partial,
-          id: body.projectId,
+          id: targetProjectId,
           ownerUid: authUid,
+          revision: updatedDoc.revision,
+          createdAt: now,
           updatedAt: now,
         });
       }
+    } else {
+      persistState();
     }
-    persistState();
+    return committedLibraryRecord;
   };
 
-  app.post('/api/v1/editor/command', requireAuth, (req: Request, res: Response) => {
+  app.post('/api/v1/editor/command', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     res.setHeader('Cache-Control', 'private, no-store');
     const body = (req.body || {}) as {
       project?: CanonicalProjectDocument;
       projectId?: string;
       directorSessionId?: string;
+      expectedRevision?: number;
       command?: CanonicalProjectCommand;
     };
 
@@ -7665,7 +10200,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
       );
     }
 
-    const resolved = resolveEditableCanonicalProject(authReq.authIdentity!.uid, body);
+    const resolved = await resolveEditableCanonicalProject(authReq.authIdentity!.uid, body);
     if (!resolved.doc) {
       return sendError(
         res,
@@ -7696,7 +10231,21 @@ export function createApiApp(options: ApiAppOptions = {}) {
       );
     }
 
-    persistUpdatedCanonicalProject(authReq.authIdentity!.uid, updatedProject, body);
+    try {
+      await persistUpdatedCanonicalProject(
+        authReq.authIdentity!.uid,
+        updatedProject,
+        body,
+        resolved.storedProjectRecord
+      );
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to commit editor command.'
+      );
+    }
 
     recordAudit(
       authReq.authIdentity!.uid,
@@ -7715,13 +10264,14 @@ export function createApiApp(options: ApiAppOptions = {}) {
     });
   });
 
-  app.post('/api/v1/editor/ai-transaction/plan', requireAuth, (req: Request, res: Response) => {
+  app.post('/api/v1/editor/ai-transaction/plan', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     res.setHeader('Cache-Control', 'private, no-store');
     const body = (req.body || {}) as {
       project?: CanonicalProjectDocument;
       projectId?: string;
       directorSessionId?: string;
+      expectedRevision?: number;
       prompt?: string;
       selectedClipId?: string | null;
       selectedSceneId?: string | null;
@@ -7743,7 +10293,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
       );
     }
 
-    const resolved = resolveEditableCanonicalProject(authReq.authIdentity!.uid, body);
+    const resolved = await resolveEditableCanonicalProject(authReq.authIdentity!.uid, body);
     if (!resolved.doc) {
       return sendError(
         res,
@@ -7778,13 +10328,14 @@ export function createApiApp(options: ApiAppOptions = {}) {
     });
   });
 
-  app.post('/api/v1/editor/ai-transaction/apply', requireAuth, (req: Request, res: Response) => {
+  app.post('/api/v1/editor/ai-transaction/apply', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     res.setHeader('Cache-Control', 'private, no-store');
     const body = (req.body || {}) as {
       project?: CanonicalProjectDocument;
       projectId?: string;
       directorSessionId?: string;
+      expectedRevision?: number;
       transaction?: AiCoEditTransaction;
       selectedOperationIds?: string[];
     };
@@ -7799,7 +10350,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
       );
     }
 
-    const resolved = resolveEditableCanonicalProject(authReq.authIdentity!.uid, body);
+    const resolved = await resolveEditableCanonicalProject(authReq.authIdentity!.uid, body);
     if (!resolved.doc) {
       return sendError(
         res,
@@ -7827,7 +10378,21 @@ export function createApiApp(options: ApiAppOptions = {}) {
       );
     }
 
-    persistUpdatedCanonicalProject(authReq.authIdentity!.uid, result.project, body);
+    try {
+      await persistUpdatedCanonicalProject(
+        authReq.authIdentity!.uid,
+        result.project,
+        body,
+        resolved.storedProjectRecord
+      );
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to commit AI Co-Edit transaction.'
+      );
+    }
 
     recordAudit(
       authReq.authIdentity!.uid,
@@ -7869,35 +10434,65 @@ export function createApiApp(options: ApiAppOptions = {}) {
   // PHASE 12: TEMPLATE FACTORY, AUTOMATIC REUSE & CONTINUOUS IMPROVEMENT API
   // =========================================================================
 
-  const getOrInitUserPreferenceConsent = (uid: string): UserPreferenceConsentConfig => {
-    const existing = userPreferenceConsentsStore.get(uid);
-    if (existing) return existing;
-    const def = createDefaultPreferenceConsent(uid);
-    userPreferenceConsentsStore.set(uid, def);
-    return def;
-  };
-
-  app.get('/api/v1/template-factory/drafts', requireAuth, (req: Request, res: Response) => {
+  app.get('/api/v1/template-factory/drafts', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     res.setHeader('Cache-Control', 'private, no-store');
     const uid = authReq.authIdentity!.uid;
 
-    const drafts = Array.from(templateFactoryDraftsStore.values())
-      .filter((d) => d.ownerUid === uid)
-      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    try {
+      const drafts = (await listAuthoritativeTemplateFactoryDrafts(uid)).sort((a, b) =>
+        b.updatedAt.localeCompare(a.updatedAt)
+      );
+      const consent = await getOrInitAuthoritativeUserPreferenceConsent(uid);
+      const signals = await listAuthoritativePreferenceSignals(uid);
 
-    const consent = getOrInitUserPreferenceConsent(uid);
-    const signals = templatePreferenceSignalsStore.filter((s) => s.ownerUid === uid);
-
-    return sendOk(res, authReq.requestId, {
-      items: drafts,
-      total: drafts.length,
-      preferenceConsent: consent,
-      preferenceSignals: signals,
-    });
+      return sendOk(res, authReq.requestId, {
+        items: drafts,
+        total: drafts.length,
+        preferenceConsent: consent,
+        preferenceSignals: signals,
+      });
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to list Template Factory drafts.'
+      );
+    }
   });
 
-  app.post('/api/v1/template-factory/extract-preview', requireAuth, (req: Request, res: Response) => {
+  app.get('/api/v1/template-factory/drafts/:id', requireAuth, async (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const uid = authReq.authIdentity!.uid;
+    const r = roleStore.get(uid) || 'user';
+    const isAdmin = r === 'admin' || r === 'owner';
+    const draftId = req.params.id;
+
+    try {
+      const draft = await getAuthoritativeTemplateFactoryDraft(draftId, uid, isAdmin);
+      if (!draft) {
+        return sendError(
+          res,
+          authReq.requestId,
+          404,
+          'DRAFT_NOT_FOUND',
+          `Template Factory draft "${draftId}" not found or accessible.`
+        );
+      }
+      return sendOk(res, authReq.requestId, { draft });
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to load Template Factory draft.'
+      );
+    }
+  });
+
+  app.post('/api/v1/template-factory/extract-preview', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     res.setHeader('Cache-Control', 'private, no-store');
     const uid = authReq.authIdentity!.uid;
@@ -7910,23 +10505,11 @@ export function createApiApp(options: ApiAppOptions = {}) {
     };
 
     let targetProject: CanonicalProjectDocument | null = null;
-    if (body.project) {
-      const v = validateCanonicalProject(body.project);
-      if (!v.valid || !v.project) {
-        return sendError(res, authReq.requestId, 400, 'INVALID_PROJECT', v.errors.join(' '));
-      }
-      targetProject = v.project;
-    } else if (body.referenceSessionId) {
-      const refSess = referenceLabSessionsStore.get(body.referenceSessionId);
-      if (!refSess) {
-        return sendError(res, authReq.requestId, 404, 'REFERENCE_SESSION_NOT_FOUND', 'Reference Lab session not found.');
-      }
-      if (refSess.ownerUid !== uid) {
-        return sendError(res, authReq.requestId, 403, 'FORBIDDEN_REFERENCE_SESSION', 'You do not own this Reference Lab session.');
-      }
-      targetProject = refSess.canonicalProject;
-    } else if (body.projectId) {
-      const resolved = resolveEditableCanonicalProject(uid, { projectId: body.projectId });
+    if (body.projectId) {
+      const resolved = await resolveEditableCanonicalProject(uid, {
+        project: body.project,
+        projectId: body.projectId,
+      });
       if (!resolved.doc) {
         return sendError(
           res,
@@ -7937,6 +10520,42 @@ export function createApiApp(options: ApiAppOptions = {}) {
         );
       }
       targetProject = resolved.doc;
+    } else if (body.project) {
+      const v = validateCanonicalProject(body.project);
+      if (!v.valid || !v.project) {
+        return sendError(res, authReq.requestId, 400, 'INVALID_PROJECT', v.errors.join(' '));
+      }
+      targetProject = v.project;
+    } else if (body.referenceSessionId) {
+      try {
+        const refSess = await getAuthoritativeReferenceLabSession(body.referenceSessionId, uid, false);
+        if (!refSess) {
+          return sendError(
+            res,
+            authReq.requestId,
+            404,
+            'REFERENCE_SESSION_NOT_FOUND',
+            'Reference Lab session not found.'
+          );
+        }
+        targetProject = refSess.canonicalProject;
+      } catch (err) {
+        if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+          return sendError(
+            res,
+            authReq.requestId,
+            403,
+            'FORBIDDEN_REFERENCE_SESSION',
+            'You do not own this Reference Lab session.'
+          );
+        }
+        return sendPersistenceError(
+          res,
+          authReq.requestId,
+          err,
+          'Unable to load Reference Lab session.'
+        );
+      }
     }
 
     if (!targetProject) {
@@ -7957,7 +10576,10 @@ export function createApiApp(options: ApiAppOptions = {}) {
     return sendOk(res, authReq.requestId, extraction);
   });
 
-  app.post('/api/v1/template-factory/create', requireAuth, (req: Request, res: Response) => {
+  app.post(
+    ['/api/v1/template-factory/create', '/api/v1/template-factory/drafts'],
+    requireAuth,
+    async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     res.setHeader('Cache-Control', 'private, no-store');
     const uid = authReq.authIdentity!.uid;
@@ -7986,14 +10608,35 @@ export function createApiApp(options: ApiAppOptions = {}) {
 
     if (sourceKind === 'reference-reconstruction') {
       if (body.referenceSessionId) {
-        const found = referenceLabSessionsStore.get(body.referenceSessionId);
-        if (!found) {
-          return sendError(res, authReq.requestId, 404, 'REFERENCE_SESSION_NOT_FOUND', 'Reference Lab session not found.');
+        try {
+          const found = await getAuthoritativeReferenceLabSession(body.referenceSessionId, uid, false);
+          if (!found) {
+            return sendError(
+              res,
+              authReq.requestId,
+              404,
+              'REFERENCE_SESSION_NOT_FOUND',
+              'Reference Lab session not found.'
+            );
+          }
+          referenceSession = found;
+        } catch (err) {
+          if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+            return sendError(
+              res,
+              authReq.requestId,
+              403,
+              'FORBIDDEN_REFERENCE_SESSION',
+              'You do not own this Reference Lab session.'
+            );
+          }
+          return sendPersistenceError(
+            res,
+            authReq.requestId,
+            err,
+            'Unable to load Reference Lab session.'
+          );
         }
-        if (found.ownerUid !== uid) {
-          return sendError(res, authReq.requestId, 403, 'FORBIDDEN_REFERENCE_SESSION', 'You do not own this Reference Lab session.');
-        }
-        referenceSession = found;
       } else if (body.project) {
         const v = validateCanonicalProject(body.project);
         if (!v.valid || !v.project) {
@@ -8016,8 +10659,8 @@ export function createApiApp(options: ApiAppOptions = {}) {
         );
       }
     } else if (sourceKind === 'canonical-project') {
-      const resolved = resolveEditableCanonicalProject(uid, {
-        project: body.project,
+      const resolved = await resolveEditableCanonicalProject(uid, {
+        project: body.project || (body as any).canonicalTemplateProject,
         projectId: body.projectId,
       });
       if (!resolved.doc) {
@@ -8032,78 +10675,131 @@ export function createApiApp(options: ApiAppOptions = {}) {
       sourceProject = resolved.doc;
     }
 
-    const userDrafts = Array.from(templateFactoryDraftsStore.values()).filter(
-      (d) => d.ownerUid === uid
-    );
+    try {
+      const userDrafts = await listAuthoritativeTemplateFactoryDrafts(uid);
+      const existingCatalog = await listAuthoritativeCatalogItems();
 
-    const draft = runTemplateFactoryPipeline({
-      ownerUid: uid,
-      sourceKind: referenceSession ? 'reference-reconstruction' : sourceProject ? 'canonical-project' : 'from-scratch',
-      title: body.title,
-      description: body.description,
-      moduleId: body.moduleId,
-      categoryId: body.categoryId,
-      tags: body.tags,
-      licenseType: body.licenseType,
-      licenseNote: body.licenseNote,
-      authorName: body.authorName || authReq.authIdentity!.displayName || uid,
-      sourceProject,
-      referenceSession,
-      selectedSceneIds: body.selectedSceneIds,
-      selectedClipIds: body.selectedClipIds,
-      exposedParameterKeys: body.exposedParameterKeys,
-      autoSavedFromAiComponent: body.autoSavedFromAiComponent,
-      existingCatalog: Array.from(catalogStore.values()),
-      existingFactoryDrafts: userDrafts,
-      assetsMap: assetsStore,
-    });
+      const draft = runTemplateFactoryPipeline({
+        ownerUid: uid,
+        sourceKind: referenceSession
+          ? 'reference-reconstruction'
+          : sourceProject
+          ? 'canonical-project'
+          : 'from-scratch',
+        title: body.title,
+        description: body.description,
+        moduleId: body.moduleId,
+        categoryId: body.categoryId,
+        tags: body.tags,
+        licenseType: body.licenseType,
+        licenseNote: body.licenseNote,
+        authorName: body.authorName || authReq.authIdentity!.displayName || uid,
+        sourceProject,
+        referenceSession,
+        selectedSceneIds: body.selectedSceneIds,
+        selectedClipIds: body.selectedClipIds,
+        exposedParameterKeys: body.exposedParameterKeys,
+        autoSavedFromAiComponent: body.autoSavedFromAiComponent,
+        existingCatalog,
+        existingFactoryDrafts: userDrafts,
+        assetsMap: assetsStore,
+      });
 
-    templateFactoryDraftsStore.set(draft.id, draft);
-    persistState();
+      const savedDraft = await saveAuthoritativeTemplateFactoryDraft(draft);
 
-    recordAudit(
-      uid,
-      authReq.authIdentity!.email,
-      'TEMPLATE_FACTORY_DRAFT_CREATED',
-      `/templateFactoryDrafts/${draft.id}`,
-      `Created private Template Factory draft "${draft.title}" (source=${draft.sourceKind}, provenance=${draft.provenanceClassification})`,
-      authReq.requestId,
-      'catalog',
-      'success'
-    );
+      recordAudit(
+        uid,
+        authReq.authIdentity!.email,
+        'TEMPLATE_FACTORY_DRAFT_CREATED',
+        `/templateFactoryDrafts/${savedDraft.id}`,
+        `Created private Template Factory draft "${savedDraft.title}" (source=${savedDraft.sourceKind}, provenance=${savedDraft.provenanceClassification})`,
+        authReq.requestId,
+        'catalog',
+        'success'
+      );
 
-    return sendOk(res, authReq.requestId, { draft }, 201);
+      return sendOk(res, authReq.requestId, { draft: savedDraft }, 201);
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to create Template Factory draft.'
+      );
+    }
   });
 
-  app.patch('/api/v1/template-factory/drafts/:id', requireAuth, (req: Request, res: Response) => {
+  app.patch('/api/v1/template-factory/drafts/:id', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     res.setHeader('Cache-Control', 'private, no-store');
     const uid = authReq.authIdentity!.uid;
-    const draft = templateFactoryDraftsStore.get(req.params.id);
+    let draft: TemplateFactoryDraftRecord | null = null;
+    try {
+      draft = await getAuthoritativeTemplateFactoryDraft(req.params.id, uid);
+    } catch (err) {
+      if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+        return sendError(
+          res,
+          authReq.requestId,
+          403,
+          'FORBIDDEN_DRAFT',
+          'You do not own this Template Factory draft.'
+        );
+      }
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to load Template Factory draft.'
+      );
+    }
     if (!draft) {
       return sendError(res, authReq.requestId, 404, 'DRAFT_NOT_FOUND', 'Template Factory draft not found.');
     }
-    if (draft.ownerUid !== uid) {
-      return sendError(res, authReq.requestId, 403, 'FORBIDDEN_DRAFT', 'You do not own this Template Factory draft.');
+
+    try {
+      const updated = updateFactoryDraftRecord(
+        draft,
+        req.body || {},
+        uid,
+        assetsStore
+      );
+      const saved = await saveAuthoritativeTemplateFactoryDraft(updated);
+      return sendOk(res, authReq.requestId, { draft: saved });
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to save Template Factory draft.'
+      );
     }
-
-    const updated = updateFactoryDraftRecord(
-      draft,
-      req.body || {},
-      uid,
-      assetsStore
-    );
-    templateFactoryDraftsStore.set(updated.id, updated);
-    persistState();
-
-    return sendOk(res, authReq.requestId, { draft: updated });
   });
 
-  app.post('/api/v1/template-factory/drafts/:id/fork', requireAuth, (req: Request, res: Response) => {
+  app.post('/api/v1/template-factory/drafts/:id/fork', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     res.setHeader('Cache-Control', 'private, no-store');
     const uid = authReq.authIdentity!.uid;
-    const draft = templateFactoryDraftsStore.get(req.params.id);
+    let draft: TemplateFactoryDraftRecord | null = null;
+    try {
+      draft = await getAuthoritativeTemplateFactoryDraft(req.params.id, uid);
+    } catch (err) {
+      if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+        return sendError(
+          res,
+          authReq.requestId,
+          403,
+          'FORBIDDEN_DRAFT',
+          'You do not have permission to fork this private draft.'
+        );
+      }
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to load Template Factory draft for fork.'
+      );
+    }
     if (!draft) {
       return sendError(res, authReq.requestId, 404, 'DRAFT_NOT_FOUND', 'Template Factory draft not found.');
     }
@@ -8111,60 +10807,98 @@ export function createApiApp(options: ApiAppOptions = {}) {
       return sendError(res, authReq.requestId, 403, 'FORBIDDEN_DRAFT', 'You do not have permission to fork this private draft.');
     }
 
-    const body = (req.body || {}) as { forkTitle?: string };
-    const forked = forkFactoryTemplate(draft, uid, body.forkTitle);
-    templateFactoryDraftsStore.set(forked.id, forked);
-    persistState();
+    try {
+      const body = (req.body || {}) as { forkTitle?: string };
+      const forked = forkFactoryTemplate(draft, uid, body.forkTitle);
+      const savedFork = await saveAuthoritativeTemplateFactoryDraft(forked);
 
-    recordAudit(
-      uid,
-      authReq.authIdentity!.email,
-      'TEMPLATE_FACTORY_FORKED',
-      `/templateFactoryDrafts/${forked.id}`,
-      `Forked Template Factory draft "${draft.title}" (${draft.id}) -> "${forked.title}" (${forked.id})`,
-      authReq.requestId,
-      'catalog',
-      'success'
-    );
+      recordAudit(
+        uid,
+        authReq.authIdentity!.email,
+        'TEMPLATE_FACTORY_FORKED',
+        `/templateFactoryDrafts/${savedFork.id}`,
+        `Forked Template Factory draft "${draft.title}" (${draft.id}) -> "${savedFork.title}" (${savedFork.id})`,
+        authReq.requestId,
+        'catalog',
+        'success'
+      );
 
-    return sendOk(res, authReq.requestId, { draft: forked }, 201);
+      return sendOk(res, authReq.requestId, { draft: savedFork }, 201);
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to persist forked Template Factory draft.'
+      );
+    }
   });
 
-  app.post('/api/v1/template-factory/drafts/:id/merge', requireAuth, (req: Request, res: Response) => {
+  app.post('/api/v1/template-factory/drafts/:id/merge', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     res.setHeader('Cache-Control', 'private, no-store');
     const uid = authReq.authIdentity!.uid;
-    const primaryDraft = templateFactoryDraftsStore.get(req.params.id);
-    if (!primaryDraft || primaryDraft.ownerUid !== uid) {
-      return sendError(res, authReq.requestId, 404, 'PRIMARY_DRAFT_NOT_FOUND', 'Primary Template Factory draft not found.');
-    }
-
     const body = (req.body || {}) as { secondaryDraftId?: string; mergedTitle?: string };
     if (!body.secondaryDraftId) {
       return sendError(res, authReq.requestId, 400, 'SECONDARY_DRAFT_REQUIRED', 'secondaryDraftId is required for merge.');
     }
-    const secondaryDraft = templateFactoryDraftsStore.get(body.secondaryDraftId);
-    if (!secondaryDraft || secondaryDraft.ownerUid !== uid) {
-      return sendError(res, authReq.requestId, 404, 'SECONDARY_DRAFT_NOT_FOUND', 'Secondary Template Factory draft not found.');
+
+    try {
+      const primaryDraft = await getAuthoritativeTemplateFactoryDraft(req.params.id, uid);
+      if (!primaryDraft || primaryDraft.ownerUid !== uid) {
+        return sendError(res, authReq.requestId, 404, 'PRIMARY_DRAFT_NOT_FOUND', 'Primary Template Factory draft not found.');
+      }
+      const secondaryDraft = await getAuthoritativeTemplateFactoryDraft(body.secondaryDraftId, uid);
+      if (!secondaryDraft || secondaryDraft.ownerUid !== uid) {
+        return sendError(res, authReq.requestId, 404, 'SECONDARY_DRAFT_NOT_FOUND', 'Secondary Template Factory draft not found.');
+      }
+
+      const merged = mergeFactoryTemplates({
+        primaryDraft,
+        secondaryDraft,
+        actorUid: uid,
+        mergedTitle: body.mergedTitle,
+      });
+      const savedMerged = await saveAuthoritativeTemplateFactoryDraft(merged);
+
+      return sendOk(res, authReq.requestId, { draft: savedMerged });
+    } catch (err) {
+      if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+        return sendError(
+          res,
+          authReq.requestId,
+          404,
+          'DRAFT_NOT_FOUND',
+          'Template Factory draft not found.'
+        );
+      }
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to merge Template Factory drafts.'
+      );
     }
-
-    const merged = mergeFactoryTemplates({
-      primaryDraft,
-      secondaryDraft,
-      actorUid: uid,
-      mergedTitle: body.mergedTitle,
-    });
-    templateFactoryDraftsStore.set(merged.id, merged);
-    persistState();
-
-    return sendOk(res, authReq.requestId, { draft: merged });
   });
 
-  app.post('/api/v1/template-factory/drafts/:id/restore-version', requireAuth, (req: Request, res: Response) => {
+  app.post('/api/v1/template-factory/drafts/:id/restore-version', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     res.setHeader('Cache-Control', 'private, no-store');
     const uid = authReq.authIdentity!.uid;
-    const draft = templateFactoryDraftsStore.get(req.params.id);
+    let draft: TemplateFactoryDraftRecord | null = null;
+    try {
+      draft = await getAuthoritativeTemplateFactoryDraft(req.params.id, uid);
+    } catch (err) {
+      if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+        return sendError(res, authReq.requestId, 404, 'DRAFT_NOT_FOUND', 'Template Factory draft not found.');
+      }
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to load Template Factory draft.'
+      );
+    }
     if (!draft || draft.ownerUid !== uid) {
       return sendError(res, authReq.requestId, 404, 'DRAFT_NOT_FOUND', 'Template Factory draft not found.');
     }
@@ -8176,10 +10910,17 @@ export function createApiApp(options: ApiAppOptions = {}) {
 
     try {
       const restored = restoreFactoryTemplateVersion(draft, body.targetVersion, uid);
-      templateFactoryDraftsStore.set(restored.id, restored);
-      persistState();
-      return sendOk(res, authReq.requestId, { draft: restored });
+      const saved = await saveAuthoritativeTemplateFactoryDraft(restored);
+      return sendOk(res, authReq.requestId, { draft: saved });
     } catch (err) {
+      if (err instanceof PersistenceContractError) {
+        return sendPersistenceError(
+          res,
+          authReq.requestId,
+          err,
+          'Unable to persist restored Template Factory draft version.'
+        );
+      }
       return sendError(
         res,
         authReq.requestId,
@@ -8190,56 +10931,112 @@ export function createApiApp(options: ApiAppOptions = {}) {
     }
   });
 
-  app.post('/api/v1/template-factory/drafts/:id/deprecate', requireAuth, (req: Request, res: Response) => {
+  app.post('/api/v1/template-factory/drafts/:id/deprecate', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     res.setHeader('Cache-Control', 'private, no-store');
     const uid = authReq.authIdentity!.uid;
-    const draft = templateFactoryDraftsStore.get(req.params.id);
+    let draft: TemplateFactoryDraftRecord | null = null;
+    try {
+      draft = await getAuthoritativeTemplateFactoryDraft(req.params.id, uid);
+    } catch (err) {
+      if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+        return sendError(res, authReq.requestId, 404, 'DRAFT_NOT_FOUND', 'Template Factory draft not found.');
+      }
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to load Template Factory draft.'
+      );
+    }
     if (!draft || draft.ownerUid !== uid) {
       return sendError(res, authReq.requestId, 404, 'DRAFT_NOT_FOUND', 'Template Factory draft not found.');
     }
 
-    const body = (req.body || {}) as { reason?: string; replacementTemplateId?: string };
-    const deprecated = deprecateFactoryTemplate(
-      draft,
-      body.reason || 'Deprecated by owner.',
-      body.replacementTemplateId
-    );
-    templateFactoryDraftsStore.set(deprecated.id, deprecated);
-    if (catalogStore.has(deprecated.id)) {
-      catalogStore.set(deprecated.id, deprecated.catalogItemDraft);
-    }
-    persistState();
+    try {
+      const body = (req.body || {}) as { reason?: string; replacementTemplateId?: string };
+      const deprecated = deprecateFactoryTemplate(
+        draft,
+        body.reason || 'Deprecated by owner.',
+        body.replacementTemplateId
+      );
+      const saved = await saveAuthoritativeTemplateFactoryDraft(deprecated);
+      const existingCatalogItem = await getAuthoritativeCatalogItem(saved.id);
+      if (existingCatalogItem) {
+        await saveAuthoritativeCatalogItem(saved.catalogItemDraft);
+      }
 
-    return sendOk(res, authReq.requestId, { draft: deprecated });
+      return sendOk(res, authReq.requestId, { draft: saved });
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to deprecate Template Factory draft.'
+      );
+    }
   });
 
-  app.post('/api/v1/template-factory/drafts/:id/update-dependencies', requireAuth, (req: Request, res: Response) => {
+  app.post('/api/v1/template-factory/drafts/:id/update-dependencies', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     res.setHeader('Cache-Control', 'private, no-store');
     const uid = authReq.authIdentity!.uid;
-    const draft = templateFactoryDraftsStore.get(req.params.id);
+    let draft: TemplateFactoryDraftRecord | null = null;
+    try {
+      draft = await getAuthoritativeTemplateFactoryDraft(req.params.id, uid);
+    } catch (err) {
+      if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+        return sendError(res, authReq.requestId, 404, 'DRAFT_NOT_FOUND', 'Template Factory draft not found.');
+      }
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to load Template Factory draft.'
+      );
+    }
     if (!draft || draft.ownerUid !== uid) {
       return sendError(res, authReq.requestId, 404, 'DRAFT_NOT_FOUND', 'Template Factory draft not found.');
     }
 
-    const body = (req.body || {}) as {
-      assetReplacements?: Record<string, string>;
-      addFonts?: string[];
-      resolveMissingAssets?: boolean;
-    };
-    const updated = updateFactoryTemplateDependencies(draft, body, uid, assetsStore);
-    templateFactoryDraftsStore.set(updated.id, updated);
-    persistState();
+    try {
+      const body = (req.body || {}) as {
+        assetReplacements?: Record<string, string>;
+        addFonts?: string[];
+        resolveMissingAssets?: boolean;
+      };
+      const updated = updateFactoryTemplateDependencies(draft, body, uid, assetsStore);
+      const saved = await saveAuthoritativeTemplateFactoryDraft(updated);
 
-    return sendOk(res, authReq.requestId, { draft: updated });
+      return sendOk(res, authReq.requestId, { draft: saved });
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to update Template Factory draft dependencies.'
+      );
+    }
   });
 
-  app.post('/api/v1/template-factory/drafts/:id/duplicate-suggestion', requireAuth, (req: Request, res: Response) => {
+  app.post('/api/v1/template-factory/drafts/:id/duplicate-suggestion', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     res.setHeader('Cache-Control', 'private, no-store');
     const uid = authReq.authIdentity!.uid;
-    const draft = templateFactoryDraftsStore.get(req.params.id);
+    let draft: TemplateFactoryDraftRecord | null = null;
+    try {
+      draft = await getAuthoritativeTemplateFactoryDraft(req.params.id, uid);
+    } catch (err) {
+      if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+        return sendError(res, authReq.requestId, 404, 'DRAFT_NOT_FOUND', 'Template Factory draft not found.');
+      }
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to load Template Factory draft.'
+      );
+    }
     if (!draft || draft.ownerUid !== uid) {
       return sendError(res, authReq.requestId, 404, 'DRAFT_NOT_FOUND', 'Template Factory draft not found.');
     }
@@ -8253,18 +11050,38 @@ export function createApiApp(options: ApiAppOptions = {}) {
       return sendError(res, authReq.requestId, 400, 'INVALID_DUPLICATE_RESOLUTION', 'suggestionId and action are required.');
     }
 
-    const updated = resolveDuplicateSuggestion(draft, body.suggestionId, body.action, body.note);
-    templateFactoryDraftsStore.set(updated.id, updated);
-    persistState();
-
-    return sendOk(res, authReq.requestId, { draft: updated });
+    try {
+      const updated = resolveDuplicateSuggestion(draft, body.suggestionId, body.action, body.note);
+      const saved = await saveAuthoritativeTemplateFactoryDraft(updated);
+      return sendOk(res, authReq.requestId, { draft: saved });
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to resolve duplicate suggestion.'
+      );
+    }
   });
 
-  app.post('/api/v1/template-factory/drafts/:id/publish', requireAuth, (req: Request, res: Response) => {
+  app.post('/api/v1/template-factory/drafts/:id/publish', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     res.setHeader('Cache-Control', 'private, no-store');
     const uid = authReq.authIdentity!.uid;
-    const draft = templateFactoryDraftsStore.get(req.params.id);
+    let draft: TemplateFactoryDraftRecord | null = null;
+    try {
+      draft = await getAuthoritativeTemplateFactoryDraft(req.params.id, uid);
+    } catch (err) {
+      if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+        return sendError(res, authReq.requestId, 404, 'DRAFT_NOT_FOUND', 'Template Factory draft not found.');
+      }
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to load Template Factory draft for publication.'
+      );
+    }
     if (!draft || draft.ownerUid !== uid) {
       return sendError(res, authReq.requestId, 404, 'DRAFT_NOT_FOUND', 'Template Factory draft not found.');
     }
@@ -8287,56 +11104,73 @@ export function createApiApp(options: ApiAppOptions = {}) {
       );
     }
 
-    templateFactoryDraftsStore.set(result.updatedDraft.id, result.updatedDraft);
-    catalogStore.set(result.publishedCatalogItem.id, result.publishedCatalogItem);
-    catalogCacheVersion += 1;
-    persistState();
+    try {
+      const published = await publishAuthoritativeTemplateFactoryDraft(
+        result.updatedDraft,
+        result.publishedCatalogItem
+      );
 
-    recordAudit(
-      uid,
-      authReq.authIdentity!.email,
-      'TEMPLATE_FACTORY_PUBLISHED',
-      `/catalog/${result.publishedCatalogItem.id}`,
-      `Published Template Factory draft "${result.publishedCatalogItem.name}" to Validated Catalog (license=${result.publishedCatalogItem.licenseType})`,
-      authReq.requestId,
-      'catalog',
-      'success'
-    );
+      recordAudit(
+        uid,
+        authReq.authIdentity!.email,
+        'TEMPLATE_FACTORY_PUBLISHED',
+        `/catalog/${published.catalogItem.id}`,
+        `Published Template Factory draft "${published.catalogItem.name}" to Validated Catalog (license=${published.catalogItem.licenseType}, idempotentNoOp=${Boolean(published.idempotentNoOp || result.idempotentNoOp)})`,
+        authReq.requestId,
+        'catalog',
+        'success'
+      );
 
-    return sendOk(res, authReq.requestId, {
-      draft: result.updatedDraft,
-      catalogItem: result.publishedCatalogItem,
-    });
+      return sendOk(res, authReq.requestId, {
+        draft: published.draft,
+        catalogItem: published.catalogItem,
+        idempotentNoOp: Boolean(published.idempotentNoOp || result.idempotentNoOp),
+      });
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to commit published Template Factory draft to authoritative catalog.'
+      );
+    }
   });
 
-  app.post('/api/v1/template-factory/feedback/consent', requireAuth, (req: Request, res: Response) => {
+  app.post('/api/v1/template-factory/feedback/consent', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     res.setHeader('Cache-Control', 'private, no-store');
     const uid = authReq.authIdentity!.uid;
-    const current = getOrInitUserPreferenceConsent(uid);
-    const body = (req.body || {}) as { consentToPreferenceRanking?: boolean };
+    try {
+      const current = await getOrInitAuthoritativeUserPreferenceConsent(uid);
+      const body = (req.body || {}) as { consentToPreferenceRanking?: boolean };
 
-    const updated: UserPreferenceConsentConfig = {
-      ...current,
-      consentToPreferenceRanking:
-        body.consentToPreferenceRanking !== undefined
-          ? Boolean(body.consentToPreferenceRanking)
-          : current.consentToPreferenceRanking,
-      allowCrossUserSharing: false,
-      silentModelTrainingEnabled: false,
-      updatedAt: new Date().toISOString(),
-    };
-    userPreferenceConsentsStore.set(uid, updated);
-    persistState();
+      const updated: UserPreferenceConsentConfig = {
+        ...current,
+        consentToPreferenceRanking:
+          body.consentToPreferenceRanking !== undefined
+            ? Boolean(body.consentToPreferenceRanking)
+            : current.consentToPreferenceRanking,
+        allowCrossUserSharing: false,
+        silentModelTrainingEnabled: false,
+        updatedAt: new Date().toISOString(),
+      };
+      const saved = await saveAuthoritativeUserPreferenceConsent(updated);
 
-    return sendOk(res, authReq.requestId, { preferenceConsent: updated });
+      return sendOk(res, authReq.requestId, { preferenceConsent: saved });
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to persist user preference consent.'
+      );
+    }
   });
 
-  app.post('/api/v1/template-factory/feedback/signal', requireAuth, (req: Request, res: Response) => {
+  app.post('/api/v1/template-factory/feedback/signal', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     res.setHeader('Cache-Control', 'private, no-store');
     const uid = authReq.authIdentity!.uid;
-    const consent = getOrInitUserPreferenceConsent(uid);
     const body = (req.body || {}) as {
       templateId?: string;
       moduleId?: CatalogItem['moduleId'];
@@ -8350,76 +11184,93 @@ export function createApiApp(options: ApiAppOptions = {}) {
       return sendError(res, authReq.requestId, 400, 'INVALID_FEEDBACK_SIGNAL', 'templateId and action are required.');
     }
 
-    const result = recordTemplateFeedbackSignal({
-      ownerUid: uid,
-      consentConfig: consent,
-      existingSignals: templatePreferenceSignalsStore,
-      templateId: body.templateId,
-      moduleId: body.moduleId,
-      action: body.action,
-      preferredVersion: body.preferredVersion,
-      styleTag: body.styleTag,
-      reasonNote: body.reasonNote,
-    });
+    try {
+      const consent = await getOrInitAuthoritativeUserPreferenceConsent(uid);
+      const existingOwnerSignals = await listAuthoritativePreferenceSignals(uid);
 
-    if (!result.recorded) {
-      return sendError(
+      const result = recordTemplateFeedbackSignal({
+        ownerUid: uid,
+        consentConfig: consent,
+        existingSignals: existingOwnerSignals,
+        templateId: body.templateId,
+        moduleId: body.moduleId,
+        action: body.action,
+        preferredVersion: body.preferredVersion,
+        styleTag: body.styleTag,
+        reasonNote: body.reasonNote,
+      });
+
+      if (!result.recorded) {
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          'CONSENT_DISABLED',
+          result.consentBlockedReason || 'Preference capture disabled by user consent settings.'
+        );
+      }
+
+      const savedSignals = await saveAuthoritativePreferenceSignals(uid, result.signals);
+      const savedConsent = await saveAuthoritativeUserPreferenceConsent(result.updatedConsent);
+
+      return sendOk(res, authReq.requestId, {
+        recorded: true,
+        preferenceConsent: savedConsent,
+        preferenceSignals: savedSignals,
+      });
+    } catch (err) {
+      return sendPersistenceError(
         res,
         authReq.requestId,
-        400,
-        'CONSENT_DISABLED',
-        result.consentBlockedReason || 'Preference capture disabled by user consent settings.'
+        err,
+        'Unable to record template preference signal.'
       );
     }
-
-    templatePreferenceSignalsStore.splice(
-      0,
-      templatePreferenceSignalsStore.length,
-      ...result.signals
-    );
-    userPreferenceConsentsStore.set(uid, result.updatedConsent);
-    persistState();
-
-    return sendOk(res, authReq.requestId, {
-      recorded: true,
-      preferenceConsent: result.updatedConsent,
-      preferenceSignals: templatePreferenceSignalsStore.filter((s) => s.ownerUid === uid),
-    });
   });
 
-  app.get('/api/v1/template-factory/rankings', requireAuth, (req: Request, res: Response) => {
+  app.get('/api/v1/template-factory/rankings', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     res.setHeader('Cache-Control', 'private, no-store');
     const uid = authReq.authIdentity!.uid;
-    const consent = getOrInitUserPreferenceConsent(uid);
     const moduleId =
       typeof req.query.moduleId === 'string'
         ? (req.query.moduleId as CatalogItem['moduleId'])
         : undefined;
 
-    const userDraftItems = Array.from(templateFactoryDraftsStore.values())
-      .filter((d) => d.ownerUid === uid)
-      .map((d) => d.catalogItemDraft);
-    const publishedItems = Array.from(catalogStore.values()).filter(
-      (i) => i.visibility === 'published'
-    );
-    const combinedMap = new Map<string, CatalogItem>();
-    for (const item of [...publishedItems, ...userDraftItems]) {
-      combinedMap.set(item.id, item);
+    try {
+      const consent = await getOrInitAuthoritativeUserPreferenceConsent(uid);
+      const userDraftItems = (await listAuthoritativeTemplateFactoryDrafts(uid)).map(
+        (d) => d.catalogItemDraft
+      );
+      const publishedItems = (await listAuthoritativeCatalogItems()).filter(
+        (i) => i.visibility === 'published'
+      );
+      const userSignals = await listAuthoritativePreferenceSignals(uid);
+      const combinedMap = new Map<string, CatalogItem>();
+      for (const item of [...publishedItems, ...userDraftItems]) {
+        combinedMap.set(item.id, item);
+      }
+
+      const rankings = rankTemplatesWithTransparentSignals({
+        ownerUid: uid,
+        consentConfig: consent,
+        userSignals,
+        templates: Array.from(combinedMap.values()),
+        moduleId,
+      });
+
+      return sendOk(res, authReq.requestId, {
+        rankings: rankings.slice(0, 50),
+        preferenceConsent: consent,
+      });
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to compute template rankings.'
+      );
     }
-
-    const rankings = rankTemplatesWithTransparentSignals({
-      ownerUid: uid,
-      consentConfig: consent,
-      userSignals: templatePreferenceSignalsStore,
-      templates: Array.from(combinedMap.values()),
-      moduleId,
-    });
-
-    return sendOk(res, authReq.requestId, {
-      rankings: rankings.slice(0, 50),
-      preferenceConsent: consent,
-    });
   });
 
   // ============================================================================
@@ -8486,7 +11337,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
     });
   });
 
-  app.post('/api/v1/render-export/feature-loss-preview', requireAuth, (req: Request, res: Response) => {
+  app.post('/api/v1/render-export/feature-loss-preview', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     res.setHeader('Cache-Control', 'private, no-store');
     const uid = authReq.authIdentity!.uid;
@@ -8501,13 +11352,28 @@ export function createApiApp(options: ApiAppOptions = {}) {
     };
 
     let projectDoc: CanonicalProjectDocument | undefined = body.projectDoc;
-    if (!projectDoc && body.projectId) {
-      const foundProj = projectsStore.get(body.projectId);
-      if (foundProj && foundProj.ownerUid === uid && foundProj.canonicalProjectJson) {
-        try {
-          projectDoc = JSON.parse(foundProj.canonicalProjectJson) as CanonicalProjectDocument;
-        } catch {
-          projectDoc = undefined;
+    const candidateId =
+      body.projectId ||
+      (body.projectDoc?.id && !body.projectDoc.id.startsWith('sample-')
+        ? body.projectDoc.id
+        : undefined);
+    if (candidateId) {
+      try {
+        const foundProj = await getAuthoritativeProject(candidateId, uid);
+        if (foundProj && foundProj.canonicalProjectJson) {
+          const parsedDoc = JSON.parse(foundProj.canonicalProjectJson) as CanonicalProjectDocument;
+          if (!projectDoc || (foundProj.revision || 1) >= (projectDoc.revision || 1)) {
+            projectDoc = parsedDoc;
+          }
+        }
+      } catch (err) {
+        if (body.projectId) {
+          return sendPersistenceError(
+            res,
+            authReq.requestId,
+            err,
+            'Unable to load project for feature-loss preview.'
+          );
         }
       }
     }
@@ -8531,23 +11397,30 @@ export function createApiApp(options: ApiAppOptions = {}) {
     });
   });
 
-  app.get('/api/v1/render-export/jobs', requireAuth, (req: Request, res: Response) => {
+  app.get('/api/v1/render-export/jobs', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     res.setHeader('Cache-Control', 'private, no-store');
     const uid = authReq.authIdentity!.uid;
 
-    const jobs = Array.from(renderExportJobsStore.values())
-      .filter((j) => j.ownerUid === uid)
-      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-      .map(toPublicRenderJobView);
+    try {
+      const owned = await listAuthoritativeRenderExportJobs(uid);
+      const jobs = owned.map(toPublicRenderJobView);
 
-    return sendOk(res, authReq.requestId, {
-      jobs,
-      sampleProject: createKnownGoodSampleCanonicalProject(uid),
-    });
+      return sendOk(res, authReq.requestId, {
+        jobs,
+        sampleProject: createKnownGoodSampleCanonicalProject(uid),
+      });
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to list render/export jobs.'
+      );
+    }
   });
 
-  app.post('/api/v1/render-export/jobs', requireAuth, (req: Request, res: Response) => {
+  app.post('/api/v1/render-export/jobs', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     res.setHeader('Cache-Control', 'private, no-store');
     const uid = authReq.authIdentity!.uid;
@@ -8555,6 +11428,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
     const body = (req.body || {}) as {
       projectDoc?: CanonicalProjectDocument;
       projectId?: string;
+      expectedProjectRevision?: number;
       directorSessionId?: string;
       executionTier?: RenderExecutionTier;
       outputFormat?: RenderOutputFormat;
@@ -8573,20 +11447,70 @@ export function createApiApp(options: ApiAppOptions = {}) {
 
     let directorSession: AiDirectorSessionRecord | null = null;
     if (body.directorSessionId) {
-      const ds = aiDirectorSessionsStore.get(body.directorSessionId);
-      if (ds && ds.ownerUid === uid) {
-        directorSession = ds;
+      try {
+        const ds = await getAuthoritativeAiDirectorSession(body.directorSessionId, uid, false);
+        if (ds && ds.ownerUid === uid) {
+          directorSession = ds;
+        }
+      } catch {
+        directorSession = null;
       }
     }
 
     let projectDoc: CanonicalProjectDocument | undefined = body.projectDoc;
-    if (!projectDoc && body.projectId) {
-      const foundProj = projectsStore.get(body.projectId);
-      if (foundProj && foundProj.ownerUid === uid && foundProj.canonicalProjectJson) {
-        try {
-          projectDoc = JSON.parse(foundProj.canonicalProjectJson) as CanonicalProjectDocument;
-        } catch {
-          projectDoc = undefined;
+    const candidateId =
+      body.projectId ||
+      (body.projectDoc?.id && !body.projectDoc.id.startsWith('sample-')
+        ? body.projectDoc.id
+        : undefined);
+    if (candidateId) {
+      try {
+        const foundProj = await getAuthoritativeProject(candidateId, uid);
+        if (!foundProj && body.projectId && !body.projectDoc) {
+          return sendError(
+            res,
+            authReq.requestId,
+            404,
+            'PROJECT_NOT_FOUND',
+            `Project "${body.projectId}" was not found.`
+          );
+        }
+        if (foundProj) {
+          if (
+            typeof body.expectedProjectRevision === 'number' &&
+            foundProj.revision !== body.expectedProjectRevision
+          ) {
+            return sendError(
+              res,
+              authReq.requestId,
+              409,
+              'REVISION_CONFLICT',
+              `Stale project revision for render job on "${foundProj.id}": expected revision ${body.expectedProjectRevision}, but authoritative revision is ${foundProj.revision}.`,
+              {
+                projectId: foundProj.id,
+                expectedRevision: body.expectedProjectRevision,
+                actualRevision: foundProj.revision,
+              }
+            );
+          }
+          if (foundProj.canonicalProjectJson) {
+            const parsedDoc = JSON.parse(foundProj.canonicalProjectJson) as CanonicalProjectDocument;
+            parsedDoc.id = foundProj.id;
+            parsedDoc.revision = foundProj.revision || parsedDoc.revision || 1;
+            parsedDoc.title = foundProj.title || parsedDoc.title;
+            if (!projectDoc || (foundProj.revision || 1) >= (projectDoc.revision || 1)) {
+              projectDoc = parsedDoc;
+            }
+          }
+        }
+      } catch (err) {
+        if (body.projectId) {
+          return sendPersistenceError(
+            res,
+            authReq.requestId,
+            err,
+            'Unable to load project for render job.'
+          );
         }
       }
     }
@@ -8614,59 +11538,92 @@ export function createApiApp(options: ApiAppOptions = {}) {
       assetsMap: assetsStore,
     });
 
-    renderExportJobsStore.set(jobRecord.id, jobRecord);
-    persistState();
+    try {
+      const saved = await saveAuthoritativeRenderExportJob(jobRecord);
 
-    recordAudit(
-      uid,
-      authReq.authIdentity!.email,
-      'CANONICAL_RENDER_JOB_EXECUTED',
-      `/render-export/jobs/${jobRecord.id}`,
-      `Executed ${executionTier} job (${outputFormat}, adapter=${jobRecord.targetAdapter}) → stage=${jobRecord.stage}`,
-      authReq.requestId,
-      'job',
-      jobRecord.stage === 'ready' ? 'success' : 'denied'
-    );
+      recordAudit(
+        uid,
+        authReq.authIdentity!.email,
+        'CANONICAL_RENDER_JOB_EXECUTED',
+        `/render-export/jobs/${saved.id}`,
+        `Executed ${executionTier} job (${outputFormat}, adapter=${saved.targetAdapter}) → stage=${saved.stage}`,
+        authReq.requestId,
+        'job',
+        saved.stage === 'ready' ? 'success' : 'denied'
+      );
 
-    return sendOk(
-      res,
-      authReq.requestId,
-      {
-        job: toPublicRenderJobView(jobRecord),
-      },
-      201
-    );
-  });
-
-  app.post('/api/v1/render-export/jobs/:id/cancel', requireAuth, (req: Request, res: Response) => {
-    const authReq = req as AuthenticatedRequest;
-    res.setHeader('Cache-Control', 'private, no-store');
-    const uid = authReq.authIdentity!.uid;
-
-    const existing = renderExportJobsStore.get(req.params.id);
-    if (!existing || existing.ownerUid !== uid) {
-      return sendError(res, authReq.requestId, 404, 'RENDER_JOB_NOT_FOUND', 'Render job not found.');
+      return sendOk(
+        res,
+        authReq.requestId,
+        {
+          job: toPublicRenderJobView(saved),
+        },
+        201
+      );
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to persist render/export job.'
+      );
     }
-
-    const reason =
-      typeof req.body?.reason === 'string' && req.body.reason.trim()
-        ? req.body.reason.trim().slice(0, 240)
-        : 'Cancelled by user request';
-    const cancelled = cancelRenderExportJob(existing, reason);
-    renderExportJobsStore.set(cancelled.id, cancelled);
-    persistState();
-
-    return sendOk(res, authReq.requestId, {
-      job: toPublicRenderJobView(cancelled),
-    });
   });
 
-  app.post('/api/v1/render-export/jobs/:id/retry', requireAuth, (req: Request, res: Response) => {
+  app.post(
+    '/api/v1/render-export/jobs/:id/cancel',
+    requireAuth,
+    async (req: Request, res: Response) => {
+      const authReq = req as AuthenticatedRequest;
+      res.setHeader('Cache-Control', 'private, no-store');
+      const uid = authReq.authIdentity!.uid;
+
+      let existing: DurableRenderExportJobRecord | null = null;
+      try {
+        existing = await getAuthoritativeRenderExportJob(req.params.id, uid);
+      } catch (err) {
+        if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+          return sendError(
+            res,
+            authReq.requestId,
+            404,
+            'RENDER_JOB_NOT_FOUND',
+            'Render job not found.'
+          );
+        }
+        return sendPersistenceError(res, authReq.requestId, err, 'Unable to load render job.');
+      }
+      if (!existing || existing.ownerUid !== uid) {
+        return sendError(res, authReq.requestId, 404, 'RENDER_JOB_NOT_FOUND', 'Render job not found.');
+      }
+
+      const reason =
+        typeof req.body?.reason === 'string' && req.body.reason.trim()
+          ? req.body.reason.trim().slice(0, 240)
+          : 'Cancelled by user request';
+      const cancelled = cancelRenderExportJob(existing, reason);
+      const saved = await saveAuthoritativeRenderExportJob(cancelled);
+
+      return sendOk(res, authReq.requestId, {
+        job: toPublicRenderJobView(saved),
+      });
+    }
+  );
+
+  app.post('/api/v1/render-export/jobs/:id/retry', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     res.setHeader('Cache-Control', 'private, no-store');
     const uid = authReq.authIdentity!.uid;
 
-    const existing = renderExportJobsStore.get(req.params.id);
+    let existing: DurableRenderExportJobRecord | null = null;
+    try {
+      existing = await getAuthoritativeRenderExportJob(req.params.id, uid);
+    } catch (err) {
+      if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+        return sendError(res, authReq.requestId, 404, 'RENDER_JOB_NOT_FOUND', 'Render job not found.');
+      }
+      return sendPersistenceError(res, authReq.requestId, err, 'Unable to load render job.');
+    }
     if (!existing || existing.ownerUid !== uid) {
       return sendError(res, authReq.requestId, 404, 'RENDER_JOB_NOT_FOUND', 'Render job not found.');
     }
@@ -8682,14 +11639,16 @@ export function createApiApp(options: ApiAppOptions = {}) {
     }
 
     let projectDoc = (req.body?.projectDoc as CanonicalProjectDocument | undefined);
-    if (!projectDoc) {
-      const foundProj = projectsStore.get(existing.projectId);
-      if (foundProj && foundProj.ownerUid === uid && foundProj.canonicalProjectJson) {
-        try {
+    if (!projectDoc && existing.projectId) {
+      try {
+        const foundProj = await getAuthoritativeProject(existing.projectId, uid);
+        if (foundProj && foundProj.canonicalProjectJson) {
           projectDoc = JSON.parse(foundProj.canonicalProjectJson) as CanonicalProjectDocument;
-        } catch {
-          projectDoc = undefined;
+          projectDoc.id = foundProj.id;
+          projectDoc.revision = foundProj.revision || projectDoc.revision || 1;
         }
+      } catch {
+        projectDoc = undefined;
       }
     }
     if (!projectDoc) {
@@ -8714,70 +11673,105 @@ export function createApiApp(options: ApiAppOptions = {}) {
       existingJobToRetry: existing,
     });
 
-    renderExportJobsStore.set(retried.id, retried);
-    persistState();
+    const saved = await saveAuthoritativeRenderExportJob(retried);
 
     return sendOk(res, authReq.requestId, {
-      job: toPublicRenderJobView(retried),
+      job: toPublicRenderJobView(saved),
     });
   });
 
-  app.get('/api/v1/render-export/jobs/:id/qa-report', requireAuth, (req: Request, res: Response) => {
-    const authReq = req as AuthenticatedRequest;
-    res.setHeader('Cache-Control', 'private, no-store');
-    const uid = authReq.authIdentity!.uid;
+  app.get(
+    '/api/v1/render-export/jobs/:id/qa-report',
+    requireAuth,
+    async (req: Request, res: Response) => {
+      const authReq = req as AuthenticatedRequest;
+      res.setHeader('Cache-Control', 'private, no-store');
+      const uid = authReq.authIdentity!.uid;
 
-    const existing = renderExportJobsStore.get(req.params.id);
-    if (!existing || existing.ownerUid !== uid) {
-      return sendError(res, authReq.requestId, 404, 'RENDER_JOB_NOT_FOUND', 'Render job not found.');
+      let existing: DurableRenderExportJobRecord | null = null;
+      try {
+        existing = await getAuthoritativeRenderExportJob(req.params.id, uid);
+      } catch (err) {
+        if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+          return sendError(
+            res,
+            authReq.requestId,
+            404,
+            'RENDER_JOB_NOT_FOUND',
+            'Render job not found.'
+          );
+        }
+        return sendPersistenceError(res, authReq.requestId, err, 'Unable to load render job.');
+      }
+      if (!existing || existing.ownerUid !== uid) {
+        return sendError(res, authReq.requestId, 404, 'RENDER_JOB_NOT_FOUND', 'Render job not found.');
+      }
+
+      return sendOk(res, authReq.requestId, {
+        jobId: existing.id,
+        stage: existing.stage,
+        qaReport: existing.qaReport,
+        featureLossReport: existing.featureLossReport,
+        artifactMetadata: existing.artifactMetadata,
+      });
     }
+  );
 
-    return sendOk(res, authReq.requestId, {
-      jobId: existing.id,
-      stage: existing.stage,
-      qaReport: existing.qaReport,
-      featureLossReport: existing.featureLossReport,
-      artifactMetadata: existing.artifactMetadata,
-    });
-  });
+  app.get(
+    '/api/v1/render-export/jobs/:id/download',
+    requireAuth,
+    async (req: Request, res: Response) => {
+      const authReq = req as AuthenticatedRequest;
+      res.setHeader('Cache-Control', 'private, no-store');
+      const uid = authReq.authIdentity!.uid;
 
-  app.get('/api/v1/render-export/jobs/:id/download', requireAuth, (req: Request, res: Response) => {
-    const authReq = req as AuthenticatedRequest;
-    res.setHeader('Cache-Control', 'private, no-store');
-    const uid = authReq.authIdentity!.uid;
+      let existing: DurableRenderExportJobRecord | null = null;
+      try {
+        existing = await getAuthoritativeRenderExportJob(req.params.id, uid);
+      } catch (err) {
+        if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+          return sendError(
+            res,
+            authReq.requestId,
+            404,
+            'RENDER_JOB_NOT_FOUND',
+            'Render job not found.'
+          );
+        }
+        return sendPersistenceError(res, authReq.requestId, err, 'Unable to load render job.');
+      }
+      if (!existing || existing.ownerUid !== uid) {
+        return sendError(res, authReq.requestId, 404, 'RENDER_JOB_NOT_FOUND', 'Render job not found.');
+      }
 
-    const existing = renderExportJobsStore.get(req.params.id);
-    if (!existing || existing.ownerUid !== uid) {
-      return sendError(res, authReq.requestId, 404, 'RENDER_JOB_NOT_FOUND', 'Render job not found.');
-    }
+      if (
+        existing.stage !== 'ready' ||
+        !existing.artifactBytesBase64 ||
+        !existing.artifactMetadata ||
+        !existing.artifactMetadata.validatedAfterWrite
+      ) {
+        return sendError(
+          res,
+          authReq.requestId,
+          409,
+          'RENDER_OUTPUT_NOT_READY',
+          `Render job "${existing.id}" is in stage "${existing.stage}" and does not have a verified downloadable file.`
+        );
+      }
 
-    if (
-      existing.stage !== 'ready' ||
-      !existing.artifactBytesBase64 ||
-      !existing.artifactMetadata ||
-      !existing.artifactMetadata.validatedAfterWrite
-    ) {
-      return sendError(
-        res,
-        authReq.requestId,
-        409,
-        'RENDER_OUTPUT_NOT_READY',
-        `Render job "${existing.id}" is in stage "${existing.stage}" and does not have a verified downloadable file.`
+      const binaryBuffer = Buffer.from(existing.artifactBytesBase64, 'base64');
+      res.setHeader('Content-Type', existing.artifactMetadata.mimeType);
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${existing.artifactMetadata.fileName}"`
       );
+      res.setHeader('Content-Length', String(binaryBuffer.byteLength));
+      res.setHeader('X-Sowveil-Sha256', existing.artifactMetadata.sha256);
+      res.setHeader('X-Sowveil-Crc32', existing.artifactMetadata.crc32Hex);
+      res.setHeader('X-Sowveil-Renderer-Version', existing.artifactMetadata.rendererVersion);
+      return res.status(200).send(binaryBuffer);
     }
-
-    const binaryBuffer = Buffer.from(existing.artifactBytesBase64, 'base64');
-    res.setHeader('Content-Type', existing.artifactMetadata.mimeType);
-    res.setHeader(
-      'Content-Disposition',
-      `attachment; filename="${existing.artifactMetadata.fileName}"`
-    );
-    res.setHeader('Content-Length', String(binaryBuffer.byteLength));
-    res.setHeader('X-Sowveil-Sha256', existing.artifactMetadata.sha256);
-    res.setHeader('X-Sowveil-Crc32', existing.artifactMetadata.crc32Hex);
-    res.setHeader('X-Sowveil-Renderer-Version', existing.artifactMetadata.rendererVersion);
-    return res.status(200).send(binaryBuffer);
-  });
+  );
 
   // Explicitly forbid alteration or deletion of audit records
   app.all('/api/v1/admin/audit-events*', requireAuth, (req: Request, res: Response, next: NextFunction) => {

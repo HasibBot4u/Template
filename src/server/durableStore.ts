@@ -31,8 +31,13 @@ import {
 } from '../services/templateFactoryEngine';
 import { DurableRenderExportJobRecord } from '../services/renderExportQaEngine';
 
+export type LocalSnapshotClassification =
+  | 'development-test-only'
+  | 'configured-shared-filesystem';
+
 export interface DurableStoreSnapshot {
   schemaVersion: string | number;
+  adapterClassification?: LocalSnapshotClassification;
   savedAt: string;
   catalogCacheVersion: number;
   ownerBootstrappedUid: string | null;
@@ -85,6 +90,15 @@ export function loadDurableSnapshot(
   }
 }
 
+export function classifyLocalSnapshotStore(options?: {
+  allowSharedFilesystemInProd?: boolean;
+}): LocalSnapshotClassification {
+  const allowed =
+    options?.allowSharedFilesystemInProd ??
+    process.env.SOWVEIL_ALLOW_SHARED_FS_SNAPSHOT === 'true';
+  return allowed ? 'configured-shared-filesystem' : 'development-test-only';
+}
+
 export function saveDurableSnapshot(
   filePath: string | null | undefined,
   snapshot: DurableStoreSnapshot
@@ -95,10 +109,16 @@ export function saveDurableSnapshot(
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
+    const enrichedSnapshot: DurableStoreSnapshot = {
+      ...snapshot,
+      adapterClassification:
+        snapshot.adapterClassification ?? classifyLocalSnapshotStore(),
+    };
     const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}`;
-    fs.writeFileSync(tmpPath, JSON.stringify(snapshot, null, 2), 'utf8');
+    fs.writeFileSync(tmpPath, JSON.stringify(enrichedSnapshot, null, 2), 'utf8');
     fs.renameSync(tmpPath, filePath);
   } catch (err) {
     console.error('[DurableStore] Failed to persist state snapshot:', err);
   }
 }
+

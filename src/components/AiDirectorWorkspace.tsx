@@ -26,7 +26,7 @@ import type {
   IntendedPlatformId,
   ShotEditableParameters,
 } from '../services/aiDirectorProductionEngine';
-import type { MobileAspectRatio } from '../types/sowveil';
+import type { MobileAspectRatio, ProjectLibraryItem } from '../types/sowveil';
 import { MobileProEditorModal } from './MobileProEditorModal';
 import { executeAuthenticatedApiRequest } from '../services/apiClient';
 
@@ -45,6 +45,7 @@ export interface AiDirectorWorkspaceProps {
   userUid?: string;
   onBackToReference: () => void;
   onOpenProjectLibrary?: () => void;
+  onProjectSaved?: (project: ProjectLibraryItem) => void;
   getAuthToken?: (forceRefresh?: boolean) => Promise<string | null>;
   fetchImpl?: typeof fetch;
 }
@@ -62,6 +63,7 @@ export const AiDirectorWorkspace: React.FC<AiDirectorWorkspaceProps> = ({
   userUid,
   onBackToReference,
   onOpenProjectLibrary,
+  onProjectSaved,
   getAuthToken,
   fetchImpl,
 }) => {
@@ -386,18 +388,20 @@ export const AiDirectorWorkspace: React.FC<AiDirectorWorkspaceProps> = ({
     try {
       const res = await apiRequest<{
         session: AiDirectorSessionRecord;
-        project: { id: string; name: string };
+        project: ProjectLibraryItem & { name?: string };
       }>(`/api/v1/ai-director/sessions/${activeSession.id}/save-project`, {
         method: 'POST',
       });
-      if (!res.ok || !res.data?.session) {
+      if (!res.ok || !res.data?.session || !res.data?.project) {
         throw new Error(res.errorMessage || 'Failed to save to Project Library');
       }
       const updated: AiDirectorSessionRecord = res.data.session;
+      const savedProj = res.data.project;
       setActiveSession(updated);
       setSessions((prev) => [updated, ...prev.filter((s) => s.id !== updated.id)]);
+      onProjectSaved?.(savedProj);
       setStatusBanner(
-        `Saved project "${res.data.project.name}" (ID: ${res.data.project.id}) to Project Library.`
+        `Saved project "${savedProj.title || savedProj.name}" (ID: ${savedProj.id} · rev r${savedProj.revision || 1}) to Project Library.`
       );
     } catch (err) {
       setErrorBanner(err instanceof Error ? err.message : 'Failed to save project');

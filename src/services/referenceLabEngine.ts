@@ -194,9 +194,17 @@ export interface ReconstructionLocalCheckResult {
 export interface ReconstructionFidelityReport {
   generatedAt: string;
   usageMode: ReferenceUsageMode;
+  mediaAnalysisState?: SourceMediaAnalysisState;
+  sourceMediaParsed?: boolean;
   overallConfidence: number;
   pixelIdenticalClaimed: false;
   fidelityDisclaimer: string;
+  fieldClassificationSummary?: {
+    observed: string[];
+    inferred: string[];
+    generated: string[];
+    unknown: string[];
+  };
   sourceCoveredProperties: Array<{
     propertyKey: string;
     label: string;
@@ -246,6 +254,32 @@ export interface ReconstructionFidelityReport {
   localCheckResult: ReconstructionLocalCheckResult;
 }
 
+export type SourceMediaAnalysisState =
+  | 'parsed-media'
+  | 'verified-preset'
+  | 'source-project-file'
+  | 'filename-only-unparsed'
+  | 'url-metadata-only';
+
+export type SourceFieldProvenanceKind =
+  | 'observed'
+  | 'inferred'
+  | 'generated'
+  | 'unknown';
+
+export interface ParsedSourceMediaMetadata {
+  parsedFromMediaBytes: boolean;
+  mimeType?: string;
+  fileSizeBytes?: number;
+  width?: number;
+  height?: number;
+  durationSec?: number;
+  fps?: 24 | 30 | 60 | null;
+  hasAudioTrack?: boolean;
+  sampledColorsHex?: string[];
+  extractedTextCues?: string[];
+}
+
 export interface ReferenceLabPipelineMetadata {
   analyzerVersion: string;
   modelId: string;
@@ -267,6 +301,17 @@ export interface ReferenceLabSession {
   rightsDeclaration: ReferenceRightsDeclaration;
   urlInspection?: ReferenceUrlInspectionResult;
   mediaSpecs: {
+    mediaAnalysisState: SourceMediaAnalysisState;
+    sourceMediaParsed: boolean;
+    parsedSourceMetadata: ParsedSourceMediaMetadata | null;
+    fieldProvenance: {
+      dimensions: SourceFieldProvenanceKind;
+      durationSec: SourceFieldProvenanceKind;
+      fps: SourceFieldProvenanceKind;
+      audioTrack: SourceFieldProvenanceKind;
+      colorPalette: SourceFieldProvenanceKind;
+      typography: SourceFieldProvenanceKind;
+    };
     durationSec: number;
     width: number;
     height: number;
@@ -622,6 +667,9 @@ export function buildReconstructionFidelityReport(params: {
   hasSourceProjectFile: boolean;
   hasAudioTrack: boolean;
   sourceKind: ReferenceInputSourceKind;
+  mediaAnalysisState?: SourceMediaAnalysisState;
+  sourceMediaParsed?: boolean;
+  fieldProvenance?: ReferenceLabSession['mediaSpecs']['fieldProvenance'];
 }): ReconstructionFidelityReport {
   const {
     usageMode,
@@ -631,7 +679,12 @@ export function buildReconstructionFidelityReport(params: {
     hasSourceProjectFile,
     hasAudioTrack,
     sourceKind,
+    mediaAnalysisState = hasSourceProjectFile ? 'source-project-file' : 'verified-preset',
+    sourceMediaParsed = true,
+    fieldProvenance,
   } = params;
+
+  const isFilenameOnly = mediaAnalysisState === 'filename-only-unparsed';
 
   const sourceCoveredProperties = observations
     .filter((o) => o.provenanceSource === 'provided source project')
@@ -648,7 +701,8 @@ export function buildReconstructionFidelityReport(params: {
         o.editableInCanonicalProject &&
         (o.provenanceSource === 'measured from frame' ||
           o.provenanceSource === 'inferred' ||
-          o.provenanceSource === 'provided source project')
+          o.provenanceSource === 'provided source project' ||
+          (isFilenameOnly && o.provenanceSource === 'generated approximation'))
     )
     .map((o) => ({
       propertyKey: o.propertyKey,
@@ -667,10 +721,31 @@ export function buildReconstructionFidelityReport(params: {
       reason:
         usageMode === 'reference-inspired'
           ? 'Independently generated alternative for Reference-Inspired Mode.'
+          : isFilenameOnly
+          ? 'Filename-only input without parsed media bytes; approximated with editable procedural layer.'
           : 'Original source asset/shader not present in flattened media; approximated with editable procedural layer.',
     }));
 
   const unrecoverableProperties: ReconstructionFidelityReport['unrecoverableProperties'] = [];
+  if (isFilenameOnly) {
+    unrecoverableProperties.push({
+      propertyKey: 'unparsed_filename_only_upload',
+      label: 'Unparsed Source Media Stream (Filename-Only Input)',
+      reason:
+        'Only a filename was provided without parsed media header/frame bytes. Source resolution, frame rate, pixel colors, and audio waveform were not measured from media.',
+    });
+  }
+  for (const obs of observations) {
+    if (obs.provenanceSource === 'unknown') {
+      unrecoverableProperties.push({
+        propertyKey: obs.propertyKey,
+        label: obs.label,
+        reason:
+          obs.uncertaintyReason ||
+          'Source property could not be measured or inferred from the supplied reference input.',
+      });
+    }
+  }
   if (!hasSourceProjectFile) {
     unrecoverableProperties.push(
       {
@@ -696,6 +771,36 @@ export function buildReconstructionFidelityReport(params: {
     });
   }
 
+  const observedFields = new Set<string>();
+  const inferredFields = new Set<string>();
+  const generatedFields = new Set<string>();
+  const unknownFields = new Set<string>();
+
+  if (fieldProvenance) {
+    for (const [fieldKey, kind] of Object.entries(fieldProvenance)) {
+      const tag = `mediaSpecs.${fieldKey}`;
+      if (kind === 'observed') observedFields.add(tag);
+      else if (kind === 'inferred') inferredFields.add(tag);
+      else if (kind === 'generated') generatedFields.add(tag);
+      else unknownFields.add(tag);
+    }
+  }
+
+  for (const obs of observations) {
+    if (
+      obs.provenanceSource === 'measured from frame' ||
+      obs.provenanceSource === 'provided source project'
+    ) {
+      observedFields.add(obs.propertyKey);
+    } else if (obs.provenanceSource === 'inferred') {
+      inferredFields.add(obs.propertyKey);
+    } else if (obs.provenanceSource === 'generated approximation') {
+      generatedFields.add(obs.propertyKey);
+    } else if (obs.provenanceSource === 'unknown') {
+      unknownFields.add(obs.propertyKey);
+    }
+  }
+
   const perShotConfidence = shots.map((s) => ({
     shotId: s.id,
     shotTitle: s.title,
@@ -705,7 +810,7 @@ export function buildReconstructionFidelityReport(params: {
     status:
       usageMode === 'reference-inspired'
         ? ('inspired-transform' as const)
-        : s.confidenceScore >= 0.82 && s.mismatchNotes.length <= 1
+        : !isFilenameOnly && s.confidenceScore >= 0.82 && s.mismatchNotes.length <= 1
         ? ('high-confidence' as const)
         : ('needs-review' as const),
     mismatchCount: s.mismatchNotes.length,
@@ -721,6 +826,11 @@ export function buildReconstructionFidelityReport(params: {
       : 0.75;
 
   const knownDifferences: string[] = [];
+  if (isFilenameOnly) {
+    knownDifferences.push(
+      'Filename-only upload detected: no media container or frame pixels were parsed. Media specs and layers are unverified approximations/defaults until actual media bytes are parsed.'
+    );
+  }
   if (usageMode === 'reference-inspired') {
     knownDifferences.push(
       'Reference-Inspired Mode intentionally transforms shot durations, color palette hexes, copy, and geometry into an independent creative work.',
@@ -760,12 +870,22 @@ export function buildReconstructionFidelityReport(params: {
   return {
     generatedAt: new Date().toISOString(),
     usageMode,
+    mediaAnalysisState,
+    sourceMediaParsed,
     overallConfidence,
     pixelIdenticalClaimed: false,
     fidelityDisclaimer:
-      usageMode === 'authorized-reconstruction'
+      isFilenameOnly
+        ? 'Filename-only input is not a parsed media analysis. Because only a filename was supplied without parsed media bytes, source media metadata is unverified and layers use generated approximations.'
+        : usageMode === 'authorized-reconstruction'
         ? 'Authorized Reconstruction approximates editable layers from measured frames and supplied assets. Unless a native source project file was supplied, reconstructed keyframes and procedural plates are approximations, not recovered hidden source data.'
         : 'Reference-Inspired Mode extracts high-level pacing, contrast, and motion categories to generate an independent original composition without 1:1 copying of protected expression.',
+    fieldClassificationSummary: {
+      observed: Array.from(observedFields),
+      inferred: Array.from(inferredFields),
+      generated: Array.from(generatedFields),
+      unknown: Array.from(unknownFields),
+    },
     sourceCoveredProperties,
     reconstructedEditableProperties,
     approximatedProperties,
@@ -800,6 +920,7 @@ export function buildReconstructionFidelityReport(params: {
  * a canonical `2.0.0` project graph tailored to the selected `ReferenceUsageMode`.
  */
 export function createReferenceLabSession(params: {
+  id?: string;
   ownerUid: string;
   title?: string;
   usageMode: ReferenceUsageMode;
@@ -807,6 +928,7 @@ export function createReferenceLabSession(params: {
   sourceUrl?: string;
   presetId?: string;
   suppliedFileNames?: string[];
+  parsedMediaMetadata?: ParsedSourceMediaMetadata;
   customHeadline?: string;
   customSubheadline?: string;
   measuredColorsHex?: string[];
@@ -822,9 +944,10 @@ export function createReferenceLabSession(params: {
   attributionText?: string;
 }): ReferenceLabSession {
   const now = new Date().toISOString();
-  const preset =
-    BUILT_IN_REFERENCE_PRESETS.find((p) => p.id === params.presetId) ||
-    BUILT_IN_REFERENCE_PRESETS[0];
+  const explicitPreset = params.presetId
+    ? BUILT_IN_REFERENCE_PRESETS.find((p) => p.id === params.presetId)
+    : undefined;
+  const preset = explicitPreset || BUILT_IN_REFERENCE_PRESETS[0];
 
   const urlInspection = params.sourceUrl
     ? inspectReferenceSourceUrl(params.sourceUrl)
@@ -840,32 +963,70 @@ export function createReferenceLabSession(params: {
   const isAuthorized = usageMode === 'authorized-reconstruction';
   const hasSourceProjectFile =
     params.hasSourceProjectFile ??
-    (params.sourceKind === 'uploaded-project-file' || preset.hasSourceProjectFile);
-  const frameRateDetected = params.sourceKind !== 'uploaded-screenshots';
+    (params.sourceKind === 'uploaded-project-file' || Boolean(explicitPreset?.hasSourceProjectFile));
+
+  const hasVerifiedParsedMedia = Boolean(params.parsedMediaMetadata?.parsedFromMediaBytes);
+  const hasSuppliedFiles = Boolean(params.suppliedFileNames && params.suppliedFileNames.length > 0);
+  const isFilenameOnlyUpload =
+    hasSuppliedFiles &&
+    !hasVerifiedParsedMedia &&
+    !hasSourceProjectFile &&
+    !explicitPreset;
+  const isUrlMetadataOnly =
+    Boolean(urlInspection && urlInspection.accessStatus === 'public-page-metadata-only') &&
+    !hasVerifiedParsedMedia &&
+    !hasSourceProjectFile &&
+    !explicitPreset;
+
+  const mediaAnalysisState: SourceMediaAnalysisState = hasSourceProjectFile
+    ? 'source-project-file'
+    : hasVerifiedParsedMedia
+    ? 'parsed-media'
+    : isFilenameOnlyUpload
+    ? 'filename-only-unparsed'
+    : isUrlMetadataOnly
+    ? 'url-metadata-only'
+    : 'verified-preset';
+
+  const sourceMediaParsed =
+    mediaAnalysisState === 'source-project-file' ||
+    mediaAnalysisState === 'parsed-media' ||
+    mediaAnalysisState === 'verified-preset';
+
+  const parsedMeta = hasVerifiedParsedMedia ? params.parsedMediaMetadata! : null;
+
+  const frameRateDetected =
+    !isFilenameOnlyUpload &&
+    !isUrlMetadataOnly &&
+    params.sourceKind !== 'uploaded-screenshots' &&
+    (parsedMeta ? parsedMeta.fps !== undefined && parsedMeta.fps !== null : true);
   const fps: 24 | 30 | 60 | null = frameRateDetected
-    ? params.fps || preset.fps
+    ? parsedMeta?.fps ?? params.fps ?? preset.fps
     : null;
   const effectiveCanvasFps: 24 | 30 | 60 = fps || 30;
 
   const baseDuration = Math.max(
     2,
-    Number(params.durationSec || preset.durationSec || 6)
+    Number(parsedMeta?.durationSec || params.durationSec || preset.durationSec || 6)
   );
   // In Reference-Inspired Mode, shift total duration slightly (+15%) so timing is not a 1:1 clone
   const durationSec = isAuthorized
     ? baseDuration
     : Number((baseDuration * 1.15).toFixed(1));
 
-  const width = params.width || preset.width;
-  const height = params.height || preset.height;
+  const width = parsedMeta?.width || params.width || preset.width;
+  const height = parsedMeta?.height || params.height || preset.height;
   const aspectRatio: MobileAspectRatio =
     width > height ? '16:9' : width === height ? '1:1' : '9:16';
   const hasAudioTrack =
+    parsedMeta?.hasAudioTrack ??
     params.hasAudioTrack ??
-    (params.sourceKind !== 'uploaded-screenshots' && preset.hasAudioTrack);
+    (!isFilenameOnlyUpload && params.sourceKind !== 'uploaded-screenshots' && preset.hasAudioTrack);
 
   const rawColors =
-    params.measuredColorsHex && params.measuredColorsHex.length >= 2
+    parsedMeta?.sampledColorsHex && parsedMeta.sampledColorsHex.length >= 2
+      ? parsedMeta.sampledColorsHex
+      : params.measuredColorsHex && params.measuredColorsHex.length >= 2
       ? params.measuredColorsHex
       : preset.defaultColors;
 
@@ -879,9 +1040,13 @@ export function createReferenceLabSession(params: {
       ];
 
   const baseHeadline =
-    params.customHeadline?.trim() || preset.defaultHeadline;
+    parsedMeta?.extractedTextCues?.[0]?.trim() ||
+    params.customHeadline?.trim() ||
+    preset.defaultHeadline;
   const baseSubheadline =
-    params.customSubheadline?.trim() || preset.defaultSubheadline;
+    parsedMeta?.extractedTextCues?.[1]?.trim() ||
+    params.customSubheadline?.trim() ||
+    preset.defaultSubheadline;
 
   const activeHeadline = isAuthorized
     ? baseHeadline
@@ -1086,7 +1251,9 @@ export function createReferenceLabSession(params: {
   ];
 
   // Build CanonicalProjectDocument (v2.0.0) from the analyzed shot graph
-  const sessionId = `ref_sess_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const sessionId =
+    params.id?.trim() ||
+    `ref_sess_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
   const projectTitle =
     params.title?.trim() ||
     (isAuthorized
@@ -1097,7 +1264,9 @@ export function createReferenceLabSession(params: {
     id: `proj_${sessionId}`,
     ownerUid: params.ownerUid,
     title: projectTitle,
-    description: isAuthorized
+    description: isFilenameOnlyUpload
+      ? `Filename-only reference scaffold (${(params.suppliedFileNames || []).join(', ')}). Source media bytes were not parsed; uses generated approximation layers.`
+      : isAuthorized
       ? `Authorized Reconstruction from ${params.sourceKind} (${params.sourceUrl || preset.title}).`
       : `Reference-Inspired independent composition derived from ${params.sourceKind}.`,
     moduleId: preset.moduleId,
@@ -1505,11 +1674,70 @@ export function createReferenceLabSession(params: {
       : 'Independently transformed timeline preserving broad pacing and motion family.',
   };
 
+  const hasObservedText = Boolean(
+    hasSourceProjectFile ||
+      parsedMeta?.extractedTextCues?.length ||
+      (!isFilenameOnlyUpload && !isUrlMetadataOnly && isAuthorized)
+  );
+  const hasObservedColors = Boolean(
+    hasSourceProjectFile ||
+      parsedMeta?.sampledColorsHex?.length ||
+      params.measuredColorsHex?.length ||
+      (!isFilenameOnlyUpload && !isUrlMetadataOnly && isAuthorized)
+  );
+
   const textProvenance: PropertyProvenanceSource = hasSourceProjectFile
     ? 'provided source project'
-    : isAuthorized
+    : hasObservedText
+    ? 'measured from frame'
+    : params.customHeadline
+    ? 'inferred'
+    : 'generated approximation';
+
+  const colorProvenance: PropertyProvenanceSource = hasSourceProjectFile
+    ? 'provided source project'
+    : hasObservedColors && isAuthorized
     ? 'measured from frame'
     : 'generated approximation';
+
+  const geometryProvenance: PropertyProvenanceSource = hasSourceProjectFile
+    ? 'provided source project'
+    : !isFilenameOnlyUpload && !isUrlMetadataOnly && isAuthorized
+    ? 'measured from frame'
+    : 'generated approximation';
+
+  const fieldProvenance: ReferenceLabSession['mediaSpecs']['fieldProvenance'] = {
+    dimensions:
+      hasSourceProjectFile || Boolean(parsedMeta?.width && parsedMeta?.height) || Boolean(explicitPreset)
+        ? 'observed'
+        : params.width && params.height
+        ? 'inferred'
+        : 'unknown',
+    durationSec:
+      hasSourceProjectFile || Boolean(parsedMeta?.durationSec) || Boolean(explicitPreset)
+        ? 'observed'
+        : params.durationSec
+        ? 'inferred'
+        : 'unknown',
+    fps:
+      hasSourceProjectFile || Boolean(parsedMeta?.fps) || Boolean(explicitPreset && frameRateDetected)
+        ? 'observed'
+        : params.fps
+        ? 'inferred'
+        : 'unknown',
+    audioTrack:
+      hasSourceProjectFile || parsedMeta?.hasAudioTrack !== undefined || Boolean(explicitPreset)
+        ? 'observed'
+        : params.hasAudioTrack !== undefined
+        ? 'inferred'
+        : 'unknown',
+    colorPalette: hasObservedColors ? 'observed' : 'generated',
+    typography: hasSourceProjectFile || Boolean(parsedMeta?.extractedTextCues?.length)
+      ? 'observed'
+      : Boolean(params.customHeadline) || (!isFilenameOnlyUpload && !isUrlMetadataOnly)
+      ? 'inferred'
+      : 'generated',
+  };
 
   const observations: ReferencePropertyObservation[] = [
     {
@@ -1520,8 +1748,14 @@ export function createReferenceLabSession(params: {
       label: 'Shot 1 Headline Copy',
       observedValue: activeHeadline,
       provenanceSource: textProvenance,
-      confidence: hasSourceProjectFile ? 0.99 : 0.92,
-      uncertain: false,
+      confidence: hasSourceProjectFile ? 0.99 : isFilenameOnlyUpload ? 0.65 : 0.92,
+      uncertain: isFilenameOnlyUpload,
+      ...(isFilenameOnlyUpload
+        ? {
+            uncertaintyReason:
+              'Filename-only upload: headline text was not extracted from media frames.',
+          }
+        : {}),
       editableInCanonicalProject: true,
       targetClipId: 'clip_ref_text_1',
       preservedByUser: false,
@@ -1533,11 +1767,15 @@ export function createReferenceLabSession(params: {
       propertyKey: 'shot_01.accentColorHex',
       label: 'Primary Accent Color Hex',
       observedValue: activeColors[1] || '#F06424',
-      provenanceSource: isAuthorized
-        ? 'measured from frame'
-        : 'generated approximation',
-      confidence: 0.95,
-      uncertain: false,
+      provenanceSource: colorProvenance,
+      confidence: isFilenameOnlyUpload ? 0.68 : 0.95,
+      uncertain: isFilenameOnlyUpload,
+      ...(isFilenameOnlyUpload
+        ? {
+            uncertaintyReason:
+              'Filename-only upload: palette was not sampled from decoded video frames.',
+          }
+        : {}),
       editableInCanonicalProject: true,
       targetClipId: 'clip_ref_text_1',
       preservedByUser: false,
@@ -1583,13 +1821,9 @@ export function createReferenceLabSession(params: {
       propertyKey: 'shot_02.cardGeometry',
       label: 'Shot 2 Feature Card Vector Geometry',
       observedValue: 'Rounded Rect 820×680px (rx=28)',
-      provenanceSource: hasSourceProjectFile
-        ? 'provided source project'
-        : isAuthorized
-        ? 'measured from frame'
-        : 'generated approximation',
-      confidence: 0.89,
-      uncertain: false,
+      provenanceSource: geometryProvenance,
+      confidence: isFilenameOnlyUpload ? 0.7 : 0.89,
+      uncertain: isFilenameOnlyUpload,
       editableInCanonicalProject: true,
       targetClipId: 'clip_ref_card_shot2',
       preservedByUser: false,
@@ -1618,12 +1852,33 @@ export function createReferenceLabSession(params: {
       label: 'Shot 3 Outro CTA Text',
       observedValue: shots[2].typographyAnalysis.detectedText || 'READY FOR EXPORT',
       provenanceSource: textProvenance,
-      confidence: 0.91,
-      uncertain: false,
+      confidence: isFilenameOnlyUpload ? 0.65 : 0.91,
+      uncertain: isFilenameOnlyUpload,
       editableInCanonicalProject: true,
       targetClipId: 'clip_ref_text_3',
       preservedByUser: false,
     },
+    ...(isFilenameOnlyUpload || isUrlMetadataOnly
+      ? [
+          {
+            id: 'obs_unparsed_media_stream',
+            shotId: 'shot_01',
+            category: 'camera-depth' as const,
+            propertyKey: 'sourceMedia.containerAndFrameStream',
+            label: 'Source Media Container & Frame Stream',
+            observedValue: isFilenameOnlyUpload
+              ? `Unparsed filename: ${(params.suppliedFileNames || []).join(', ')}`
+              : `Unparsed page URL: ${params.sourceUrl || ''}`,
+            provenanceSource: 'unknown' as const,
+            confidence: 0,
+            uncertain: true,
+            uncertaintyReason:
+              'Source media bytes were not parsed. Frame dimensions, frame rate, and pixel colors are unknown until actual media parsing occurs.',
+            editableInCanonicalProject: false,
+            preservedByUser: false,
+          },
+        ]
+      : []),
   ];
 
   const fidelityReport = buildReconstructionFidelityReport({
@@ -1634,6 +1889,9 @@ export function createReferenceLabSession(params: {
     hasSourceProjectFile,
     hasAudioTrack,
     sourceKind: params.sourceKind,
+    mediaAnalysisState,
+    sourceMediaParsed,
+    fieldProvenance,
   });
 
   const rightsDeclaration: ReferenceRightsDeclaration = {
@@ -1657,17 +1915,35 @@ export function createReferenceLabSession(params: {
     attributionText: params.attributionText || 'User Reference Declaration',
   };
 
+  const persistedParsedMetadata: ParsedSourceMediaMetadata | null = sourceMediaParsed
+    ? parsedMeta || {
+        parsedFromMediaBytes: true,
+        width,
+        height,
+        durationSec,
+        fps,
+        hasAudioTrack,
+        sampledColorsHex: activeColors,
+        extractedTextCues: [activeHeadline, activeSubheadline],
+      }
+    : null;
+
   return {
     id: sessionId,
     ownerUid: params.ownerUid,
     title: projectTitle,
     sourceKind: params.sourceKind,
-    sourceSummary:
-      urlInspection?.statusSummary ||
-      `${params.sourceKind} · ${width}×${height} · ${durationSec}s`,
+    sourceSummary: isFilenameOnlyUpload
+      ? `Filename-only upload (${(params.suppliedFileNames || []).join(', ')}) — source media bytes were not parsed; using generated approximation scaffold.`
+      : urlInspection?.statusSummary ||
+        `${params.sourceKind} · ${width}×${height} · ${durationSec}s`,
     rightsDeclaration,
     urlInspection,
     mediaSpecs: {
+      mediaAnalysisState,
+      sourceMediaParsed,
+      parsedSourceMetadata: persistedParsedMetadata,
+      fieldProvenance,
       durationSec,
       width,
       height,
@@ -1917,6 +2193,9 @@ export function applyReferenceCorrectionAction(
     hasSourceProjectFile: next.mediaSpecs.hasSourceProjectFile,
     hasAudioTrack: next.mediaSpecs.hasAudioTrack,
     sourceKind: next.sourceKind,
+    mediaAnalysisState: next.mediaSpecs.mediaAnalysisState,
+    sourceMediaParsed: next.mediaSpecs.sourceMediaParsed,
+    fieldProvenance: next.mediaSpecs.fieldProvenance,
   });
 
   const actionRecord: ReferenceCorrectionActionRecord = {

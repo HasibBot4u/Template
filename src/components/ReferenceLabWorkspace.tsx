@@ -46,6 +46,7 @@ interface ReferenceLabWorkspaceProps {
   userUid?: string | null;
   onProjectSaved?: (project: ProjectLibraryItem) => void;
   onTemplateSaved?: (template: CatalogItem) => void;
+  onCatalogChanged?: () => void;
   getAuthToken?: (forceRefresh?: boolean) => Promise<string | null>;
   fetchImpl?: typeof fetch;
 }
@@ -91,6 +92,7 @@ export const ReferenceLabWorkspace: React.FC<ReferenceLabWorkspaceProps> = ({
   userUid,
   onProjectSaved,
   onTemplateSaved,
+  onCatalogChanged,
   getAuthToken,
   fetchImpl,
 }) => {
@@ -258,6 +260,7 @@ export const ReferenceLabWorkspace: React.FC<ReferenceLabWorkspaceProps> = ({
           : 'uploaded-video';
 
     setSourceKind(detectedKind);
+    setSelectedPresetId('');
     setSessionTitle(file.name.replace(/\.[^.]+$/, ''));
     setSuppliedFileNames([file.name]);
     setUploadedSizeBytes(file.size);
@@ -431,6 +434,7 @@ export const ReferenceLabWorkspace: React.FC<ReferenceLabWorkspaceProps> = ({
     if (res.ok && res.data?.template) {
       const templateItem = res.data.template;
       onTemplateSaved?.(templateItem);
+      onCatalogChanged?.();
       setSession(res.data.session || {
         ...session,
         savedDraftTemplateId: templateItem.id,
@@ -1525,6 +1529,54 @@ export const ReferenceLabWorkspace: React.FC<ReferenceLabWorkspaceProps> = ({
                     <div className="p-3 rounded-lg bg-amber-950/30 border border-amber-500/30 text-amber-200 text-[11px]">
                       <strong>Honest Reconstruction Disclosure:</strong>{' '}
                       {session.fidelityReport.fidelityDisclaimer}
+                    </div>
+
+                    {/* Media Analysis State & Field Classification Summary */}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
+                      <div className="p-2.5 rounded-lg bg-zinc-900 border border-zinc-800 space-y-1">
+                        <div className="text-[10px] uppercase font-mono text-zinc-400">Analysis State</div>
+                        <div className="flex items-center gap-1.5">
+                          <span
+                            className={`px-2 py-0.5 rounded text-[10px] font-semibold ${
+                              session.mediaSpecs.sourceMediaParsed
+                                ? 'bg-emerald-500/20 border border-emerald-500/40 text-emerald-300'
+                                : 'bg-amber-500/20 border border-amber-500/40 text-amber-300'
+                            }`}
+                          >
+                            {session.mediaSpecs.mediaAnalysisState || (session.mediaSpecs.sourceMediaParsed ? 'parsed-from-media' : 'filename-only-unparsed')}
+                          </span>
+                        </div>
+                        <div className="text-[10px] text-zinc-400">
+                          {session.mediaSpecs.sourceMediaParsed
+                            ? 'Media stream inspected & measured.'
+                            : 'Unparsed stream: filename only; no frame metrics claimed.'}
+                        </div>
+                      </div>
+
+                      <div className="p-2.5 rounded-lg bg-zinc-900 border border-zinc-800 space-y-1">
+                        <div className="text-[10px] uppercase font-mono text-zinc-400">Observed / Source-Proven</div>
+                        <div className="text-lg font-bold text-sky-400">
+                          {session.fidelityReport.fieldClassificationSummary?.observed.length ?? session.fidelityReport.reconstructedEditableProperties.length}
+                        </div>
+                        <div className="text-[10px] text-zinc-400">Verified from stream / source project</div>
+                      </div>
+
+                      <div className="p-2.5 rounded-lg bg-zinc-900 border border-zinc-800 space-y-1">
+                        <div className="text-[10px] uppercase font-mono text-zinc-400">Inferred & Approximated</div>
+                        <div className="text-lg font-bold text-purple-400">
+                          {(session.fidelityReport.fieldClassificationSummary?.inferred.length ?? 0) +
+                            (session.fidelityReport.fieldClassificationSummary?.generated.length ?? session.fidelityReport.approximatedProperties.length)}
+                        </div>
+                        <div className="text-[10px] text-zinc-400">Inferred motion / generated proxies</div>
+                      </div>
+
+                      <div className="p-2.5 rounded-lg bg-zinc-900 border border-zinc-800 space-y-1">
+                        <div className="text-[10px] uppercase font-mono text-zinc-400">Unknown / Unrecoverable</div>
+                        <div className="text-lg font-bold text-rose-400">
+                          {session.fidelityReport.fieldClassificationSummary?.unknown.length ?? session.fidelityReport.unrecoverableProperties.length}
+                        </div>
+                        <div className="text-[10px] text-zinc-400">Flattened video boundaries / unparsed</div>
+                      </div>
                     </div>
 
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-3">

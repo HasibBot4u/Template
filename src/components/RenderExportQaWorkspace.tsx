@@ -322,6 +322,10 @@ export const RenderExportQaWorkspace: React.FC<RenderExportQaWorkspaceProps> = (
         {
           method: 'POST',
           body: {
+            projectId:
+              selectedProjectId !== 'sample-canonical'
+                ? selectedProjectId
+                : undefined,
             projectDoc: activeCanonicalProject,
             executionTier: tier,
             outputFormat,
