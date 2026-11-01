@@ -48,6 +48,7 @@ import {
 export type TemplateFactorySourceKind =
   | 'from-scratch'
   | 'canonical-project'
+  | 'ai-director-production'
   | 'reference-reconstruction';
 
 export type ProvenanceOriginClassification =
@@ -1423,7 +1424,11 @@ export function runTemplateFactoryPipeline(params: {
       status: 'passed',
       detail: `Loaded Reference Lab session "${refSess.title}" with mandatory "Reconstructed" provenance and Fidelity Report (${Math.round(refSess.fidelityReport.overallConfidence * 100)}% confidence).`,
     });
-  } else if (params.sourceKind === 'canonical-project' && params.sourceProject) {
+  } else if (
+    (params.sourceKind === 'canonical-project' ||
+      params.sourceKind === 'ai-director-production') &&
+    params.sourceProject
+  ) {
     provenanceClassification =
       params.sourceProject.provenance.originType === 'reference-reconstruction'
         ? 'Reconstructed'

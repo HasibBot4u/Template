@@ -50,6 +50,7 @@ import {
   REGISTERED_AI_TOOLS,
   RISKY_EXTENSION_PERMISSIONS,
   SecretStorageMode,
+  SkillClassification,
   TaskRoutingProfile,
   ToolExecutionAuditRecord,
   validateCustomEndpointSsrf,
@@ -183,6 +184,10 @@ export const ProviderHubWorkspace: React.FC<ProviderHubWorkspaceProps> = ({
   const [extensions, setExtensions] = useState<ExtensionPackageRecord[]>([]);
   const [extName, setExtName] = useState<string>('');
   const [extKind, setExtKind] = useState<ExtensionPackageKind>('github-repo');
+  const [extClassification, setExtClassification] =
+    useState<SkillClassification>('executable-extension');
+  const [extAttribution, setExtAttribution] = useState<string>('');
+  const [extGitBranchOrTag, setExtGitBranchOrTag] = useState<string>('main');
   const [extSourceUrl, setExtSourceUrl] = useState<string>('https://github.com/');
   const [extCommitPin, setExtCommitPin] = useState<string>('v1.0.0-pinned');
   const [extLicense, setExtLicense] = useState<string>('MIT');
@@ -670,6 +675,9 @@ export const ProviderHubWorkspace: React.FC<ProviderHubWorkspaceProps> = ({
         body: {
           name: extName,
           kind: extKind,
+          classification: extClassification,
+          attribution: extAttribution.trim() || undefined,
+          gitBranchOrTagOrCommitPin: extGitBranchOrTag.trim() || extCommitPin,
           sourceUrl: extSourceUrl,
           commitOrReleasePin: extCommitPin,
           version: '1.0.0',
@@ -698,10 +706,87 @@ export const ProviderHubWorkspace: React.FC<ProviderHubWorkspaceProps> = ({
       setExtManifestContent('');
       onNotify(
         registered.installState === 'quarantined'
-          ? `Extension "${registered.name}" was quarantined by the security sandbox.`
-          : `Registered extension "${registered.name}" (${registered.installState}).`,
+          ? `Extension "${registered.name}" was quarantined by the pre-flight static security scan.`
+          : `Registered extension "${registered.name}" (${registered.installState}, ${registered.classification}).`,
         registered.installState === 'quarantined' ? 'error' : 'success'
       );
+    } finally {
+      setIsMutating(false);
+    }
+  };
+
+  const handleExecuteExtensionInSandbox = async (ext: ExtensionPackageRecord) => {
+    setIsMutating(true);
+    setApiErrorBanner(null);
+    try {
+      const res = await apiCall<{
+        result: {
+          runId: string;
+          status: string;
+          executionDurationMs: number;
+          outputSummary: string;
+          errorMessage?: string;
+        };
+        extension: ExtensionPackageRecord;
+      }>(`/api/v1/extensions/${encodeURIComponent(ext.id)}/execute`, {
+        method: 'POST',
+        body: {
+          inputPayload: { action: 'verify-sandbox', timestamp: new Date().toISOString() },
+        },
+      });
+
+      if (!res.ok || !res.data) {
+        const msg = res.errorMessage || 'Failed to execute extension in sandbox.';
+        setApiErrorBanner({
+          code: res.errorCode || 'EXTENSION_EXECUTION_FAILED',
+          message: msg,
+        });
+        onNotify(msg, 'error');
+        return;
+      }
+
+      const { result, extension: updated } = res.data;
+      setExtensions((prev) =>
+        prev.map((item) => (item.id === updated.id ? updated : item))
+      );
+      onNotify(
+        result.status === 'success'
+          ? `Sandbox execution passed in ${result.executionDurationMs}ms.`
+          : `Sandbox execution status: ${result.status} — ${result.errorMessage || result.outputSummary}`,
+        result.status === 'success' ? 'success' : 'warning'
+      );
+    } finally {
+      setIsMutating(false);
+    }
+  };
+
+  const handleRevokePermissions = async (ext: ExtensionPackageRecord) => {
+    setIsMutating(true);
+    setApiErrorBanner(null);
+    try {
+      const res = await apiCall<{ extension: ExtensionPackageRecord }>(
+        `/api/v1/extensions/${encodeURIComponent(ext.id)}/revoke`,
+        {
+          method: 'POST',
+          body: { reason: 'User initiated permission revocation' },
+        }
+      );
+
+      if (!res.ok || !res.data?.extension) {
+        const msg = res.errorMessage || 'Failed to revoke permissions.';
+        setApiErrorBanner({
+          code: res.errorCode || 'EXTENSION_REVOKE_FAILED',
+          message: msg,
+        });
+        onNotify(msg, 'error');
+        return;
+      }
+
+      const updated = res.data.extension;
+      setExtensions((prev) =>
+        prev.map((item) => (item.id === updated.id ? updated : item))
+      );
+      onNotify(`Revoked all permissions for extension "${updated.name}".`, 'info');
     } finally {
       setIsMutating(false);
     }
@@ -1931,6 +2016,34 @@ export const ProviderHubWorkspace: React.FC<ProviderHubWorkspaceProps> = ({
                 </div>
                 <div>
                   <label className="block text-[11px] text-zinc-400 mb-1">
+                    Classification
+                  </label>
+                  <select
+                    value={extClassification}
+                    onChange={(e) => setExtClassification(e.target.value as SkillClassification)}
+                    className="w-full px-2.5 py-1.5 text-xs bg-zinc-900 border border-zinc-700 rounded text-zinc-100"
+                  >
+                    <option value="executable-extension">Executable Extension (VM Sandbox)</option>
+                    <option value="read-only-prompt-skill">Read-Only Prompt Skill (No Code)</option>
+                  </select>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="block text-[11px] text-zinc-400 mb-1">
+                    Git Branch / Tag / Pin
+                  </label>
+                  <input
+                    type="text"
+                    value={extGitBranchOrTag}
+                    onChange={(e) => setExtGitBranchOrTag(e.target.value)}
+                    placeholder="main or v1.0.0"
+                    className="w-full px-2.5 py-1.5 text-xs font-mono bg-zinc-900 border border-zinc-700 rounded text-zinc-100"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] text-zinc-400 mb-1">
                     Commit / Release Pin
                   </label>
                   <input
@@ -1965,6 +2078,19 @@ export const ProviderHubWorkspace: React.FC<ProviderHubWorkspaceProps> = ({
                     className="w-full px-2.5 py-1.5 text-xs bg-zinc-900 border border-zinc-700 rounded text-zinc-100"
                   />
                 </div>
+              </div>
+
+              <div>
+                <label className="block text-[11px] text-zinc-400 mb-1">
+                  Author / Upstream Attribution
+                </label>
+                <input
+                  type="text"
+                  value={extAttribution}
+                  onChange={(e) => setExtAttribution(e.target.value)}
+                  placeholder="e.g. Developed by community author @example"
+                  className="w-full px-2.5 py-1.5 text-xs bg-zinc-900 border border-zinc-700 rounded text-zinc-100"
+                />
               </div>
 
               <div>
@@ -2050,18 +2176,33 @@ export const ProviderHubWorkspace: React.FC<ProviderHubWorkspaceProps> = ({
                   >
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <div>
-                        <div className="flex items-center gap-2">
+                        <div className="flex flex-wrap items-center gap-2">
                           <span className="text-xs font-bold text-white">{ext.name}</span>
+                          <span
+                            className={`px-2 py-0.5 text-[10px] font-mono font-semibold rounded border ${
+                              ext.classification === 'read-only-prompt-skill'
+                                ? 'bg-sky-950/60 text-sky-300 border-sky-500/30'
+                                : 'bg-purple-950/60 text-purple-300 border-purple-500/30'
+                            }`}
+                          >
+                            {ext.classification === 'read-only-prompt-skill'
+                              ? 'Prompt Skill (Read-Only)'
+                              : 'Executable Extension'}
+                          </span>
                           <span className="px-2 py-0.5 text-[10px] font-mono bg-zinc-800 text-zinc-300 rounded">
                             {ext.kind} · v{ext.version}
                           </span>
                           <span className="px-2 py-0.5 text-[10px] font-mono bg-zinc-900 text-zinc-400 border border-zinc-800 rounded">
-                            pin: {ext.commitOrReleasePin}
+                            pin: {ext.gitBranchOrTagOrCommitPin || ext.commitOrReleasePin}
                           </span>
                         </div>
-                        <p className="text-[11px] text-zinc-400 font-mono mt-0.5">
-                          sha256: {ext.checksumSha256.slice(0, 24)}… · License: {ext.license}
-                        </p>
+                        <div className="flex flex-wrap items-center gap-3 text-[11px] text-zinc-400 font-mono mt-0.5">
+                          <span>sha256: {ext.checksumSha256.slice(0, 16)}…</span>
+                          <span>License: {ext.license}</span>
+                          {ext.attribution && (
+                            <span className="text-zinc-300 font-sans">Attribution: {ext.attribution}</span>
+                          )}
+                        </div>
                       </div>
 
                       <span
@@ -2076,6 +2217,24 @@ export const ProviderHubWorkspace: React.FC<ProviderHubWorkspaceProps> = ({
                         {ext.installState}
                       </span>
                     </div>
+
+                    {ext.preFlightScanReport && (
+                      <div className="p-2 rounded bg-zinc-950/80 border border-zinc-800 text-[10px] space-y-0.5">
+                        <div className="flex items-center justify-between text-zinc-300">
+                          <span className="font-semibold text-zinc-200">
+                            Pre-Flight Static Security Scan:
+                          </span>
+                          <span
+                            className={
+                              ext.preFlightScanReport.passed ? 'text-emerald-400' : 'text-rose-400'
+                            }
+                          >
+                            {ext.preFlightScanReport.passed ? 'PASSED' : 'QUARANTINED'}
+                          </span>
+                        </div>
+                        <p className="text-zinc-400">{ext.preFlightScanReport.summary}</p>
+                      </div>
+                    )}
 
                     {latestRun && (
                       <div className="p-2.5 rounded bg-zinc-900/80 border border-zinc-800 text-[11px] space-y-1">
@@ -2099,6 +2258,16 @@ export const ProviderHubWorkspace: React.FC<ProviderHubWorkspaceProps> = ({
                       </div>
                     )}
 
+                    {ext.sandboxExecutions && ext.sandboxExecutions.length > 0 && (
+                      <div className="p-2.5 rounded bg-zinc-950 border border-purple-500/20 text-[11px] space-y-1">
+                        <div className="flex items-center justify-between text-purple-300 font-semibold text-[10px]">
+                          <span>Latest VM Isolated Sandbox Execution:</span>
+                          <span className="font-mono">{ext.sandboxExecutions[0].status} ({ext.sandboxExecutions[0].executionDurationMs}ms)</span>
+                        </div>
+                        <p className="text-zinc-400 text-[10px]">{ext.sandboxExecutions[0].outputSummary}</p>
+                      </div>
+                    )}
+
                     <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
                       <div className="flex flex-wrap gap-1">
                         {ext.requestedPermissions.map((p) => (
@@ -2115,7 +2284,27 @@ export const ProviderHubWorkspace: React.FC<ProviderHubWorkspaceProps> = ({
                         ))}
                       </div>
 
-                      <div className="flex items-center gap-1.5">
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        {ext.isExecutable && ext.installState === 'installed-enabled' && (
+                          <button
+                            type="button"
+                            disabled={isMutating}
+                            onClick={() => void handleExecuteExtensionInSandbox(ext)}
+                            className="px-2.5 py-1 rounded bg-purple-600 hover:bg-purple-500 text-[11px] font-semibold text-white disabled:opacity-50 inline-flex items-center gap-1"
+                          >
+                            <Terminal className="w-3 h-3" /> Run in VM Sandbox
+                          </button>
+                        )}
+                        {ext.approvedPermissions.length > 0 && (
+                          <button
+                            type="button"
+                            disabled={isMutating}
+                            onClick={() => void handleRevokePermissions(ext)}
+                            className="px-2.5 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-[11px] text-amber-300 disabled:opacity-50"
+                          >
+                            Revoke Scopes
+                          </button>
+                        )}
                         {ext.permissionDiff.requiresExplicitApproval &&
                           !ext.explicitApprovalGranted && (
                             <button

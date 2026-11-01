@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { z } from 'zod';
 import { MobileAspectRatio, ModuleId, TargetMobileEditorId, TemplateLicenseType } from '../types/sowveil';
 import {
   CanonicalProjectCommand,
@@ -11,7 +12,24 @@ import {
   validateCanonicalProject,
 } from './canonicalProjectEngine';
 import { SEED_CATALOG_ITEMS } from '../data/catalogSeeds';
-import { PREPOPULATED_MODEL_CATALOG } from './providerHubEngine';
+import {
+  PREPOPULATED_MODEL_CATALOG,
+  buildProtocolRequest,
+  executeSafeUpstreamRequest,
+  invokeRegisteredTool,
+  parseProtocolResponse,
+  parseProtocolStreamChunk,
+} from './providerHubEngine';
+import {
+  HubProviderProtocol,
+  HubTaskType,
+  ProviderConnectionRecord,
+  TaskRoutingProfile,
+} from '../types/providerHub';
+import { decryptCredentialFromVault } from '../server/credentialVault';
+import { sanitizeAndValidateSvgContent } from './marketplaceEngine';
+
+
 
 // ============================================================================
 // 1. DURABLE PRODUCTION STATE MACHINE & INTAKE TYPES
@@ -147,8 +165,15 @@ export interface DeepScriptAnalysisReport {
     repeatedText: string;
     preserved: boolean;
   }>;
-  analyzerModelUsed: 'gemini-4-argon' | 'gemini-3.8-flash';
+  /**
+   * Truthful model attribution:
+   * - Defaults to 'deterministic-local-analyzer' when no live upstream model was contacted or when upstream failed.
+   * - Set to the exact runtime model ID (e.g., 'gemini-4-argon', 'gemini-3.8-flash', 'gpt-4o', 'claude-3-7-sonnet-20250219')
+   *   ONLY when that exact configured model was actually contacted upstream and succeeded.
+   */
+  analyzerModelUsed: string;
 }
+
 
 export interface CompleteCoverageLedger {
   totalSegments: number;
@@ -383,7 +408,122 @@ export interface GeneratedAssetProvenanceRecord {
   licenseType: TemplateLicenseType;
   provenanceNote: string;
   createdAt: string;
-  status: 'completed' | 'fallback-substituted';
+  status: 'completed' | 'fallback-substituted' | 'metadata-only';
+  /** Real verified asset payload fields (never represent metadata placeholders as generated media) */
+  svgContent: string;
+  byteLength: number;
+  checksumSha256: string;
+  mimeType: 'image/svg+xml';
+  storageLocation: string;
+  validationPassed: boolean;
+}
+
+export type DirectorProviderInvocationStatus =
+  | 'succeeded'
+  | 'failed-rate-limit'
+  | 'failed-invalid-model'
+  | 'failed-auth'
+  | 'failed-timeout'
+  | 'failed-provider-outage'
+  | 'failed-schema-validation'
+  | 'failed-capability-or-quota'
+  | 'skipped-no-live-provider';
+
+export interface AiDirectorProviderInvocationEvidence {
+  invocationId: string;
+  taskType: HubTaskType;
+  stage: DirectorProductionStage;
+  connectionId: string | null;
+  connectionLabel: string;
+  providerBrand: string;
+  protocol: HubProviderProtocol | 'none';
+  requestedModelId: string;
+
+  /**
+   * Non-null ONLY when the upstream HTTP request succeeded and returned a valid response
+   * from that exact runtime model. Never claims 'gemini-4-argon' or 'gemini-3.8-flash' on failure/skip.
+   */
+  actualContactedModelId: string | null;
+  usedFallbackConnection: boolean;
+  primaryConnectionAttemptedId?: string | null;
+  status: DirectorProviderInvocationStatus;
+  httpStatus: number | null;
+  latencyMs: number;
+  usage: {
+    promptTokens: number;
+    completionTokens: number;
+    reasoningTokens: number;
+    totalTokens: number;
+    estimatedCostUsd: number;
+  };
+  streamStages: string[];
+  sanitizedError: {
+    code: string;
+    message: string;
+    retryable: boolean;
+  } | null;
+  createdAt: string;
+}
+
+export interface LiveModelSemanticAndDirectorSynthesis {
+  narrativeStructure: {
+    hookStrategy: string;
+    risingActionBeats: string[];
+    climaxMoment: string;
+    resolutionAndCta: string;
+    pacingArc: string;
+  };
+  audienceAndTone: {
+    refinedAudiencePersona: string;
+    toneDescriptor: string;
+    vocalDeliveryNotes: string;
+  };
+  sceneInterpretations: Array<{
+    segmentId: string;
+    narrativeRole: string;
+    visualMetaphor: string;
+    shotDescription: string;
+    cameraLanguage: string;
+    motionAndEffects: string;
+    transitionPlan: string;
+    audioSfxVoiceCue: string;
+    continuityAndRiskNote: string;
+  }>;
+  paletteAndTypography: {
+    primaryHex?: string;
+    secondaryHex?: string;
+    backgroundHex?: string;
+    lightingDirection: string;
+    typographyHierarchyNote: string;
+  };
+  assetAndMotionPlan: {
+    primaryAssetStrategy: string;
+    motionSystemSummary: string;
+    transitionLanguageSummary: string;
+    audioMasterPlan: string;
+  };
+  riskAndContinuityAnalysis: Array<{
+    code: string;
+    severity: 'low' | 'medium' | 'high';
+    description: string;
+    mitigation: string;
+  }>;
+  prioritizedQuestions?: Array<{
+    id: string;
+    category: DirectorClarificationQuestion['category'];
+    classification: UncertaintyClassification;
+    questionText: string;
+    whyItMatters: string;
+    options: string[];
+    recommendedDefault: string;
+  }>;
+}
+
+export interface ExecutionStageTraceEntry {
+  stage: string;
+  status: 'completed' | 'running' | 'failed' | 'fallback';
+  detail: string;
+  timestamp: string;
 }
 
 export interface ProductionTraceabilityMappings {
@@ -469,9 +609,17 @@ export interface AiDirectorSessionRecord {
   acceptanceGate: DirectorAcceptanceGateReport;
   estimatedTotalCostUsd: number;
   spentBudgetUsd: number;
+  /** Live Provider Hub Orchestration Telemetry & Model Synthesis */
+  executionMode?: 'live-provider' | 'deterministic-fallback' | 'hybrid-live-and-deterministic';
+  selectedConnectionId?: string | null;
+  actualContactedModels?: string[];
+  providerInvocations?: AiDirectorProviderInvocationEvidence[];
+  liveModelSynthesis?: LiveModelSemanticAndDirectorSynthesis | null;
+  executionStageTrace?: ExecutionStageTraceEntry[];
   createdAt: string;
   updatedAt: string;
 }
+
 
 // ============================================================================
 // 6. BUILT-IN SAMPLE SCRIPTS FOR INSTANT ONE-CLICK WORKFLOW TESTING
@@ -909,10 +1057,11 @@ export function analyzeScriptSemantics(
     visualPossibilities,
     mustPreservePhrases,
     meaningfulRepetitions,
-    analyzerModelUsed:
-      budgetMode === 'low-cost-fast-flash' ? 'gemini-3.8-flash' : 'gemini-4-argon',
+    // Never falsely claim 'gemini-4-argon' or 'gemini-3.8-flash' unless that exact model was contacted upstream and succeeded
+    analyzerModelUsed: 'deterministic-local-analyzer',
   };
 }
+
 
 // ============================================================================
 // 9. COMPLETE COVERAGE LEDGER COMPUTATION
@@ -1075,9 +1224,17 @@ export function buildClarificationQuestions(
         : 'Require explicit human approval before compiling shots (Recommended)',
   });
 
+  const priorityOrder: Record<UncertaintyClassification, number> = {
+    blocking: 1,
+    important: 2,
+    optional: 3,
+    assumed: 4,
+  };
+
   const now = new Date().toISOString();
   return candidates
     .filter((c) => !previouslyAnsweredFingerprints.has(c.fingerprint))
+    .sort((a, b) => priorityOrder[a.classification] - priorityOrder[b.classification])
     .map((c) => {
       if (intake.noQuestionsWorkflow || c.classification === 'assumed') {
         return {
@@ -1097,6 +1254,7 @@ export function buildClarificationQuestions(
       };
     });
 }
+
 
 // ============================================================================
 // 11. 4-TIER ASSET STRATEGY & HONEST CATALOG MATCHING
@@ -1652,6 +1810,25 @@ export function createAiDirectorSession(input: {
     },
     estimatedTotalCostUsd,
     spentBudgetUsd: 0.01,
+    executionMode: 'deterministic-fallback',
+    selectedConnectionId: null,
+    actualContactedModels: [],
+    providerInvocations: [],
+    liveModelSynthesis: null,
+    executionStageTrace: [
+      {
+        stage: 'deterministic-script-segmentation',
+        status: 'completed',
+        detail: `Segmented ${segmented.segments.length} passage(s) across ${segmented.chunkCountProcessed} chunk(s) with 100% character offset reconciliation.`,
+        timestamp: now,
+      },
+      {
+        stage: 'baseline-shot-plan-synthesis',
+        status: 'completed',
+        detail: `Built ${shots.length} baseline shot(s) mapped to ${coverageLedger.coveragePercent}% of script segments.`,
+        timestamp: now,
+      },
+    ],
     createdAt: now,
     updatedAt: now,
   };
@@ -1659,6 +1836,7 @@ export function createAiDirectorSession(input: {
   session.acceptanceGate = evaluateDirectorAcceptanceGate(session);
   return session;
 }
+
 
 /**
  * Answers or locks clarification questions, or applies recommended defaults,
@@ -1996,23 +2174,21 @@ export function executeDirectorProductionPlan(
 
     shotToTemplateMap[shot.shotId] = effectiveTemplateId;
 
-    // Create procedural/generative asset record with explicit provenance
+    // Create real verified SVG procedural asset with actual bytes, SHA-256 checksum, storage location, and validation
     const assetTaskId = `asset_dir_${shot.shotId}`;
-    generatedAssets.push({
+    const verifiedPlate = synthesizeVerifiedSvgMotionPlate({
       assetTaskId,
-      shotId: shot.shotId,
-      title: `${shot.editableParameters.headlineText.slice(0, 28)} Motion Plate`,
-      kind: dependencyFailed ? 'procedural-svg-plate' : 'kinetic-title-rig',
-      licenseType: 'Sowveil Original',
-      provenanceNote: dependencyFailed
-        ? `Fallback procedural plate generated for isolated shot ${shot.shotId}`
-        : `Compiled from template ${effectiveTemplateId} for shot ${shot.shotId}`,
+      shot,
+      brandKit: next.intake.brandKit,
+      dependencyFailed,
+      effectiveTemplateId,
       createdAt: now,
-      status: dependencyFailed ? 'fallback-substituted' : 'completed',
     });
+    generatedAssets.push(verifiedPlate);
     shotToAssetsMap[shot.shotId] = [assetTaskId];
 
     const createdClipIds: string[] = [];
+
 
     // 1. Instantiate Template / Vector Motion Clip via typed command
     const tplClipId = `clip_tpl_${shot.shotId}`;
@@ -2577,9 +2753,11 @@ export function evaluateDirectorAcceptanceGate(
 
   const assetProvenanceStored =
     session.generatedAssetRecords.length > 0 &&
-    session.generatedAssetRecords.every((a) => Boolean(a.licenseType && a.provenanceNote));
+    session.generatedAssetRecords.every((a) => validateGeneratedAssetRecord(a).valid);
   if (!assetProvenanceStored) {
-    blockingReasons.push('Asset provenance records have not been generated yet (run Production Compilation).');
+    blockingReasons.push(
+      'Generated asset records are missing or failed byte/SHA-256/provenance validation (run Production Compilation).'
+    );
   }
 
   let canonicalProjectValid = false;
@@ -2644,3 +2822,1424 @@ export function evaluateDirectorAcceptanceGate(
       : `Acceptance Gate PENDING (${blockingReasons.length} item(s)): ${blockingReasons[0] || ''}`,
   };
 }
+
+// ============================================================================
+// 17. VERIFIED ASSET SYNTHESIS & HONEST PROVENANCE VALIDATION
+// ============================================================================
+
+function escapeXmlText(text: string): string {
+  return String(text || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+/**
+ * Generates a real, self-contained SVG vector motion plate with verified UTF-8 bytes,
+ * SHA-256 digest, storage location, provenance, and security sanitization.
+ * Never represents metadata-only placeholders as generated media.
+ */
+export function synthesizeVerifiedSvgMotionPlate(input: {
+  assetTaskId: string;
+  shot: DirectorShotPlanItem;
+  brandKit: DirectorBrandKitInput;
+  dependencyFailed: boolean;
+  effectiveTemplateId: string;
+  createdAt: string;
+}): GeneratedAssetProvenanceRecord {
+  const { assetTaskId, shot, brandKit, dependencyFailed, effectiveTemplateId, createdAt } = input;
+  const width = shot.technicalParameters.width || 1080;
+  const height = shot.technicalParameters.height || 1920;
+  const primaryHex = shot.editableParameters.accentColorHex || brandKit.primaryColorHex || '#FF6B1A';
+  const secondaryHex = shot.paletteAndLighting.accentHex || brandKit.secondaryColorHex || '#FF9E44';
+  const bgHex = shot.paletteAndLighting.backgroundHex || brandKit.backgroundColorHex || '#0A0B0E';
+  const headline = escapeXmlText(shot.editableParameters.headlineText.slice(0, 84));
+  const subhead = escapeXmlText(shot.editableParameters.subheadText.slice(0, 96));
+
+  const rawSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}">
+  <defs>
+    <linearGradient id="bg_${shot.shotId}" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="${bgHex}" />
+      <stop offset="100%" stop-color="#141822" />
+    </linearGradient>
+    <linearGradient id="accent_${shot.shotId}" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="${primaryHex}" />
+      <stop offset="100%" stop-color="${secondaryHex}" />
+    </linearGradient>
+  </defs>
+  <rect width="${width}" height="${height}" fill="url(#bg_${shot.shotId})" />
+  <rect x="64" y="${Math.round(height * 0.38)}" width="${width - 128}" height="6" rx="3" fill="url(#accent_${shot.shotId})" opacity="0.9" />
+  <text x="${Math.round(width / 2)}" y="${Math.round(height * 0.45)}" fill="#F5F7FA" font-family="${escapeXmlText(brandKit.headingFont || 'Syne')}" font-size="52" font-weight="800" text-anchor="middle">${headline}</text>
+  <text x="${Math.round(width / 2)}" y="${Math.round(height * 0.52)}" fill="${secondaryHex}" font-family="${escapeXmlText(brandKit.bodyFont || 'Plus Jakarta Sans')}" font-size="26" font-weight="600" text-anchor="middle">${subhead}</text>
+</svg>`;
+
+  const svgCheck = sanitizeAndValidateSvgContent(rawSvg);
+  const sanitizedSvg = svgCheck.sanitizedSvg;
+  const byteLength = Buffer.byteLength(sanitizedSvg, 'utf8');
+  const checksumSha256 = crypto.createHash('sha256').update(sanitizedSvg, 'utf8').digest('hex');
+
+  return {
+    assetTaskId,
+    shotId: shot.shotId,
+    title: `${shot.editableParameters.headlineText.slice(0, 28)} Motion Plate`,
+    kind: dependencyFailed ? 'procedural-svg-plate' : 'kinetic-title-rig',
+    licenseType: 'Sowveil Original',
+    provenanceNote: dependencyFailed
+      ? `Fallback procedural SVG plate synthesized and SHA-256 verified for isolated shot ${shot.shotId}`
+      : `Compiled & SHA-256 verified SVG vector plate from template ${effectiveTemplateId} for shot ${shot.shotId}`,
+    createdAt,
+    status: dependencyFailed ? 'fallback-substituted' : 'completed',
+    svgContent: sanitizedSvg,
+    byteLength,
+    checksumSha256,
+    mimeType: 'image/svg+xml',
+    storageLocation: `sowveil-inline-svg://${assetTaskId}.svg`,
+    validationPassed: svgCheck.valid && byteLength > 64 && /^[a-f0-9]{64}$/i.test(checksumSha256),
+  };
+}
+
+
+/**
+ * Validates that a generated asset record is not a fake metadata placeholder.
+ * Any asset claiming status 'completed' or 'fallback-substituted' must have real SVG bytes,
+ * a matching SHA-256 checksum, a storage location, provenance, and passed validation.
+ */
+export function validateGeneratedAssetRecord(
+  asset: GeneratedAssetProvenanceRecord
+): { valid: boolean; errors: string[] } {
+  const errors: string[] = [];
+  if (!asset.licenseType || !asset.provenanceNote) {
+    errors.push(`Asset "${asset.assetTaskId}" is missing licenseType or provenanceNote.`);
+  }
+  if (asset.status === 'metadata-only') {
+    errors.push(
+      `Asset "${asset.assetTaskId}" is marked 'metadata-only' and cannot be represented as a generated asset.`
+    );
+  }
+  if (typeof asset.svgContent !== 'string' || !asset.svgContent.trim().startsWith('<svg')) {
+    errors.push(`Asset "${asset.assetTaskId}" has no real SVG payload bytes.`);
+  } else {
+    const actualBytes = Buffer.byteLength(asset.svgContent, 'utf8');
+    const actualSha256 = crypto.createHash('sha256').update(asset.svgContent, 'utf8').digest('hex');
+    if (asset.byteLength !== actualBytes || actualBytes <= 0) {
+      errors.push(
+        `Asset "${asset.assetTaskId}" byteLength (${asset.byteLength}) does not match actual bytes (${actualBytes}).`
+      );
+    }
+    if (asset.checksumSha256 !== actualSha256) {
+      errors.push(
+        `Asset "${asset.assetTaskId}" SHA-256 checksum mismatch (${asset.checksumSha256} vs ${actualSha256}).`
+      );
+    }
+  }
+  if (!asset.storageLocation || !asset.storageLocation.trim()) {
+    errors.push(`Asset "${asset.assetTaskId}" is missing storageLocation.`);
+  }
+  if (!asset.validationPassed) {
+    errors.push(`Asset "${asset.assetTaskId}" did not pass asset payload validation.`);
+  }
+  return { valid: errors.length === 0, errors };
+}
+
+// ============================================================================
+// 18. REVISE PLAN DURING PRODUCTION (WITH REASON, CHECKPOINT, TYPED COMMANDS & QA RE-RUN)
+// ============================================================================
+
+export interface ReviseDirectorPlanDuringProductionInput {
+  reason: string;
+  shotId: string;
+  editablePatch: Partial<ShotEditableParameters>;
+  actorUid?: string;
+  approvedByUser?: boolean;
+}
+
+/**
+ * Supports revising a shot plan during or after production compilation:
+ * 1. Requires an explicit non-empty `reason`.
+ * 2. Enforces user-locked shot/field protections and autonomy/budget gates.
+ * 3. Creates a reversible `ProductionCheckpointRecord` BEFORE mutating.
+ * 4. Executes timeline updates exclusively through typed canonical project commands
+ *    (`invokeRegisteredTool` / `executeProjectCommand`), never raw arbitrary code.
+ * 5. Records a new `DirectorPlanRevisionSnapshot` and automatically re-runs
+ *    `computeCompleteCoverageLedger`, `generateAdaptiveRefinementSuggestions`, and `evaluateDirectorAcceptanceGate`.
+ */
+export function reviseDirectorPlanDuringProduction(
+  session: AiDirectorSessionRecord,
+  input: ReviseDirectorPlanDuringProductionInput
+): AiDirectorSessionRecord {
+  const reason = typeof input.reason === 'string' ? input.reason.trim() : '';
+  if (reason.length < 3) {
+    throw new Error('REVISION_REASON_REQUIRED: A clear reason (min 3 chars) is required to revise a plan during production.');
+  }
+
+  const next: AiDirectorSessionRecord = JSON.parse(JSON.stringify(session));
+  const now = new Date().toISOString();
+
+  const targetShot = next.shots.find((s) => s.shotId === input.shotId);
+  if (!targetShot) {
+    throw new Error(`SHOT_NOT_FOUND: Shot "${input.shotId}" does not exist in the plan.`);
+  }
+
+  if (targetShot.approvalState === 'locked') {
+    throw new Error(
+      `LOCKED_DECISION_PROTECTED: Shot "${targetShot.shotId}" is locked by the user and cannot be revised without unlocking.`
+    );
+  }
+
+  for (const key of Object.keys(input.editablePatch) as Array<keyof ShotEditableParameters>) {
+    if (input.editablePatch[key] !== undefined && targetShot.lockedFields.includes(key)) {
+      throw new Error(
+        `LOCKED_DECISION_PROTECTED: Field "${key}" on shot "${targetShot.shotId}" is locked by the user.`
+      );
+    }
+  }
+
+  // Autonomy gate check for unapproved mid-production revisions
+  if (next.intake.autonomyMode === 'require-approval' && input.approvedByUser === false) {
+    throw new Error(
+      'APPROVAL_REQUIRED_FOR_REVISION: User autonomy mode requires explicit approval before applying a mid-production plan revision.'
+    );
+  }
+
+  // Create reversible checkpoint before mutating
+  const checkpointId = `chk_rev_${Date.now()}_${crypto.randomBytes(2).toString('hex')}`;
+  if (next.canonicalProject) {
+    next.productionCheckpoints.unshift({
+      checkpointId,
+      label: `Pre-Revision Checkpoint · ${targetShot.shotId}`,
+      createdAt: now,
+      reason: `Reversible checkpoint before revising ${targetShot.shotId}: ${reason}`,
+      canonicalProjectSnapshot: JSON.parse(JSON.stringify(next.canonicalProject)),
+      shotsSnapshot: JSON.parse(JSON.stringify(next.shots)),
+      coverageLedgerSnapshot: JSON.parse(JSON.stringify(next.coverageLedger)),
+    });
+  }
+
+  const patch = input.editablePatch;
+  if (patch.headlineText !== undefined && patch.headlineText.trim()) {
+    targetShot.editableParameters.headlineText = patch.headlineText.trim();
+    targetShot.typographyAndGraphics.headlineText = patch.headlineText.trim();
+  }
+  if (patch.subheadText !== undefined) {
+    targetShot.editableParameters.subheadText = patch.subheadText;
+    targetShot.typographyAndGraphics.subheadText = patch.subheadText;
+  }
+  if (patch.durationSec !== undefined && patch.durationSec >= 0.5) {
+    targetShot.editableParameters.durationSec = Number(patch.durationSec.toFixed(2));
+    targetShot.estimatedDurationSec = targetShot.editableParameters.durationSec;
+  }
+  if (patch.accentColorHex !== undefined && patch.accentColorHex.trim()) {
+    targetShot.editableParameters.accentColorHex = patch.accentColorHex.trim();
+    targetShot.paletteAndLighting.primaryHex = patch.accentColorHex.trim();
+  }
+  if (patch.cameraMotion !== undefined) {
+    targetShot.editableParameters.cameraMotion = patch.cameraMotion;
+    targetShot.compositionFramingCameraMovement.cameraMovement = patch.cameraMotion;
+  }
+  if (patch.easingCurve !== undefined && patch.easingCurve.length === 4) {
+    targetShot.editableParameters.easingCurve = patch.easingCurve;
+    targetShot.animationAndEasing.cubicBezier = patch.easingCurve;
+  }
+  if (patch.selectedTemplateId !== undefined) {
+    const realTpl = SEED_CATALOG_ITEMS.find((t) => t.id === patch.selectedTemplateId);
+    if (!realTpl) {
+      throw new Error(
+        `TEMPLATE_NOT_FOUND: Cannot assign non-existent catalog template "${patch.selectedTemplateId}".`
+      );
+    }
+    targetShot.editableParameters.selectedTemplateId = realTpl.id;
+    targetShot.templateCandidatesAndRationale.primaryTemplateId = realTpl.id;
+    targetShot.templateCandidatesAndRationale.primaryTemplateName = realTpl.name;
+    next.traceability.shotToTemplateMap[targetShot.shotId] = realTpl.id;
+  }
+
+  // Recompute sequential start times
+  let cursorSec = 0;
+  for (const s of next.shots) {
+    s.startTimeSec = Number(cursorSec.toFixed(2));
+    cursorSec += s.estimatedDurationSec;
+  }
+
+  // Execute timeline updates through typed canonical project commands & registered tool gateway
+  if (next.canonicalProject) {
+    const clipIds = next.traceability.shotToTimelineClipsMap[targetShot.shotId] || [];
+    const textClipId = clipIds.find((id) => id.startsWith('clip_txt_'));
+
+    if (patch.headlineText !== undefined && textClipId) {
+      const toolReceipt = invokeRegisteredTool({
+        ownerUid: input.actorUid || next.ownerUid,
+        toolId: 'timeline.execute_command',
+        input: {
+          projectId: next.canonicalProject.id,
+          commandType: 'update-text',
+          clipId: textClipId,
+          textValue: targetShot.editableParameters.headlineText,
+        },
+        grantedPermissions: ['read-project', 'read-catalog', 'propose-commands', 'write-project'],
+        projectDoc: next.canonicalProject,
+      });
+      if (toolReceipt.allowed && toolReceipt.status === 'allowed') {
+        const cmdRes = executeProjectCommand(
+          next.canonicalProject,
+          {
+            type: 'setTextProperties',
+            clipId: textClipId,
+            textData: {
+              content: targetShot.editableParameters.headlineText,
+              strokeColorHex: targetShot.editableParameters.accentColorHex,
+            },
+          },
+          {
+            actorId: next.ownerUid,
+            actorKind: 'ai-director',
+            rationale: `Plan revision (${reason}) via ${toolReceipt.auditRecord.toolId}`,
+            approvedByUser: true,
+          }
+        );
+        next.canonicalProject = cmdRes.project;
+        next.commandReceipts.unshift(cmdRes.receipt);
+      }
+    }
+
+    if (patch.durationSec !== undefined) {
+      for (const clipId of clipIds) {
+        const cmdRes = executeProjectCommand(
+          next.canonicalProject,
+          {
+            type: 'trimClip',
+            clipId,
+            durationSec: targetShot.editableParameters.durationSec,
+          },
+          {
+            actorId: next.ownerUid,
+            actorKind: 'ai-director',
+            rationale: `Plan revision duration update (${reason})`,
+            approvedByUser: true,
+          }
+        );
+        next.canonicalProject = cmdRes.project;
+        next.commandReceipts.unshift(cmdRes.receipt);
+      }
+    }
+
+    if (patch.cameraMotion !== undefined && clipIds[0]) {
+      const scaleVal: [number, number] =
+        patch.cameraMotion === 'push-in'
+          ? [1.08, 1.08]
+          : patch.cameraMotion === 'pull-out'
+          ? [0.95, 0.95]
+          : [1, 1];
+      const cmdRes = executeProjectCommand(
+        next.canonicalProject,
+        {
+          type: 'setTransform',
+          clipId: clipIds[0],
+          transform: { scale: scaleVal },
+        },
+        {
+          actorId: next.ownerUid,
+          actorKind: 'ai-director',
+          rationale: `Plan revision cameraMotion update (${reason})`,
+          approvedByUser: true,
+        }
+      );
+      next.canonicalProject = cmdRes.project;
+      next.commandReceipts.unshift(cmdRes.receipt);
+    }
+
+    // Regenerate verified SVG asset for the revised shot so checksum & bytes match the new parameters
+    const existingAssetIdx = next.generatedAssetRecords.findIndex(
+      (a) => a.shotId === targetShot.shotId
+    );
+    const updatedPlate = synthesizeVerifiedSvgMotionPlate({
+      assetTaskId: `asset_dir_${targetShot.shotId}`,
+      shot: targetShot,
+      brandKit: next.intake.brandKit,
+      dependencyFailed: targetShot.productionStatus === 'fallback-isolated',
+      effectiveTemplateId: targetShot.editableParameters.selectedTemplateId,
+      createdAt: now,
+    });
+    if (existingAssetIdx >= 0) {
+      next.generatedAssetRecords[existingAssetIdx] = updatedPlate;
+    } else {
+      next.generatedAssetRecords.push(updatedPlate);
+    }
+  }
+
+  // Recompute coverage ledger, record plan revision snapshot, and re-run affected QA
+  next.coverageLedger = computeCompleteCoverageLedger(
+    next.originalScriptText,
+    next.segments,
+    next.shots
+  );
+
+  next.planRevisions.unshift({
+    revisionNumber: next.planRevisions.length + 1,
+    savedAt: now,
+    reason,
+    shotsSnapshot: JSON.parse(JSON.stringify(next.shots)),
+    coveragePercent: next.coverageLedger.coveragePercent,
+  });
+
+  next.refinementSuggestions = generateAdaptiveRefinementSuggestions(next);
+  next.updatedAt = now;
+  next.acceptanceGate = evaluateDirectorAcceptanceGate(next);
+  return next;
+}
+
+// ============================================================================
+// 19. LIVE MODEL-DRIVEN AI DIRECTOR ORCHESTRATOR (PROVIDER HUB + VAULT + ZOD)
+// ============================================================================
+
+export const LiveModelDirectorSynthesisSchema = z.object({
+  narrativeStructure: z.object({
+    hookStrategy: z.string().min(1),
+    risingActionBeats: z.array(z.string().min(1)).min(1),
+    climaxMoment: z.string().min(1),
+    resolutionAndCta: z.string().min(1),
+    pacingArc: z.string().min(1),
+  }),
+  audienceAndTone: z.object({
+    refinedAudiencePersona: z.string().min(1),
+    toneDescriptor: z.string().min(1),
+    vocalDeliveryNotes: z.string().min(1),
+  }),
+  sceneInterpretations: z
+    .array(
+      z.object({
+        segmentId: z.string().min(1),
+        narrativeRole: z.string().min(1),
+        visualMetaphor: z.string().min(1),
+        shotDescription: z.string().min(1),
+        cameraLanguage: z.string().min(1),
+        motionAndEffects: z.string().min(1),
+        transitionPlan: z.string().min(1),
+        audioSfxVoiceCue: z.string().min(1),
+        continuityAndRiskNote: z.string().min(1),
+      })
+    )
+    .min(1),
+  paletteAndTypography: z.object({
+    primaryHex: z.string().regex(/^#[0-9A-Fa-f]{6}$/).optional(),
+    secondaryHex: z.string().regex(/^#[0-9A-Fa-f]{6}$/).optional(),
+    backgroundHex: z.string().regex(/^#[0-9A-Fa-f]{6}$/).optional(),
+    lightingDirection: z.string().min(1),
+    typographyHierarchyNote: z.string().min(1),
+  }),
+  assetAndMotionPlan: z.object({
+    primaryAssetStrategy: z.string().min(1),
+    motionSystemSummary: z.string().min(1),
+    transitionLanguageSummary: z.string().min(1),
+    audioMasterPlan: z.string().min(1),
+  }),
+  riskAndContinuityAnalysis: z.array(
+    z.object({
+      code: z.string().min(1),
+      severity: z.enum(['low', 'medium', 'high']),
+      description: z.string().min(1),
+      mitigation: z.string().min(1),
+    })
+  ),
+  prioritizedQuestions: z
+    .array(
+      z.object({
+        id: z.string().min(1),
+        category: z.enum([
+          'audience-goal',
+          'visual-style',
+          'audio-voice',
+          'assets-rights',
+          'pacing-duration',
+          'budget-autonomy',
+        ]),
+        classification: z.enum(['blocking', 'important', 'optional', 'assumed']),
+        questionText: z.string().min(5),
+        whyItMatters: z.string().min(3),
+        options: z.array(z.string().min(1)).min(2),
+        recommendedDefault: z.string().min(1),
+      })
+    )
+    .optional(),
+});
+
+function extractJsonObjectFromModelText(rawText: string): unknown {
+  const trimmed = String(rawText || '').trim();
+  const fencedMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = fencedMatch ? fencedMatch[1].trim() : trimmed;
+  try {
+    return JSON.parse(candidate);
+  } catch {
+    const firstBrace = candidate.indexOf('{');
+    const lastBrace = candidate.lastIndexOf('}');
+    if (firstBrace >= 0 && lastBrace > firstBrace) {
+      return JSON.parse(candidate.slice(firstBrace, lastBrace + 1));
+    }
+    throw new Error('MODEL_OUTPUT_NOT_VALID_JSON');
+  }
+}
+
+function resolveServerSideSecretForConnection(conn: ProviderConnectionRecord): {
+  ok: boolean;
+  secret: string;
+  errorCode?: string;
+  errorMessage?: string;
+} {
+  if (conn.credentialStatus === 'revoked') {
+    return {
+      ok: false,
+      secret: '',
+      errorCode: 'CREDENTIAL_REVOKED',
+      errorMessage: `Credential for connection "${conn.label}" has been revoked.`,
+    };
+  }
+  if (conn.credentialStatus === 'requires-reentry') {
+    return {
+      ok: false,
+      secret: '',
+      errorCode: 'CREDENTIAL_REQUIRES_REENTRY',
+      errorMessage: `Credential for connection "${conn.label}" requires re-entry in Provider Hub.`,
+    };
+  }
+  if (conn.authMode === 'server-env') {
+    const envSecret = (process.env.GEMINI_API_KEY || '').trim();
+    if (!envSecret) {
+      return {
+        ok: false,
+        secret: '',
+        errorCode: 'SERVER_ENV_KEY_MISSING',
+        errorMessage: 'GEMINI_API_KEY is not configured in the server environment.',
+      };
+    }
+    return { ok: true, secret: envSecret };
+  }
+  if (!conn.encryptedCredential) {
+    return {
+      ok: false,
+      secret: '',
+      errorCode: 'VAULT_CREDENTIAL_NOT_FOUND',
+      errorMessage: `No encrypted credential stored in server vault for connection "${conn.label}".`,
+    };
+  }
+  try {
+    const plain = decryptCredentialFromVault(conn.encryptedCredential, {
+      ownerUid: conn.ownerUid,
+      workspaceId: conn.workspaceId,
+      connectionId: conn.id,
+      protocol: conn.protocol,
+    });
+    if (!plain || !plain.trim()) {
+      return {
+        ok: false,
+        secret: '',
+        errorCode: 'VAULT_DECRYPT_EMPTY',
+        errorMessage: 'Decrypted vault credential is empty.',
+      };
+    }
+    return { ok: true, secret: plain.trim() };
+  } catch {
+    return {
+      ok: false,
+      secret: '',
+      errorCode: 'VAULT_DECRYPT_FAILED',
+      errorMessage: 'Failed to decrypt user credential from server vault.',
+    };
+  }
+}
+
+
+function classifyUpstreamFailure(
+  httpStatus: number,
+  rawBody: string,
+  errorCode?: string
+): {
+  status: DirectorProviderInvocationStatus;
+  code: string;
+  message: string;
+  retryable: boolean;
+} {
+  if (errorCode === 'UPSTREAM_TIMEOUT' || httpStatus === 408) {
+    return {
+      status: 'failed-timeout',
+      code: 'PROVIDER_TIMEOUT',
+      message: 'Provider request timed out before completing structured synthesis.',
+      retryable: true,
+    };
+  }
+  if (httpStatus === 429) {
+    return {
+      status: 'failed-rate-limit',
+      code: 'PROVIDER_RATE_LIMITED',
+      message: 'Provider rate limit (HTTP 429) exceeded.',
+      retryable: true,
+    };
+  }
+  if (httpStatus === 401 || httpStatus === 403) {
+    return {
+      status: 'failed-auth',
+      code: 'PROVIDER_AUTH_FAILED',
+      message: `Provider authentication/authorization failed (HTTP ${httpStatus}).`,
+      retryable: false,
+    };
+  }
+  if (
+    httpStatus === 404 ||
+    (httpStatus === 400 && /model|not found|unknown model|invalid model/i.test(rawBody))
+  ) {
+    return {
+      status: 'failed-invalid-model',
+      code: 'PROVIDER_INVALID_MODEL',
+      message: `Configured runtime model was rejected or not found by upstream provider (HTTP ${httpStatus}).`,
+      retryable: false,
+    };
+  }
+  if (httpStatus >= 500 || httpStatus === 0) {
+    return {
+      status: 'failed-provider-outage',
+      code: 'PROVIDER_OUTAGE',
+      message: `Upstream provider service outage or network error (HTTP ${httpStatus || 'ERR'}).`,
+      retryable: true,
+    };
+  }
+  return {
+    status: 'failed-provider-outage',
+    code: errorCode || `HTTP_${httpStatus}`,
+    message: `Upstream provider returned HTTP ${httpStatus}.`,
+    retryable: false,
+  };
+}
+
+function buildDirectorOrchestrationPrompts(session: AiDirectorSessionRecord): {
+  systemPrompt: string;
+  userPrompt: string;
+} {
+  const segmentListText = session.segments
+    .map(
+      (s) =>
+        `- ${s.segmentId} [offsets ${s.startOffset}..${s.endOffset}, role=${s.kind}, emotion=${s.emotionalTone.trim()}]: "${s.exactOriginalText}"`
+    )
+    .join('\n');
+
+  const systemPrompt = `You are the Sowveil Studio AI Director Orchestrator.
+Return ONLY a valid JSON object matching the exact schema below (no markdown prose outside JSON).
+You must preserve every provided segmentId verbatim. Do not drop or invent segmentIds.
+Required JSON keys:
+- narrativeStructure: { hookStrategy, risingActionBeats: string[], climaxMoment, resolutionAndCta, pacingArc }
+- audienceAndTone: { refinedAudiencePersona, toneDescriptor, vocalDeliveryNotes }
+- sceneInterpretations: Array<{ segmentId, narrativeRole, visualMetaphor, shotDescription, cameraLanguage, motionAndEffects, transitionPlan, audioSfxVoiceCue, continuityAndRiskNote }>
+- paletteAndTypography: { primaryHex (optional #RRGGBB), secondaryHex (optional #RRGGBB), backgroundHex (optional #RRGGBB), lightingDirection, typographyHierarchyNote }
+- assetAndMotionPlan: { primaryAssetStrategy, motionSystemSummary, transitionLanguageSummary, audioMasterPlan }
+- riskAndContinuityAnalysis: Array<{ code, severity: "low"|"medium"|"high", description, mitigation }>
+- prioritizedQuestions (optional): Array<{ id, category, classification: "blocking"|"important"|"optional"|"assumed", questionText, whyItMatters, options: string[], recommendedDefault }>`;
+
+  const userPrompt = `Production Title: ${session.intake.title}
+Platform: ${session.intake.intendedPlatform} (${session.intake.aspectRatio} @ ${session.intake.fps}fps)
+Target Audience: ${session.intake.audience}
+Visual Goals: ${session.intake.visualGoals}
+Brand Kit: ${session.intake.brandKit.brandName} (Primary ${session.intake.brandKit.primaryColorHex}, Secondary ${session.intake.brandKit.secondaryColorHex}, Fonts ${session.intake.brandKit.headingFont} / ${session.intake.brandKit.bodyFont})
+
+Deterministic Script Segments (${session.segments.length} total, 100% offset-verified):
+${segmentListText}`;
+
+  return { systemPrompt, userPrompt };
+}
+
+/**
+ * Executes a single AI Director task against a resolved ProviderConnectionRecord
+ * using server-only vault credential decryption, protocol formatting, SSRF-hardened transport,
+ * SSE stream or JSON response parsing, and strict Zod schema validation.
+ */
+export async function executeAiDirectorLiveProviderTask(input: {
+  session: AiDirectorSessionRecord;
+  connection: ProviderConnectionRecord;
+  taskType: HubTaskType;
+  usedFallbackConnection?: boolean;
+  primaryConnectionAttemptedId?: string | null;
+  stream?: boolean;
+  timeoutMs?: number;
+  fetchImpl?: typeof fetch;
+}): Promise<{
+  invocation: AiDirectorProviderInvocationEvidence;
+  synthesis: LiveModelSemanticAndDirectorSynthesis | null;
+}> {
+  const {
+    session,
+    connection,
+    taskType,
+    usedFallbackConnection = false,
+    primaryConnectionAttemptedId = null,
+    stream = false,
+    timeoutMs = 15000,
+    fetchImpl = fetch,
+  } = input;
+
+  const invocationId = `inv_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+  const now = new Date().toISOString();
+  const requestedModelId = (connection.modelId || '').trim() || 'unconfigured-model';
+  const streamStages: string[] = ['connection-resolved'];
+
+  // 1. Verify ownership
+  if (connection.ownerUid !== session.ownerUid) {
+    return {
+      invocation: {
+        invocationId,
+        taskType,
+        stage: session.stage,
+        connectionId: connection.id,
+        connectionLabel: connection.label,
+        providerBrand: connection.providerBrand,
+        protocol: connection.protocol,
+        requestedModelId,
+        actualContactedModelId: null,
+        usedFallbackConnection,
+        primaryConnectionAttemptedId,
+        status: 'failed-auth',
+        httpStatus: 403,
+        latencyMs: 0,
+        usage: { promptTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0, estimatedCostUsd: 0 },
+        streamStages,
+        sanitizedError: {
+          code: 'CONNECTION_OWNER_MISMATCH',
+          message: 'Cannot use a provider connection owned by another user.',
+          retryable: false,
+        },
+        createdAt: now,
+      },
+      synthesis: null,
+    };
+  }
+
+  // 2. Verify capabilities and quota/budget status
+  if (connection.capabilities?.text?.state === 'Unsupported') {
+    return {
+      invocation: {
+        invocationId,
+        taskType,
+        stage: session.stage,
+        connectionId: connection.id,
+        connectionLabel: connection.label,
+        providerBrand: connection.providerBrand,
+        protocol: connection.protocol,
+        requestedModelId,
+        actualContactedModelId: null,
+        usedFallbackConnection,
+        primaryConnectionAttemptedId,
+        status: 'failed-capability-or-quota',
+        httpStatus: null,
+        latencyMs: 0,
+        usage: { promptTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0, estimatedCostUsd: 0 },
+        streamStages,
+        sanitizedError: {
+          code: 'MODEL_CAPABILITY_UNSUPPORTED',
+          message: `Connection "${connection.label}" (${requestedModelId}) does not support text generation.`,
+          retryable: false,
+        },
+        createdAt: now,
+      },
+      synthesis: null,
+    };
+  }
+
+  if (
+    connection.budgetPolicy &&
+    connection.budgetPolicy.mode === 'hard-stop' &&
+    connection.budgetPolicy.spentCurrentMonthUsd >= connection.budgetPolicy.monthlyLimitUsd
+  ) {
+    return {
+      invocation: {
+        invocationId,
+        taskType,
+        stage: session.stage,
+        connectionId: connection.id,
+        connectionLabel: connection.label,
+        providerBrand: connection.providerBrand,
+        protocol: connection.protocol,
+        requestedModelId,
+        actualContactedModelId: null,
+        usedFallbackConnection,
+        primaryConnectionAttemptedId,
+        status: 'failed-capability-or-quota',
+        httpStatus: null,
+        latencyMs: 0,
+        usage: { promptTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0, estimatedCostUsd: 0 },
+        streamStages,
+        sanitizedError: {
+          code: 'PROVIDER_QUOTA_BUDGET_EXCEEDED',
+          message: `Connection "${connection.label}" has reached its monthly budget limit ($${connection.budgetPolicy.monthlyLimitUsd}).`,
+          retryable: true,
+        },
+        createdAt: now,
+      },
+      synthesis: null,
+    };
+  }
+
+  if (session.spentBudgetUsd >= session.intake.maxBudgetUsd) {
+    return {
+      invocation: {
+        invocationId,
+        taskType,
+        stage: session.stage,
+        connectionId: connection.id,
+        connectionLabel: connection.label,
+        providerBrand: connection.providerBrand,
+        protocol: connection.protocol,
+        requestedModelId,
+        actualContactedModelId: null,
+        usedFallbackConnection,
+        primaryConnectionAttemptedId,
+        status: 'failed-capability-or-quota',
+        httpStatus: null,
+        latencyMs: 0,
+        usage: { promptTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0, estimatedCostUsd: 0 },
+        streamStages,
+        sanitizedError: {
+          code: 'SESSION_BUDGET_CAP_EXCEEDED',
+          message: `Session has reached its max budget cap ($${session.intake.maxBudgetUsd}).`,
+          retryable: false,
+        },
+        createdAt: now,
+      },
+      synthesis: null,
+    };
+  }
+
+  streamStages.push('capability-and-quota-verified');
+
+  // 3. Resolve secret from server vault or server-env (never exposed to browser)
+  const secretRes = resolveServerSideSecretForConnection(connection);
+  if (!secretRes.ok) {
+    return {
+      invocation: {
+        invocationId,
+        taskType,
+        stage: session.stage,
+        connectionId: connection.id,
+        connectionLabel: connection.label,
+        providerBrand: connection.providerBrand,
+        protocol: connection.protocol,
+        requestedModelId,
+        actualContactedModelId: null,
+        usedFallbackConnection,
+        primaryConnectionAttemptedId,
+        status: 'failed-auth',
+        httpStatus: null,
+        latencyMs: 0,
+        usage: { promptTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0, estimatedCostUsd: 0 },
+        streamStages,
+        sanitizedError: {
+          code: secretRes.errorCode || 'CREDENTIAL_UNAVAILABLE',
+          message: secretRes.errorMessage || 'Provider credential unavailable.',
+          retryable: true,
+        },
+        createdAt: now,
+      },
+      synthesis: null,
+    };
+  }
+
+  streamStages.push('vault-credential-decrypted');
+
+  // 4. Build provider-specific request payload via protocol adapter
+  const { systemPrompt, userPrompt } = buildDirectorOrchestrationPrompts(session);
+  const useStreaming = Boolean(
+    stream && connection.capabilities?.streaming && connection.capabilities.streaming.state !== 'Unsupported'
+  );
+
+  const builtReq = buildProtocolRequest({
+    connection,
+    resolvedSecret: secretRes.secret,
+    systemInstruction: systemPrompt,
+    userPrompt,
+    temperature: 0.2,
+    stream: useStreaming,
+  });
+
+  streamStages.push('upstream-request-dispatched');
+
+  // 5. Execute real server-only transport with SSRF protection
+  const upstreamRes = await executeSafeUpstreamRequest({
+    url: builtReq.url,
+    method: builtReq.method,
+    headers: builtReq.headers,
+    body: builtReq.body,
+    timeoutMs,
+    fetchImpl,
+    resolvedSecret: secretRes.secret,
+  });
+
+  if (!upstreamRes.ok) {
+    const classified = classifyUpstreamFailure(
+      upstreamRes.httpStatus,
+      upstreamRes.rawText,
+      upstreamRes.errorCode
+    );
+    return {
+      invocation: {
+        invocationId,
+        taskType,
+        stage: session.stage,
+        connectionId: connection.id,
+        connectionLabel: connection.label,
+        providerBrand: connection.providerBrand,
+        protocol: connection.protocol,
+        requestedModelId,
+        actualContactedModelId: null,
+        usedFallbackConnection,
+        primaryConnectionAttemptedId,
+        status: classified.status,
+        httpStatus: upstreamRes.httpStatus || null,
+        latencyMs: upstreamRes.latencyMs,
+        usage: { promptTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0, estimatedCostUsd: 0 },
+        streamStages,
+        sanitizedError: {
+          code: classified.code,
+          message: classified.message,
+          retryable: classified.retryable,
+        },
+        createdAt: now,
+      },
+      synthesis: null,
+    };
+  }
+
+  // 6. Parse response (supporting SSE streaming chunks or standard JSON body)
+  let extractedText = '';
+  let promptTokens = Math.max(64, Math.ceil((systemPrompt.length + userPrompt.length) / 4));
+  let completionTokens = 128;
+  let reasoningTokens = 0;
+
+  if (useStreaming && upstreamRes.rawText.includes('data:')) {
+    const lines = upstreamRes.rawText.split(/\r?\n/);
+    for (const line of lines) {
+      const chunk = parseProtocolStreamChunk(connection.protocol, line);
+      if (chunk.deltaText) {
+        extractedText += chunk.deltaText;
+      }
+    }
+    streamStages.push('stream-chunks-received');
+    completionTokens = Math.max(32, Math.ceil(extractedText.length / 4));
+  } else {
+    let parsedJson: unknown;
+    try {
+      parsedJson = JSON.parse(upstreamRes.rawText);
+    } catch {
+      return {
+        invocation: {
+          invocationId,
+          taskType,
+          stage: session.stage,
+          connectionId: connection.id,
+          connectionLabel: connection.label,
+          providerBrand: connection.providerBrand,
+          protocol: connection.protocol,
+          requestedModelId,
+          actualContactedModelId: null,
+          usedFallbackConnection,
+          primaryConnectionAttemptedId,
+          status: 'failed-schema-validation',
+          httpStatus: upstreamRes.httpStatus,
+          latencyMs: upstreamRes.latencyMs,
+          usage: { promptTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0, estimatedCostUsd: 0 },
+          streamStages,
+          sanitizedError: {
+            code: 'UPSTREAM_NON_JSON_RESPONSE',
+            message: 'Provider returned a non-JSON HTTP 200 payload.',
+            retryable: false,
+          },
+          createdAt: now,
+        },
+        synthesis: null,
+      };
+    }
+
+    const protocolParsed = parseProtocolResponse(connection.protocol, parsedJson);
+    extractedText = protocolParsed.text;
+    promptTokens = protocolParsed.usage.promptTokens || promptTokens;
+    completionTokens = protocolParsed.usage.completionTokens || Math.max(32, Math.ceil(extractedText.length / 4));
+    reasoningTokens = protocolParsed.usage.reasoningTokens || 0;
+    streamStages.push('protocol-response-parsed');
+  }
+
+  const totalTokens = promptTokens + completionTokens + reasoningTokens;
+  const catalogModel = PREPOPULATED_MODEL_CATALOG.find((m) => m.modelId === requestedModelId);
+  const isFlashPreset = catalogModel?.presetId === 'preset-gemini-3-8-flash';
+  const inputRate = isFlashPreset ? 0.35 : 1.5;
+  const outputRate = isFlashPreset ? 1.05 : 6.0;
+  const estimatedCostUsd = Number(
+    ((promptTokens / 1_000_000) * inputRate + ((completionTokens + reasoningTokens) / 1_000_000) * outputRate).toFixed(6)
+  );
+
+  // 7. Validate structured output against strict Zod schema
+  let rawObject: unknown;
+  try {
+    rawObject = extractJsonObjectFromModelText(extractedText);
+  } catch {
+    return {
+      invocation: {
+        invocationId,
+        taskType,
+        stage: session.stage,
+        connectionId: connection.id,
+        connectionLabel: connection.label,
+        providerBrand: connection.providerBrand,
+        protocol: connection.protocol,
+        requestedModelId,
+        // Even though HTTP 200 returned, structured output was malformed
+        actualContactedModelId: requestedModelId,
+        usedFallbackConnection,
+        primaryConnectionAttemptedId,
+        status: 'failed-schema-validation',
+        httpStatus: upstreamRes.httpStatus,
+        latencyMs: upstreamRes.latencyMs,
+        usage: { promptTokens, completionTokens, reasoningTokens, totalTokens, estimatedCostUsd },
+        streamStages,
+        sanitizedError: {
+          code: 'DIRECTOR_JSON_PARSE_FAILED',
+          message: 'Model response did not contain a parseable JSON object.',
+          retryable: false,
+        },
+        createdAt: now,
+      },
+      synthesis: null,
+    };
+  }
+
+  const zodResult = LiveModelDirectorSynthesisSchema.safeParse(rawObject);
+  if (!zodResult.success) {
+    const firstIssue = zodResult.error.issues[0];
+    return {
+      invocation: {
+        invocationId,
+        taskType,
+        stage: session.stage,
+        connectionId: connection.id,
+        connectionLabel: connection.label,
+        providerBrand: connection.providerBrand,
+        protocol: connection.protocol,
+        requestedModelId,
+        actualContactedModelId: requestedModelId,
+        usedFallbackConnection,
+        primaryConnectionAttemptedId,
+        status: 'failed-schema-validation',
+        httpStatus: upstreamRes.httpStatus,
+        latencyMs: upstreamRes.latencyMs,
+        usage: { promptTokens, completionTokens, reasoningTokens, totalTokens, estimatedCostUsd },
+        streamStages,
+        sanitizedError: {
+          code: 'DIRECTOR_SCHEMA_VALIDATION_FAILED',
+          message: `Structured output failed Zod schema validation at "${firstIssue?.path.join('.') || 'root'}": ${firstIssue?.message || 'invalid field'}`,
+          retryable: false,
+        },
+        createdAt: now,
+      },
+      synthesis: null,
+    };
+  }
+
+  streamStages.push('structured-schema-validated');
+  streamStages.push('director-plan-synthesized');
+
+  return {
+    invocation: {
+      invocationId,
+      taskType,
+      stage: session.stage,
+      connectionId: connection.id,
+      connectionLabel: connection.label,
+      providerBrand: connection.providerBrand,
+      protocol: connection.protocol,
+      requestedModelId,
+      actualContactedModelId: requestedModelId,
+      usedFallbackConnection,
+      primaryConnectionAttemptedId,
+      status: 'succeeded',
+      httpStatus: upstreamRes.httpStatus,
+      latencyMs: upstreamRes.latencyMs,
+      usage: { promptTokens, completionTokens, reasoningTokens, totalTokens, estimatedCostUsd },
+      streamStages,
+      sanitizedError: null,
+      createdAt: now,
+    },
+    synthesis: zodResult.data,
+  };
+}
+
+
+/**
+ * Merges a validated `LiveModelSemanticAndDirectorSynthesis` into an `AiDirectorSessionRecord`
+ * while strictly preserving 100% deterministic script segmentation (`startOffset`, `endOffset`,
+ * `exactOriginalText`) and complete coverage ledger invariants.
+ */
+export function applyLiveModelSynthesisToSession(
+  session: AiDirectorSessionRecord,
+  synthesis: LiveModelSemanticAndDirectorSynthesis,
+  actualContactedModelId: string,
+  connectionId: string
+): AiDirectorSessionRecord {
+  const next: AiDirectorSessionRecord = JSON.parse(JSON.stringify(session));
+  const now = new Date().toISOString();
+
+  // 1. Update truthful model identity ONLY because `actualContactedModelId` succeeded
+  next.analysisReport.analyzerModelUsed = actualContactedModelId;
+  next.analysisReport.overallTone = synthesis.audienceAndTone.toneDescriptor;
+  next.liveModelSynthesis = synthesis;
+  next.selectedConnectionId = connectionId;
+  next.executionMode = 'live-provider';
+  const contactedSet = new Set([...(next.actualContactedModels || []), actualContactedModelId]);
+  next.actualContactedModels = Array.from(contactedSet);
+
+  // 2. Enrich Production Brief with model-driven narrative, audience, camera, palette, typography, asset/motion/transition/audio plans
+  next.productionBrief.targetAudience = synthesis.audienceAndTone.refinedAudiencePersona;
+  next.productionBrief.visualStyle = `${synthesis.narrativeStructure.hookStrategy} · ${synthesis.assetAndMotionPlan.motionSystemSummary}`;
+  next.productionBrief.pacingProfile = synthesis.narrativeStructure.pacingArc;
+  next.productionBrief.cameraLanguage =
+    synthesis.sceneInterpretations[0]?.cameraLanguage || next.productionBrief.cameraLanguage;
+  next.productionBrief.footageAndAssetsPolicy = synthesis.assetAndMotionPlan.primaryAssetStrategy;
+  next.productionBrief.graphicsAndOverlays = synthesis.paletteAndTypography.typographyHierarchyNote;
+  next.productionBrief.voiceoverDirection = synthesis.audienceAndTone.vocalDeliveryNotes;
+  next.productionBrief.sfxDirection = synthesis.assetAndMotionPlan.audioMasterPlan;
+  next.productionBrief.musicDirection = synthesis.assetAndMotionPlan.audioMasterPlan;
+  next.productionBrief.transitionsPolicy = synthesis.assetAndMotionPlan.transitionLanguageSummary;
+
+  if (synthesis.paletteAndTypography.primaryHex) {
+    next.productionBrief.colorPalette.primaryHex = synthesis.paletteAndTypography.primaryHex;
+  }
+  if (synthesis.paletteAndTypography.secondaryHex) {
+    next.productionBrief.colorPalette.secondaryHex = synthesis.paletteAndTypography.secondaryHex;
+  }
+  if (synthesis.paletteAndTypography.backgroundHex) {
+    next.productionBrief.colorPalette.backgroundHex = synthesis.paletteAndTypography.backgroundHex;
+  }
+
+  // 3. Enrich shot-by-shot plan with scene interpretations while preserving exact script segment offsets & user locks
+  const sceneBySegId = new Map(
+    synthesis.sceneInterpretations.map((item) => [item.segmentId, item])
+  );
+
+  for (const shot of next.shots) {
+    if (shot.approvalState === 'locked') continue;
+    const primarySegId = shot.scriptSegmentIds[0];
+    const interp =
+      (primarySegId ? sceneBySegId.get(primarySegId) : undefined) ||
+      synthesis.sceneInterpretations[Math.min(shot.shotNumber - 1, synthesis.sceneInterpretations.length - 1)];
+
+    if (interp) {
+      shot.beatAndEmotionalPurpose = `${interp.narrativeRole}: ${interp.visualMetaphor}`;
+      shot.subjectAndAction = interp.shotDescription;
+      shot.backgroundEnvironment = `${synthesis.paletteAndTypography.lightingDirection} · ${interp.motionAndEffects}`;
+      shot.audioVoiceSfxMusicIntent.sfxCue = interp.audioSfxVoiceCue;
+
+      const camLower = interp.cameraLanguage.toLowerCase();
+      if (!shot.lockedFields.includes('cameraMotion')) {
+        if (camLower.includes('push-in') || camLower.includes('zoom in')) {
+          shot.editableParameters.cameraMotion = 'push-in';
+          shot.compositionFramingCameraMovement.cameraMovement = 'push-in';
+        } else if (camLower.includes('pull-out') || camLower.includes('wide')) {
+          shot.editableParameters.cameraMotion = 'pull-out';
+          shot.compositionFramingCameraMovement.cameraMovement = 'pull-out';
+        } else if (camLower.includes('orbit')) {
+          shot.editableParameters.cameraMotion = 'orbital-drift';
+          shot.compositionFramingCameraMovement.cameraMovement = 'orbital-drift';
+        } else if (camLower.includes('pan-right') || camLower.includes('pan right')) {
+          shot.editableParameters.cameraMotion = 'pan-right';
+          shot.compositionFramingCameraMovement.cameraMovement = 'pan-right';
+        } else if (camLower.includes('pan-left') || camLower.includes('pan left')) {
+          shot.editableParameters.cameraMotion = 'pan-left';
+          shot.compositionFramingCameraMovement.cameraMovement = 'pan-left';
+        }
+      }
+
+      const transLower = interp.transitionPlan.toLowerCase();
+      if (transLower.includes('whip')) {
+        shot.transitionInOut.transitionIn = 'whip-pan';
+      } else if (transLower.includes('morph') || transLower.includes('scale')) {
+        shot.transitionInOut.transitionIn = 'scale-morph';
+      } else if (transLower.includes('dissolve')) {
+        shot.transitionInOut.transitionIn = 'dissolve';
+      } else if (transLower.includes('light')) {
+        shot.transitionInOut.transitionIn = 'light-leak';
+      }
+
+      if (
+        synthesis.paletteAndTypography.primaryHex &&
+        !shot.lockedFields.includes('accentColorHex')
+      ) {
+        shot.editableParameters.accentColorHex = synthesis.paletteAndTypography.primaryHex;
+        shot.paletteAndLighting.primaryHex = synthesis.paletteAndTypography.primaryHex;
+      }
+
+      if (interp.continuityAndRiskNote) {
+        shot.risksAndWarnings.push({
+          code: 'MODEL_CONTINUITY_NOTE',
+          severity: 'low',
+          message: interp.continuityAndRiskNote,
+        });
+      }
+    }
+  }
+
+  for (const risk of synthesis.riskAndContinuityAnalysis) {
+    if (next.shots[0]) {
+      next.shots[0].risksAndWarnings.push({
+        code: risk.code,
+        severity: risk.severity,
+        message: `${risk.description} (Mitigation: ${risk.mitigation})`,
+      });
+    }
+  }
+
+  // 4. Merge & prioritize clarifying questions by importance (blocking > important > optional > assumed)
+  // and provide automatic defaults for minor unknowns ('optional' / 'assumed')
+  if (synthesis.prioritizedQuestions && synthesis.prioritizedQuestions.length > 0) {
+    const fpSet = new Set(next.answeredQuestionFingerprints);
+    const existingIds = new Set(next.questions.map((q) => q.id));
+
+    for (const mq of synthesis.prioritizedQuestions) {
+      const fp = `fp_live_${mq.id}`;
+      if (fpSet.has(fp) || existingIds.has(mq.id)) continue;
+      const isMinorUnknown =
+        next.intake.noQuestionsWorkflow ||
+        mq.classification === 'assumed' ||
+        mq.classification === 'optional';
+      next.questions.push({
+        id: mq.id,
+        fingerprint: fp,
+        category: mq.category,
+        classification: mq.classification,
+        questionText: mq.questionText,
+        whyItMatters: mq.whyItMatters,
+        options: mq.options,
+        recommendedDefault: mq.recommendedDefault,
+        selectedAnswer: isMinorUnknown ? mq.recommendedDefault : null,
+        status: isMinorUnknown ? 'default-applied' : 'unanswered',
+        lockedByUser: false,
+        answeredAt: isMinorUnknown ? now : null,
+      });
+      if (isMinorUnknown) {
+        next.productionBrief.deliverablesAndRestrictions.recordedAssumptions.push(
+          `Default applied for minor unknown "${mq.id}": ${mq.recommendedDefault}`
+        );
+      }
+    }
+
+    const priorityOrder: Record<UncertaintyClassification, number> = {
+      blocking: 1,
+      important: 2,
+      optional: 3,
+      assumed: 4,
+    };
+    next.questions.sort(
+      (a, b) => priorityOrder[a.classification] - priorityOrder[b.classification]
+    );
+  }
+
+  // 5. Recompute coverage ledger and save plan revision
+  next.coverageLedger = computeCompleteCoverageLedger(
+    next.originalScriptText,
+    next.segments,
+    next.shots
+  );
+
+  next.planRevisions.unshift({
+    revisionNumber: next.planRevisions.length + 1,
+    savedAt: now,
+    reason: `Live model synthesis applied from ${actualContactedModelId} (${connectionId})`,
+    shotsSnapshot: JSON.parse(JSON.stringify(next.shots)),
+    coveragePercent: next.coverageLedger.coveragePercent,
+  });
+
+  next.updatedAt = now;
+  next.acceptanceGate = evaluateDirectorAcceptanceGate(next);
+  return next;
+}
+
+/**
+ * High-level orchestrator that resolves the user's selected or routed ProviderConnectionRecord,
+ * executes the live AI Director task (with automatic fallback to `fallbackConnectionId` on
+ * retryable errors like HTTP 429 rate limits, timeouts, or 5xx outages), records complete
+ * invocation telemetry, and enriches the session without ever breaking 100% script coverage.
+ */
+export async function orchestrateLiveAiDirectorSession(input: {
+  session: AiDirectorSessionRecord;
+  connections: ProviderConnectionRecord[];
+  routingProfiles?: TaskRoutingProfile[] | Record<string, TaskRoutingProfile>;
+  preferredConnectionId?: string | null;
+  taskType?: HubTaskType;
+  stream?: boolean;
+  timeoutMs?: number;
+  fetchImpl?: typeof fetch;
+}): Promise<{
+  session: AiDirectorSessionRecord;
+  latestInvocation: AiDirectorProviderInvocationEvidence;
+}> {
+  const {
+    session,
+    connections,
+    routingProfiles = [],
+    preferredConnectionId = null,
+    taskType = 'planning',
+    stream = false,
+    timeoutMs = 15000,
+    fetchImpl = fetch,
+  } = input;
+
+  let next: AiDirectorSessionRecord = JSON.parse(JSON.stringify(session));
+  next.providerInvocations = Array.isArray(next.providerInvocations) ? next.providerInvocations : [];
+  next.actualContactedModels = Array.isArray(next.actualContactedModels) ? next.actualContactedModels : [];
+  next.executionStageTrace = Array.isArray(next.executionStageTrace) ? next.executionStageTrace : [];
+
+  const userConnections = connections.filter((c) => c.ownerUid === next.ownerUid);
+  const routingProfileList: TaskRoutingProfile[] = Array.isArray(routingProfiles)
+    ? routingProfiles
+    : Object.values(routingProfiles || {});
+  const routeProfile = routingProfileList.find((r) => r.taskType === taskType);
+
+  const primaryConnId =
+    preferredConnectionId ||
+    routeProfile?.primaryConnectionId ||
+    userConnections[0]?.id ||
+    null;
+
+  const primaryConnection = primaryConnId
+    ? userConnections.find((c) => c.id === primaryConnId) || null
+    : null;
+
+  if (!primaryConnection) {
+    const skippedInv: AiDirectorProviderInvocationEvidence = {
+      invocationId: `inv_skip_${Date.now()}`,
+      taskType,
+      stage: next.stage,
+      connectionId: null,
+      connectionLabel: 'No Configured Connection',
+      providerBrand: 'none',
+      protocol: 'none',
+      requestedModelId: 'none',
+      actualContactedModelId: null,
+      usedFallbackConnection: false,
+      status: 'skipped-no-live-provider',
+      httpStatus: null,
+      latencyMs: 0,
+      usage: { promptTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0, estimatedCostUsd: 0 },
+      streamStages: ['no-provider-connection-configured'],
+      sanitizedError: {
+        code: 'NO_PROVIDER_CONNECTION_CONFIGURED',
+        message: 'No live Provider Hub connection was selected or available; preserving deterministic baseline.',
+        retryable: true,
+      },
+      createdAt: new Date().toISOString(),
+    };
+    next.providerInvocations.unshift(skippedInv);
+    next.executionStageTrace.push({
+      stage: `live-orchestration-${taskType}`,
+      status: 'fallback',
+      detail: skippedInv.sanitizedError!.message,
+      timestamp: skippedInv.createdAt,
+    });
+    return { session: next, latestInvocation: skippedInv };
+  }
+
+  // Attempt primary connection
+  const primaryResult = await executeAiDirectorLiveProviderTask({
+    session: next,
+    connection: primaryConnection,
+    taskType,
+    usedFallbackConnection: false,
+    stream,
+    timeoutMs,
+    fetchImpl,
+  });
+
+  next.providerInvocations.unshift(primaryResult.invocation);
+  next.spentBudgetUsd = Number(
+    (next.spentBudgetUsd + primaryResult.invocation.usage.estimatedCostUsd).toFixed(6)
+  );
+
+  if (primaryResult.invocation.status === 'succeeded' && primaryResult.synthesis && primaryResult.invocation.actualContactedModelId) {
+    next.executionStageTrace.push({
+      stage: `live-orchestration-${taskType}`,
+      status: 'completed',
+      detail: `Contacted ${primaryResult.invocation.actualContactedModelId} via "${primaryConnection.label}" (${primaryResult.invocation.latencyMs}ms, ${primaryResult.invocation.usage.totalTokens} tokens).`,
+      timestamp: primaryResult.invocation.createdAt,
+    });
+    next = applyLiveModelSynthesisToSession(
+      next,
+      primaryResult.synthesis,
+      primaryResult.invocation.actualContactedModelId,
+      primaryConnection.id
+    );
+    return { session: next, latestInvocation: primaryResult.invocation };
+  }
+
+  // Check if fallback connection is configured and error is retryable
+  const fallbackConnId =
+    routeProfile?.fallbackConnectionId || primaryConnection.fallbackConnectionId || null;
+  const fallbackConnection =
+    fallbackConnId && fallbackConnId !== primaryConnection.id
+      ? userConnections.find((c) => c.id === fallbackConnId) || null
+      : null;
+
+  if (fallbackConnection && primaryResult.invocation.sanitizedError?.retryable) {
+    next.executionStageTrace.push({
+      stage: `live-orchestration-${taskType}-primary-failed`,
+      status: 'fallback',
+      detail: `Primary connection "${primaryConnection.label}" failed (${primaryResult.invocation.sanitizedError.code}); failing over to "${fallbackConnection.label}".`,
+      timestamp: new Date().toISOString(),
+    });
+
+    const fallbackResult = await executeAiDirectorLiveProviderTask({
+      session: next,
+      connection: fallbackConnection,
+      taskType,
+      usedFallbackConnection: true,
+      primaryConnectionAttemptedId: primaryConnection.id,
+      stream,
+      timeoutMs,
+      fetchImpl,
+    });
+
+    next.providerInvocations.unshift(fallbackResult.invocation);
+    next.spentBudgetUsd = Number(
+      (next.spentBudgetUsd + fallbackResult.invocation.usage.estimatedCostUsd).toFixed(6)
+    );
+
+    if (
+      fallbackResult.invocation.status === 'succeeded' &&
+      fallbackResult.synthesis &&
+      fallbackResult.invocation.actualContactedModelId
+    ) {
+      next.executionStageTrace.push({
+        stage: `live-orchestration-${taskType}-fallback-succeeded`,
+        status: 'completed',
+        detail: `Fallback connection "${fallbackConnection.label}" succeeded with model ${fallbackResult.invocation.actualContactedModelId} (${fallbackResult.invocation.latencyMs}ms).`,
+        timestamp: fallbackResult.invocation.createdAt,
+      });
+      next = applyLiveModelSynthesisToSession(
+        next,
+        fallbackResult.synthesis,
+        fallbackResult.invocation.actualContactedModelId,
+        fallbackConnection.id
+      );
+      return { session: next, latestInvocation: fallbackResult.invocation };
+    }
+
+    next.executionStageTrace.push({
+      stage: `live-orchestration-${taskType}-fallback-failed`,
+      status: 'failed',
+      detail: `Fallback connection "${fallbackConnection.label}" also failed (${fallbackResult.invocation.sanitizedError?.code || 'ERR'}). Preserving deterministic script coverage ledger.`,
+      timestamp: fallbackResult.invocation.createdAt,
+    });
+    return { session: next, latestInvocation: fallbackResult.invocation };
+  }
+
+  next.executionStageTrace.push({
+    stage: `live-orchestration-${taskType}-failed`,
+    status: 'failed',
+    detail: `Live provider call to "${primaryConnection.label}" failed (${primaryResult.invocation.sanitizedError?.code || 'ERR'}): ${primaryResult.invocation.sanitizedError?.message || ''}`,
+    timestamp: primaryResult.invocation.createdAt,
+  });
+
+  return { session: next, latestInvocation: primaryResult.invocation };
+}
+

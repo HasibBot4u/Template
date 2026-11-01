@@ -43,3 +43,27 @@
 - **Bottom Status Bar:** Green status dot + `Connected · No active comp` (left) and `Sowveil 2.3.0 · After Effects` (right)
 - **Desktop Split Ratio (Modules 1–16 & 19):** `5:7` (`lg:col-span-5` left catalog rail / `lg:col-span-7` right detail inspector)
 - **Full-Width 5-Column Grids:** Module 17 (`Templates`, frame `01:17`) and Module 20 (`Project Library`, frame `01:23`)
+
+---
+
+## 3. Prompt G — Mobile Landscape Creative Studio UI & Viewport QA Matrix
+
+### 3.1 Design Mission & Architectural Separation
+- **Marketplace Workspace (`/app/text-animation` .. `/app/project-library`):** Preserves 100% of the original 20-module reference clone layout (frames `00:01`–`01:23`) with 2-row navigation strip, 2-column card rails, and right-side parameter inspectors.
+- **Landscape Creative Studio (`/app/landscape-studio`):** Dedicated expanded studio providing a compact single-line project header, horizontally scrollable 20-module strip, collapsible marketplace sidebar with instant "Insert Clip" action, central aspect-ratio-aware canvas (`9:16`, `16:9`, `1:1`, `4:5`) with title/action safe guides, right-side 5-tab panel (AI Director, Inspector, Effects, Animation/Easing, Assets), and bottom 7-track multitrack timeline.
+- **Portrait Mobile Navigation:** Android 5-item thumb zone retained (`Modules`, `Studio`, `Projects`, `Saved`, `More`), with `More` launching a touch-friendly slide-up sheet providing 1-tap navigation to all 10 specialized workspaces.
+
+### 3.2 Viewport Adaptation & Layout Testing
+
+| Viewport Category | Target Dimensions | Header & Top Strip Behavior | Left Marketplace Sidebar | Central Preview Canvas | Right Inspector / AI Panel | Bottom Multitrack Timeline | Status |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Phone Landscape (Compact)** | `854 × 393` (e.g. Android 18:9) | Compact `h-10` bar + `h-9` scrollable 20-module strip; safe-area left/right inset padding | Collapsible with toggle handle; defaults to closed or `w-64` | Dynamically scaled letterbox/pillarbox; never overflows viewport; touch transport controls | Collapsible `w-72` with 5 tabs; toggleable via right handle to maximize canvas | Multi-lane timeline with zoom slider, playhead scrubber, split/duplicate/delete/keyframe actions; minimizable to `h-10` | **Verified Pass** |
+| **Phone Landscape (Large)** | `915 × 412` (e.g. Pixel 8 Pro / S24) | Compact `h-10` bar + `h-9` scrollable strip; timecode badge & format select visible | `w-72` sidebar with search & category pills; touch-friendly insert buttons | Dynamic aspect frame (`9:16`, `16:9`, `1:1`, `4:5`) with safe-area guidelines (80%/90%) | `w-80` tabbed panel with live sliders & AI Director prompt bar | Full 7 canonical tracks (`V1`, `T1`, `M1`, `O1`, `A1`, `A2`, `A3`) visible with vertical scroll | **Verified Pass** |
+| **Phone Portrait** | `390 × 844` / `412 × 915` | Full `AuthenticatedAppShell` with desktop hidden nav; 5-item bottom thumb bar | Displayed when navigating to Marketplace modules | Aspect-ratio previews embedded in module cards and detail panes | Accessible via `More` bottom launcher sheet or top route links | Available via dedicated `/app/editor` route or Landscape Studio route | **Verified Pass** |
+| **Tablet Landscape** | `1024 × 768` / `1280 × 800` | Full header with global workspace switcher, timecode, and gateway status pill | `w-72` open sidebar with category chips and rich template cards | Centered preview canvas with fit/50%/75%/100% zoom controls | `w-80` open tabbed panel with live SVG bezier curve visualizer | `h-52` bottom timeline showing all 7 tracks with clip blocks, mute/solo/visibility toggles | **Verified Pass** |
+| **Desktop High-Res** | `1440 × 900` / `1920 × 1080` | Full workspace navigation with active badges; fullscreen and shortcut support | `w-80` sidebar with rich catalog seeds and instant clip insertion | Large aspect canvas with guide overlays and real-time composite rendering | `w-96` panel with AI Director, Inspector, Effects, Animation presets, and Asset Media Pool | `h-60` multitrack timeline with 20px–120px zoom slider, split at playhead, and trim handles | **Verified Pass** |
+
+### 3.3 Elimination of Obsolete Desktop Copy
+- **Removed:** All simulated desktop "Connected · After Effects" strings and "Studio-Workstation-Sim".
+- **Added:** Honest mobile status: `"Mobile Compositor Active · Native Canvas Engine"` and `"Sowveil 2.3.0 · Mobile Creative Engine"`.
+- **Diagnostic Companion Mode:** Simulated device reflects `"Pixel 8 Pro (Simulated Android Session)"` with native canvas composition.

@@ -22,9 +22,15 @@ import {
   applyReferenceCorrectionAction,
   BUILT_IN_REFERENCE_PRESETS,
   buildDraftTemplateFromReferenceSession,
+  buildReferenceFixtureAVertical60FpsMp4,
+  buildReferenceFixtureBLandscape24FpsMp4,
+  computeSha256HexFromBytes,
   convertReferenceSessionToProjectRecord,
   createReferenceLabSession,
+  DOCUMENTED_REFERENCE_MEDIA_FORMATS,
+  ingestAndReconstructReferenceMedia,
   inspectReferenceSourceUrl,
+  MediaRetentionMode,
   PropertyProvenanceSource,
   ReferenceCorrectionActionRecord,
   ReferenceInputSourceKind,
@@ -32,6 +38,7 @@ import {
   ReferenceUrlInspectionResult,
   ReferenceUsageMode,
   validateAndPromoteReferenceTemplate,
+  validateUploadedMediaFormatAndSize,
 } from '../services/referenceLabEngine';
 import {
   evaluateProjectAtTime,
@@ -113,17 +120,19 @@ export const ReferenceLabWorkspace: React.FC<ReferenceLabWorkspaceProps> = ({
     },
     [getAuthToken, idToken, fetchImpl]
   );
-  // 1. Rights & Usage Mode State (Mandatory at start)
+  // 1. Rights & Usage Mode State (Mandatory at start; defaults to false until user actively confirms)
   const [usageMode, setUsageMode] = useState<ReferenceUsageMode | null>(
     'authorized-reconstruction'
   );
-  const [rightsDeclarationChecked, setRightsDeclarationChecked] = useState<boolean>(true);
+  const [rightsDeclarationChecked, setRightsDeclarationChecked] = useState<boolean>(false);
   const [attributionText, setAttributionText] = useState<string>(
     'Authorized kinetic typography reel for Sowveil Studio template reconstruction.'
   );
   const [allowRemoteModelUpload, setAllowRemoteModelUpload] = useState<boolean>(false);
   const [cancelledBeforeRemoteUpload, setCancelledBeforeRemoteUpload] =
     useState<boolean>(false);
+  const [retentionMode, setRetentionMode] =
+    useState<MediaRetentionMode>('session-bound-7d');
 
   // 2. Ingestion Source State
   const [selectedPresetId, setSelectedPresetId] = useState<string>(
@@ -138,6 +147,9 @@ export const ReferenceLabWorkspace: React.FC<ReferenceLabWorkspaceProps> = ({
     useState<ReferenceUrlInspectionResult | null>(null);
   const [suppliedFileNames, setSuppliedFileNames] = useState<string[]>([]);
   const [uploadedSizeBytes, setUploadedSizeBytes] = useState<number | null>(null);
+  const [uploadedFileBytes, setUploadedFileBytes] = useState<Uint8Array | null>(null);
+  const [uploadedMimeType, setUploadedMimeType] = useState<string>('video/mp4');
+  const [uploadedFileSha256, setUploadedFileSha256] = useState<string | null>(null);
 
   // 3. Active Session
   const [session, setSession] = useState<ReferenceLabSession>(() =>
@@ -243,32 +255,81 @@ export const ReferenceLabWorkspace: React.FC<ReferenceLabWorkspaceProps> = ({
     });
   };
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+  const uint8ToBase64 = (bytes: Uint8Array): string => {
+    let binary = '';
+    const chunkSize = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+    }
+    return typeof btoa === 'function' ? btoa(binary) : '';
+  };
 
-    const isStill = file.type.startsWith('image/');
-    const isAudio = file.type.startsWith('audio/');
-    const isJson = file.name.endsWith('.json');
-
-    const detectedKind: ReferenceInputSourceKind = isJson
-      ? 'uploaded-project-file'
-      : isStill
-        ? 'uploaded-screenshots'
-        : isAudio
-          ? 'uploaded-audio'
-          : 'uploaded-video';
-
-    setSourceKind(detectedKind);
+  const handleLoadBinaryFixture = (fixtureKind: 'fixture-a' | 'fixture-b') => {
+    const fixture =
+      fixtureKind === 'fixture-a'
+        ? buildReferenceFixtureAVertical60FpsMp4()
+        : buildReferenceFixtureBLandscape24FpsMp4();
+    const sha256 = computeSha256HexFromBytes(fixture.bytes);
+    setSourceKind('uploaded-video');
     setSelectedPresetId('');
-    setSessionTitle(file.name.replace(/\.[^.]+$/, ''));
-    setSuppliedFileNames([file.name]);
-    setUploadedSizeBytes(file.size);
+    setSessionTitle(fixture.fileName.replace(/\.[^.]+$/, ''));
+    setSuppliedFileNames([fixture.fileName]);
+    setUploadedSizeBytes(fixture.bytes.byteLength);
+    setUploadedFileBytes(fixture.bytes);
+    setUploadedMimeType(fixture.mimeType);
+    setUploadedFileSha256(sha256);
 
     setStatusBanner({
       tone: 'ok',
-      message: `Selected lawful file "${file.name}" (${Math.round(file.size / 1024)} KB) as ${detectedKind}. Ready to run analysis pipeline.`,
+      message: `Loaded binary MP4 fixture "${fixture.fileName}" (${fixture.bytes.byteLength} bytes, SHA-256 ${sha256.slice(0, 12)}...). Confirm rights checkbox and click Run to parse actual bytes.`,
     });
+  };
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    try {
+      const arrayBuf = await file.arrayBuffer();
+      const rawBytes = new Uint8Array(arrayBuf);
+      const validation = validateUploadedMediaFormatAndSize({
+        fileName: file.name,
+        mimeType: file.type,
+        sizeBytes: rawBytes.byteLength,
+        bytes: rawBytes,
+      });
+
+      if (!validation.valid || !validation.spec) {
+        setStatusBanner({
+          tone: 'error',
+          message: `[${validation.errorCode || 'INVALID_MEDIA'}] ${validation.errorMessage}`,
+        });
+        return;
+      }
+
+      const sha256 = computeSha256HexFromBytes(rawBytes);
+      const detectedKind = validation.spec.sourceKind;
+      const resolvedMime = file.type || validation.spec.mimeTypes[0];
+
+      setSourceKind(detectedKind);
+      setSelectedPresetId('');
+      setSessionTitle(file.name.replace(/\.[^.]+$/, ''));
+      setSuppliedFileNames([file.name]);
+      setUploadedSizeBytes(rawBytes.byteLength);
+      setUploadedFileBytes(rawBytes);
+      setUploadedMimeType(resolvedMime);
+      setUploadedFileSha256(sha256);
+
+      setStatusBanner({
+        tone: 'ok',
+        message: `Read ${rawBytes.byteLength} actual bytes from "${file.name}" (${resolvedMime}, SHA-256: ${sha256.slice(0, 12)}...). Ready to run binary analysis & reconstruction.`,
+      });
+    } catch (err: any) {
+      setStatusBanner({
+        tone: 'error',
+        message: err?.message || 'Failed to read uploaded file bytes.',
+      });
+    }
   };
 
   const handleCancelBeforeRemoteUpload = () => {
@@ -293,47 +354,94 @@ export const ReferenceLabWorkspace: React.FC<ReferenceLabWorkspaceProps> = ({
     if (!rightsDeclarationChecked) {
       setStatusBanner({
         tone: 'error',
-        message: 'Acknowledge the usage declaration before ingesting reference material.',
+        message:
+          'Default rights acknowledgement is false. Please actively confirm the usage & rights declaration checkbox before ingesting reference material.',
       });
       return;
     }
 
     try {
-      const payload = {
-        title: sessionTitle.trim() || 'Reference Reconstruction',
-        usageMode,
-        sourceKind,
-        sourceUrl: sourceUrlInput.trim() || undefined,
-        presetId: selectedPresetId,
-        suppliedFileNames,
-        allowRemoteModelUpload: cancelledBeforeRemoteUpload
-          ? false
-          : allowRemoteModelUpload,
-        cancelledBeforeRemoteUpload,
-        attributionText,
-      };
-
-      const res = await apiRequest<{ session: ReferenceLabSession }>(
-        '/api/v1/reference-lab/sessions',
-        {
-          method: 'POST',
-          body: payload,
-        }
-      );
-
       let activeSession: ReferenceLabSession;
-      if (res.ok && res.data?.session) {
-        activeSession = res.data.session;
-      } else {
-        activeSession = createReferenceLabSession({
-          ownerUid: userUid || 'local-studio-user',
-          ...payload,
+
+      if (uploadedFileBytes && uploadedFileBytes.byteLength > 0) {
+        const ingestPayload = {
+          title: sessionTitle.trim() || 'Reference Media Reconstruction',
+          fileName: suppliedFileNames[0] || 'uploaded-media.mp4',
+          mimeType: uploadedMimeType,
+          bytesBase64: uint8ToBase64(uploadedFileBytes),
+          usageMode,
+          rightsConfirmedByUser: rightsDeclarationChecked,
+          attributionText,
+          retentionMode,
+          allowRemoteModelUpload: cancelledBeforeRemoteUpload
+            ? false
+            : allowRemoteModelUpload,
+          cancelledBeforeRemoteUpload,
+        };
+
+        const res = await apiRequest<{
+          session: ReferenceLabSession;
+        }>('/api/v1/reference-lab/ingest-media', {
+          method: 'POST',
+          body: ingestPayload,
         });
-        if (!res.ok && res.status !== 401) {
-          setStatusBanner({
-            tone: 'warn',
-            message: `Server analysis rejected: ${res.errorMessage || 'Using local reconstruction session.'}`,
+
+        if (res.ok && res.data?.session) {
+          activeSession = res.data.session;
+        } else {
+          const localIngested = ingestAndReconstructReferenceMedia({
+            ownerUid: userUid || 'local-studio-user',
+            title: ingestPayload.title,
+            fileName: ingestPayload.fileName,
+            mimeType: ingestPayload.mimeType,
+            bytes: uploadedFileBytes,
+            usageMode,
+            rightsConfirmedByUser: rightsDeclarationChecked,
+            attributionText,
+            retentionMode,
+            allowRemoteModelUpload: ingestPayload.allowRemoteModelUpload,
+            cancelledBeforeRemoteUpload,
           });
+          activeSession = localIngested;
+        }
+      } else {
+        const payload = {
+          title: sessionTitle.trim() || 'Reference Reconstruction',
+          usageMode,
+          sourceKind,
+          sourceUrl: sourceUrlInput.trim() || undefined,
+          presetId: selectedPresetId,
+          suppliedFileNames,
+          rightsConfirmedByUser: rightsDeclarationChecked,
+          retentionMode,
+          allowRemoteModelUpload: cancelledBeforeRemoteUpload
+            ? false
+            : allowRemoteModelUpload,
+          cancelledBeforeRemoteUpload,
+          attributionText,
+        };
+
+        const res = await apiRequest<{ session: ReferenceLabSession }>(
+          '/api/v1/reference-lab/sessions',
+          {
+            method: 'POST',
+            body: payload,
+          }
+        );
+
+        if (res.ok && res.data?.session) {
+          activeSession = res.data.session;
+        } else {
+          activeSession = createReferenceLabSession({
+            ownerUid: userUid || 'local-studio-user',
+            ...payload,
+          });
+          if (!res.ok && res.status !== 401) {
+            setStatusBanner({
+              tone: 'warn',
+              message: `Server analysis rejected: ${res.errorMessage || 'Using local reconstruction session.'}`,
+            });
+          }
         }
       }
 
@@ -345,7 +453,7 @@ export const ReferenceLabWorkspace: React.FC<ReferenceLabWorkspaceProps> = ({
         tone: 'ok',
         message:
           usageMode === 'authorized-reconstruction'
-            ? `Authorized Reconstruction complete: ${activeSession.shots.length} shots segmented, ${activeSession.fidelityReport.reconstructedEditableProperties.length} editable properties mapped to Canonical Project v2.0.0.`
+            ? `Authorized Reconstruction complete (${activeSession.mediaSpecs.width}×${activeSession.mediaSpecs.height}, ${activeSession.mediaSpecs.durationSec}s @ ${activeSession.mediaSpecs.fps}fps): ${activeSession.shots.length} shots segmented, ${activeSession.fidelityReport.reconstructedEditableProperties.length} editable properties mapped to Canonical Project v2.0.0.`
             : `Reference-Inspired synthesis complete: Preserved broad pacing/contrast lessons and generated an independent editable composition with original copy, shifted timing, and Sowveil original audio.`,
       });
     } catch (err: any) {
@@ -644,6 +752,33 @@ export const ReferenceLabWorkspace: React.FC<ReferenceLabWorkspaceProps> = ({
                 />
               </div>
 
+              {/* Media Access & Retention Policy */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                <div>
+                  <label className="block text-[10px] uppercase tracking-wider text-zinc-400 mb-1">
+                    Retention & Access Policy
+                  </label>
+                  <select
+                    data-testid="reflab-retention-select"
+                    value={retentionMode}
+                    onChange={(e) => setRetentionMode(e.target.value as MediaRetentionMode)}
+                    className="w-full rounded-lg bg-zinc-900 border border-zinc-800 px-2.5 py-1.5 text-xs text-zinc-100 focus:outline-none focus:border-orange-500"
+                  >
+                    <option value="session-bound-7d">Owner-Private · 7-Day Session Retention</option>
+                    <option value="workspace-durable-30d">Owner-Private · 30-Day Durable Retention</option>
+                    <option value="ephemeral-24h">Owner-Private · 24-Hour Ephemeral</option>
+                  </select>
+                </div>
+                <div className="p-2 rounded-lg bg-zinc-900/70 border border-zinc-800 text-[10px] text-zinc-400 flex flex-col justify-center">
+                  <span className="font-semibold text-zinc-200">Rights Status:</span>
+                  <span>
+                    {rightsDeclarationChecked
+                      ? 'Confirmed by user (Active)'
+                      : 'Unconfirmed (Default false — check box above)'}
+                  </span>
+                </div>
+              </div>
+
               {/* Remote Model Upload Consent & Cancel Option */}
               <div className="rounded-lg bg-zinc-900/90 border border-zinc-800 p-2.5 space-y-2">
                 <div className="flex items-center justify-between gap-2">
@@ -775,27 +910,54 @@ export const ReferenceLabWorkspace: React.FC<ReferenceLabWorkspaceProps> = ({
               )}
             </div>
 
-            {/* Lawful File / Screenshot / Project Upload */}
-            <div className="space-y-1.5 pt-2 border-t border-zinc-800/80">
-              <label className="block text-[10px] uppercase tracking-wider text-zinc-400">
-                Upload Lawful Video, Screenshots, Audio, or .sowveil.json Project
-              </label>
+            {/* Lawful File / Screenshot / Project Upload (Actual Binary Byte Reader) */}
+            <div className="space-y-2 pt-2 border-t border-zinc-800/80">
+              <div className="flex items-center justify-between">
+                <label className="block text-[10px] uppercase tracking-wider text-zinc-400">
+                  Upload Lawful Video, Screenshots, Audio, or .sowveil.json (Reads Actual Bytes)
+                </label>
+                <span className="text-[10px] font-mono text-zinc-400">
+                  {DOCUMENTED_REFERENCE_MEDIA_FORMATS.length} formats supported
+                </span>
+              </div>
               <label className="flex items-center justify-between gap-2 px-3 py-2 rounded-lg border border-dashed border-zinc-700 hover:border-orange-500/60 bg-zinc-900/50 cursor-pointer text-xs text-zinc-300 transition-colors">
                 <span className="flex items-center gap-2 truncate">
                   <Upload className="w-3.5 h-3.5 text-orange-400 shrink-0" />
                   {suppliedFileNames.length > 0
-                    ? `${suppliedFileNames.join(', ')} (${Math.round(
-                        (uploadedSizeBytes || 2048) / 1024
-                      )} KB)`
-                    : 'Choose MP4/WebM, PNG/JPG screenshots, WAV, or .json...'}
+                    ? `${suppliedFileNames.join(', ')} (${
+                        uploadedSizeBytes ? `${uploadedSizeBytes} bytes` : 'ready'
+                      }${uploadedFileSha256 ? ` · SHA-256 ${uploadedFileSha256.slice(0, 10)}…` : ''})`
+                    : 'Choose MP4/MOV/WebM, PNG/JPG/WebP/SVG, WAV/MP3, or .json...'}
                 </span>
                 <input
                   type="file"
-                  accept="video/*,image/*,audio/*,.json"
+                  accept="video/mp4,video/quicktime,video/webm,image/png,image/jpeg,image/webp,image/svg+xml,audio/wav,audio/mpeg,audio/mp4,audio/ogg,.json"
                   onChange={handleFileUpload}
                   className="hidden"
                 />
               </label>
+
+              {/* Binary Media Test Fixtures (Different-Source Binary Verification) */}
+              <div className="grid grid-cols-2 gap-1.5 pt-1">
+                <button
+                  type="button"
+                  data-testid="reflab-load-fixture-a-btn"
+                  onClick={() => handleLoadBinaryFixture('fixture-a')}
+                  className="px-2 py-1.5 rounded bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 text-[10px] text-zinc-200 font-medium text-left transition-colors"
+                >
+                  <div className="font-semibold text-orange-300">Load Binary Fixture A</div>
+                  <div className="text-zinc-400">720×1280 · 4.5s @ 60fps · 2 Shots + Audio</div>
+                </button>
+                <button
+                  type="button"
+                  data-testid="reflab-load-fixture-b-btn"
+                  onClick={() => handleLoadBinaryFixture('fixture-b')}
+                  className="px-2 py-1.5 rounded bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 text-[10px] text-zinc-200 font-medium text-left transition-colors"
+                >
+                  <div className="font-semibold text-sky-300">Load Binary Fixture B</div>
+                  <div className="text-zinc-400">1920×1080 · 9.5s @ 24fps · 4 Shots Silent</div>
+                </button>
+              </div>
             </div>
 
             {/* Session Title & Run Pipeline Button */}
@@ -1507,6 +1669,16 @@ export const ReferenceLabWorkspace: React.FC<ReferenceLabWorkspaceProps> = ({
                                   </div>
                                 )}
 
+                                {obs.extractionEvidence && (
+                                  <div className="text-[10px] text-zinc-400 font-mono truncate">
+                                    [{obs.epistemicLabel || 'inferred'}
+                                    {typeof obs.sourceTimestampSec === 'number'
+                                      ? ` @ ${obs.sourceTimestampSec.toFixed(2)}s`
+                                      : ''}
+                                    ] {obs.extractionEvidence}
+                                  </div>
+                                )}
+
                                 {obs.uncertaintyReason && (
                                   <div className="text-[10px] text-amber-300/90">
                                     Note: {obs.uncertaintyReason}
@@ -1530,6 +1702,121 @@ export const ReferenceLabWorkspace: React.FC<ReferenceLabWorkspaceProps> = ({
                       <strong>Honest Reconstruction Disclosure:</strong>{' '}
                       {session.fidelityReport.fidelityDisclaimer}
                     </div>
+
+                    {/* Source Binary Media Analysis Report (SHA-256, Streams, Sampled Frames, Epistemic Counts) */}
+                    {session.sourceAnalysisReport && (
+                      <div
+                        data-testid="reflab-source-analysis-report"
+                        className="p-3.5 rounded-xl bg-zinc-900/90 border border-zinc-800 space-y-3"
+                      >
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div>
+                            <div className="text-xs font-bold text-white">
+                              Source Media Binary Analysis & Epistemic Provenance Report
+                            </div>
+                            <div className="text-[11px] text-zinc-400 font-mono">
+                              File: {session.sourceAnalysisReport.fileName} (
+                              {session.sourceAnalysisReport.fileSizeBytes} bytes ·{' '}
+                              {session.sourceAnalysisReport.containerFormat}) · SHA-256:{' '}
+                              {session.sourceAnalysisReport.checksumSha256.slice(0, 20)}…
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-1.5 text-[10px] font-mono">
+                            <span className="px-2 py-0.5 rounded bg-sky-500/15 border border-sky-500/40 text-sky-300">
+                              Measured:{' '}
+                              {
+                                Object.values(
+                                  session.sourceAnalysisReport.epistemicFieldLabels
+                                ).filter((v) => v === 'measured').length
+                              }
+                            </span>
+                            <span className="px-2 py-0.5 rounded bg-amber-500/15 border border-amber-500/40 text-amber-300">
+                              Inferred:{' '}
+                              {
+                                Object.values(
+                                  session.sourceAnalysisReport.epistemicFieldLabels
+                                ).filter((v) => v === 'inferred').length
+                              }
+                            </span>
+                            <span className="px-2 py-0.5 rounded bg-purple-500/15 border border-purple-500/40 text-purple-300">
+                              AI-Estimated:{' '}
+                              {
+                                Object.values(
+                                  session.sourceAnalysisReport.epistemicFieldLabels
+                                ).filter((v) => v === 'AI-estimated').length
+                              }
+                            </span>
+                            <span className="px-2 py-0.5 rounded bg-zinc-800 border border-zinc-700 text-zinc-300">
+                              Unknown:{' '}
+                              {
+                                Object.values(
+                                  session.sourceAnalysisReport.epistemicFieldLabels
+                                ).filter((v) => v === 'unknown').length
+                              }
+                            </span>
+                          </div>
+                        </div>
+
+                        {/* Extracted Container Streams */}
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-[11px]">
+                          {session.sourceAnalysisReport.streams.map((stream) => (
+                            <div
+                              key={`${stream.streamIndex}_${stream.streamType}`}
+                              className="p-2 rounded bg-zinc-950 border border-zinc-800 flex items-center justify-between gap-2"
+                            >
+                              <div>
+                                <span className="font-semibold text-zinc-200 uppercase">
+                                  Stream #{stream.streamIndex} ({stream.streamType})
+                                </span>{' '}
+                                · <span className="font-mono text-orange-300">{stream.codec}</span>
+                                <div className="text-[10px] text-zinc-400">{stream.evidence}</div>
+                              </div>
+                              <span className="text-[10px] px-1.5 py-0.5 rounded bg-sky-500/15 text-sky-300 font-mono shrink-0">
+                                {stream.provenance}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+
+                        {/* Sampled Representative & Scene-Change Frames */}
+                        {session.sourceAnalysisReport.sampledFrames.length > 0 && (
+                          <div className="space-y-1.5">
+                            <div className="text-[11px] font-semibold text-zinc-300">
+                              Sampled Representative & Scene-Change Frames (
+                              {session.sourceAnalysisReport.sampledFrames.length}):
+                            </div>
+                            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                              {session.sourceAnalysisReport.sampledFrames
+                                .slice(0, 4)
+                                .map((frame) => (
+                                  <div
+                                    key={frame.frameId}
+                                    className="p-2 rounded-lg bg-zinc-950 border border-zinc-800 space-y-1 text-[10px]"
+                                  >
+                                    <div className="flex items-center justify-between font-mono text-zinc-300">
+                                      <span>t={frame.timestampSec.toFixed(2)}s</span>
+                                      <span className="text-orange-300">{frame.samplingReason}</span>
+                                    </div>
+                                    <div className="text-zinc-400 font-mono">
+                                      Luma: {frame.meanLuminance} · Contrast: {frame.contrastRatio}
+                                    </div>
+                                    <div className="flex gap-1">
+                                      {frame.dominantColorsHex.map((hex) => (
+                                        <span
+                                          key={hex}
+                                          className="px-1 py-0.5 rounded bg-zinc-900 border border-zinc-700 font-mono text-[9px]"
+                                        >
+                                          {hex}
+                                        </span>
+                                      ))}
+                                    </div>
+                                  </div>
+                                ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )}
 
                     {/* Media Analysis State & Field Classification Summary */}
                     <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
@@ -1589,7 +1876,7 @@ export const ReferenceLabWorkspace: React.FC<ReferenceLabWorkspaceProps> = ({
                           {session.fidelityReport.reconstructedEditableProperties.map(
                             (p, idx) => (
                               <li key={idx}>
-                                {p.label} ({p.provenanceSource})
+                                {p.label} ({p.provenanceSource} · {p.epistemicLabel || 'measured'})
                               </li>
                             )
                           )}

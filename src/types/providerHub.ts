@@ -946,13 +946,63 @@ export interface ExtensionSandboxValidationRun {
   summary: string;
 }
 
+export type SkillClassification = 'read-only-prompt-skill' | 'executable-extension';
+
+export interface PreFlightSecurityScanReport {
+  scanId: string;
+  timestamp: string;
+  passed: boolean;
+  classification: SkillClassification;
+  isExecutable: boolean;
+  detectedSecretsCount: number;
+  flaggedRisks: string[];
+  findings: Array<{
+    severity: 'critical' | 'high' | 'medium' | 'low' | 'info';
+    category: 'secret-leak' | 'dangerous-api' | 'path-traversal' | 'prompt-override' | 'untrusted-dependency';
+    message: string;
+    line?: number;
+  }>;
+  summary: string;
+}
+
+export interface IsolatedSandboxExecutionResult {
+  runId: string;
+  skillId: string;
+  operatorUid: string;
+  timestamp: string;
+  status: 'success' | 'quarantined' | 'permission-denied' | 'timeout' | 'error';
+  executionDurationMs: number;
+  memoryUsedBytes: number;
+  capabilitiesUsed: string[];
+  virtualFsOperations: Array<{
+    op: 'read' | 'write' | 'list' | 'stat';
+    path: string;
+    bytesCount?: number;
+  }>;
+  networkRequestsAttempted: Array<{
+    url: string;
+    method: string;
+    allowed: boolean;
+    reason?: string;
+  }>;
+  inputDigestSha256: string;
+  outputPayload?: unknown;
+  outputSummary: string;
+  rollbackCheckpointId?: string | null;
+  errorMessage?: string;
+}
+
 export interface ExtensionPackageRecord {
   id: string;
   ownerUid: string;
   name: string;
   kind: ExtensionPackageKind;
+  classification: SkillClassification;
+  isExecutable: boolean;
+  attribution: string;
   sourceUrl: string;
   commitOrReleasePin: string;
+  gitBranchOrTagOrCommitPin?: string;
   version: string;
   checksumSha256: string;
   license: string;
@@ -968,7 +1018,9 @@ export interface ExtensionPackageRecord {
   explicitApprovalGranted: boolean;
   installState: 'installed-enabled' | 'installed-disabled' | 'quarantined' | 'uninstalled';
   untrustedContentEnvelope: string;
+  preFlightScanReport?: PreFlightSecurityScanReport | null;
   validationRuns: ExtensionSandboxValidationRun[];
+  sandboxExecutions?: IsolatedSandboxExecutionResult[];
   versionHistory: ExtensionVersionSnapshot[];
   auditHistory: Array<{
     timestamp: string;

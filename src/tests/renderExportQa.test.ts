@@ -10,11 +10,17 @@ import {
   computeAdapterFeatureLossReport,
   createAndExecuteCanonicalRenderJob,
   createKnownGoodSampleCanonicalProject,
+  decodeWavPcm,
   DurableRenderExportJobRecord,
+  encode16BitPcmWav,
+  evaluateProjectAtTimestamp,
   generateValidJpegFrameBytes,
   getMobileAdapterCapabilityManifests,
   recoverInterruptedRenderJobsOnStartup,
+  renderCanonicalFrameSvg,
+  renderCanonicalToAlightMotionXml,
   RenderOutputFormat,
+  synthesizeCanonicalAudioAndTelemetry,
   validateJpegBytes,
 } from '../services/renderExportQaEngine';
 import {
@@ -534,3 +540,222 @@ test('Phase 13.6 — End-to-End API routes (/api/v1/render-export/*), authorized
 
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
+
+test('Phase 13.7 — Genuine Visual Timeline Evaluator & SVG Compositor evaluates active clips at timestamp with transforms, keyframes, transitions and track ordering', () => {
+  const project = createKnownGoodSampleCanonicalProject('user-render-qa-1');
+
+  // Add a background vector card on track 0, motion typography on track 1
+  const projectWithLayers = {
+    ...project,
+    tracks: [
+      {
+        id: 'track-bg-vector',
+        name: 'Background Shapes',
+        kind: 'vector' as const,
+        order: 0,
+        visible: true,
+        locked: false,
+        muted: false,
+        solo: false,
+        blendMode: 'normal' as const,
+        gainDb: 0,
+        clips: [
+          {
+            id: 'clip-bg-card',
+            trackId: 'track-bg-vector',
+            name: 'Hero Glass Backdrop',
+            kind: 'vector' as const,
+            startTimeSec: 0,
+            durationSec: 6,
+            sourceInSec: 0,
+            sourceOutSec: 6,
+            trimInSec: 0,
+            trimOutSec: 0,
+            speedMultiplier: 1,
+            visible: true,
+            locked: false,
+            muted: false,
+            solo: false,
+            blendMode: 'normal' as const,
+            transform: {
+              position: [540, 960] as [number, number],
+              scale: [100, 100] as [number, number],
+              rotationDeg: 0,
+              anchor: [540, 960] as [number, number],
+              opacity: 0.95,
+            },
+            vectorData: {
+              shapeType: 'liquid-glass-card' as const,
+              svgPathData: '',
+              fillColorHex: '#18181b',
+              strokeColorHex: '#10b981',
+              strokeWidthPx: 3,
+              cornerRadiusPx: 32,
+            },
+            keyframes: [],
+            effects: [],
+            masks: [],
+          },
+        ],
+      },
+      ...project.tracks,
+    ],
+  };
+
+  // Evaluate at t=0.2s: Hook headline is fading in via cubic-bezier keyframes (time 0 to 0.45s)
+  const evalHookStart = evaluateProjectAtTimestamp(projectWithLayers, 0.2);
+  assert.equal(evalHookStart.canvasWidth, 1080);
+  assert.equal(evalHookStart.canvasHeight, 1920);
+  assert.ok(evalHookStart.activeLayers.length >= 2);
+  const hookLayerStart = evalHookStart.activeLayers.find(
+    (l) => l.clipId === 'clip-headline-hook'
+  );
+  assert.ok(hookLayerStart);
+  assert.ok(hookLayerStart.opacity > 0 && hookLayerStart.opacity < 1);
+  assert.equal(hookLayerStart.textData?.content, 'PRECISION MOTION ON MOBILE');
+
+  // Evaluate at t=1.5s: Hook headline is fully opaque (opacity = 1)
+  const evalHookMid = evaluateProjectAtTimestamp(projectWithLayers, 1.5);
+  const hookLayerMid = evalHookMid.activeLayers.find(
+    (l) => l.clipId === 'clip-headline-hook'
+  );
+  assert.ok(hookLayerMid);
+  assert.equal(hookLayerMid.opacity, 1);
+
+  // Evaluate at t=4.0s: Hook headline is ended; payoff headline is active
+  const evalPayoff = evaluateProjectAtTimestamp(projectWithLayers, 4.0);
+  const hookLayerAfter = evalPayoff.activeLayers.find(
+    (l) => l.clipId === 'clip-headline-hook'
+  );
+  const payoffLayer = evalPayoff.activeLayers.find(
+    (l) => l.clipId === 'clip-headline-payoff'
+  );
+  assert.equal(hookLayerAfter, undefined); // Inactive at 4.0s
+  assert.ok(payoffLayer);
+  assert.equal(payoffLayer.textData?.content, 'VERIFIED EXPORTS & 11-POINT QA');
+
+  // Verify full SVG rendering includes active layer IDs and styled elements
+  const svgOutput = renderCanonicalFrameSvg(projectWithLayers, 1080, 1920, 1.5);
+  assert.ok(svgOutput.includes('<svg'));
+  assert.ok(svgOutput.includes('id="clip-bg-card"'));
+  assert.ok(svgOutput.includes('id="clip-headline-hook"'));
+  assert.ok(svgOutput.includes('PRECISION MOTION ON MOBILE'));
+  assert.ok(svgOutput.includes('fill="#10b981"'));
+});
+
+test('Phase 13.8 — Genuine Multi-Track Audio Engine: Decodes PCM WAV, mixes timeline with gain/fades/mute/solo, and verifies waveform changes when clips change (no sine placeholders)', () => {
+  const baseProject = createKnownGoodSampleCanonicalProject('user-render-qa-1');
+
+  // 1. WAV decoding test: encode synthetic PCM, then decode it accurately
+  const testPcm = new Float32Array([
+    0.0, 0.25, 0.5, 0.75, 0.5, 0.25, 0.0, -0.25, -0.5, -0.75,
+  ]);
+  const testWav = encode16BitPcmWav({ samples: testPcm, sampleRate: 44100 });
+  const decoded = decodeWavPcm(testWav);
+  assert.equal(decoded.valid, true);
+  assert.equal(decoded.sampleRate, 44100);
+  assert.equal(decoded.samples.length, testPcm.length);
+  // Verify sample accuracy within 16-bit quantization threshold (1/32768 ~ 0.0001)
+  for (let i = 0; i < testPcm.length; i++) {
+    assert.ok(Math.abs(decoded.samples[i] - testPcm[i]) < 0.001);
+  }
+
+  // 2. Synthesize baseline audio mix
+  const baseAudio = synthesizeCanonicalAudioAndTelemetry(baseProject, 6.0);
+  assert.ok(baseAudio.masterWavBytes.byteLength > 1000);
+  assert.ok(baseAudio.maxPeakDbfs > -40);
+  assert.equal(baseAudio.clippingDetected, false);
+  assert.equal(baseAudio.stems.length, 1);
+
+  // 3. Test that changing clip gain measurably changes peak dBFS and sample amplitudes
+  const boostedProject = {
+    ...baseProject,
+    tracks: baseProject.tracks.map((t) =>
+      t.kind === 'audio'
+        ? {
+            ...t,
+            clips: t.clips.map((c) => ({
+              ...c,
+              audioConfig: {
+                ...c.audioConfig!,
+                gainDb: 4.0, // Boosted by +7.5 dB relative to -3.5 dB
+              },
+            })),
+          }
+        : t
+    ),
+  };
+  const boostedAudio = synthesizeCanonicalAudioAndTelemetry(boostedProject, 6.0);
+  assert.ok(boostedAudio.maxPeakDbfs > baseAudio.maxPeakDbfs);
+
+  // 4. Test that changing clip duration changes active audio duration
+  const shortProject = {
+    ...baseProject,
+    tracks: baseProject.tracks.map((t) =>
+      t.kind === 'audio'
+        ? {
+            ...t,
+            clips: t.clips.map((c) => ({
+              ...c,
+              durationSec: 2.0, // Shortened from 6s to 2s
+            })),
+          }
+        : t
+    ),
+  };
+  const shortAudio = synthesizeCanonicalAudioAndTelemetry(shortProject, 6.0);
+  const decodedBase = decodeWavPcm(baseAudio.masterWavBytes);
+  const decodedShort = decodeWavPcm(shortAudio.masterWavBytes);
+  // At sample 3.0s (index 3 * 44100 = 132300), short audio should be near zero silence while base audio is active
+  const sampleIdxAt3s = 3 * 44100;
+  assert.ok(Math.abs(decodedBase.samples[sampleIdxAt3s]) > 0.001);
+  assert.ok(Math.abs(decodedShort.samples[sampleIdxAt3s]) < 0.0001);
+
+  // 5. Test that muting an audio clip mutes output
+  const mutedProject = {
+    ...baseProject,
+    tracks: baseProject.tracks.map((t) =>
+      t.kind === 'audio'
+        ? {
+            ...t,
+            clips: t.clips.map((c) => ({
+              ...c,
+              muted: true,
+            })),
+          }
+        : t
+    ),
+  };
+  const mutedAudio = synthesizeCanonicalAudioAndTelemetry(mutedProject, 6.0);
+  assert.equal(mutedAudio.maxPeakLinear, 0);
+  assert.equal(mutedAudio.maxPeakDbfs, -96.0);
+});
+
+test('Phase 13.9 — Alight Motion XML Serializer exports all supported clips, shapes, and cubic-bezier keyframes in track order', () => {
+  const project = createKnownGoodSampleCanonicalProject('user-render-qa-1');
+
+  const xml = renderCanonicalToAlightMotionXml(project, 1080, 1920, 30);
+  assert.ok(xml.startsWith('<?xml version="1.0" encoding="UTF-8"?>'));
+  assert.ok(xml.includes('<scene title="'));
+  assert.ok(xml.includes('width="1080" height="1920"'));
+
+  // Both headlines must be serialized as <text> nodes with fonts and cubic-bezier keyframes
+  assert.ok(xml.includes('label="Hook Headline"'));
+  assert.ok(xml.includes('label="Payoff Headline"'));
+  assert.ok(xml.includes('<content>PRECISION MOTION ON MOBILE</content>'));
+  assert.ok(
+    xml.includes('<content>VERIFIED EXPORTS &amp; 11-POINT QA</content>')
+  );
+  assert.ok(xml.includes('font family="Inter"'));
+  assert.ok(xml.includes('e="cubicBezier 0.22 1.0 0.36 1.0"'));
+
+  // Validate the generated XML with validateAndInspectAlightMotionXml
+  const inspection = validateAndInspectAlightMotionXml(xml);
+  assert.equal(inspection.valid, true);
+  assert.equal(inspection.width, 1080);
+  assert.equal(inspection.height, 1920);
+  assert.equal(inspection.textCount, 2);
+  assert.ok(inspection.keyframeCount >= 8);
+  assert.equal(inspection.hasCubicBezier, true);
+});
+

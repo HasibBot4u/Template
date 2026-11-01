@@ -1,5 +1,7 @@
 import express, { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import { z } from 'zod';
 import firebaseConfig from '../../firebase-applet-config.json';
 import { SOWVEIL_MODULES, MODULE_CATEGORIES } from '../data/modules';
@@ -99,21 +101,36 @@ import {
   applyReferenceCorrectionAction,
   BUILT_IN_REFERENCE_PRESETS,
   buildDraftTemplateFromReferenceSession,
+  buildReferenceFixtureAVertical60FpsMp4,
+  buildReferenceFixtureBLandscape24FpsMp4,
+  buildReferenceFixtureCPngImage,
+  buildReferenceFixtureDWavAudio,
+  computeSha256HexFromBytes,
   convertReferenceSessionToProjectRecord,
   createReferenceLabSession,
+  DOCUMENTED_REFERENCE_MEDIA_FORMATS,
+  ingestAndReconstructReferenceMedia,
   inspectReferenceSourceUrl,
+  MediaAccessAndRetentionPolicy,
+  MediaRetentionMode,
+  parseActualReferenceMediaBytes,
   ReferenceCorrectionActionRecord,
   ReferenceInputSourceKind,
   ReferenceLabSession,
+  ReferenceProviderModelTelemetry,
   ReferenceUsageMode,
   validateAndPromoteReferenceTemplate,
+  validateUploadedMediaFormatAndSize,
 } from '../services/referenceLabEngine';
 import {
   ALL_HUB_TASK_TYPES,
   ALL_MODEL_CAPABILITY_KEYS,
   buildDefaultRoutingProfiles,
+  buildProtocolRequest,
   createProviderConnectionRecord,
   evaluateRoutingReadiness,
+  executeSafeUpstreamRequest,
+  executeInIsolatedSandbox,
   ExtensionPackageRecord,
   ExtensionPermissionScope,
   getVaultConfigurationDiagnostics,
@@ -125,12 +142,14 @@ import {
   invokeRegisteredTool,
   ModelCapabilityKey,
   overrideConnectionCapabilityState,
+  parseProtocolResponse,
   PREPOPULATED_MODEL_CATALOG,
   probeProviderConnection,
   ProviderConnectionRecord,
   REGISTERED_AI_TOOLS,
   registerExtensionPackage,
   revokeConnectionCredential,
+  revokeExtensionPermissions,
   rollbackExtensionPackage,
   rotateConnectionCredential,
   SecretStorageMode,
@@ -149,9 +168,13 @@ import {
   createAiDirectorSession,
   evaluateDirectorAcceptanceGate,
   executeDirectorProductionPlan,
+  orchestrateLiveAiDirectorSession,
+  reviseDirectorPlanDuringProduction,
   rollbackDirectorToCheckpoint,
   updateDirectorShotPlanAndApprovals,
+  validateGeneratedAssetRecord,
 } from '../services/aiDirectorProductionEngine';
+
 import {
   createDefaultPreferenceConsent,
   deprecateFactoryTemplate,
@@ -182,6 +205,7 @@ import {
   evaluateServerWorkerTransparency,
   getAllClipsFromProject,
   getMobileAdapterCapabilityManifests,
+  getMobileEditorCompatibilityMatrix,
   recoverInterruptedRenderJobsOnStartup,
   RENDER_EXPORT_ENGINE_VERSION,
   RenderExecutionTier,
@@ -578,7 +602,25 @@ const PairingStartSchema = z
 
 export function createApiApp(options: ApiAppOptions = {}) {
   const app = express();
-  app.use(express.json({ limit: '256kb' }));
+  const defaultJsonParser = express.json({ limit: '256kb' });
+  const mediaUploadJsonParser = express.json({ limit: '68mb' });
+  const mediaUploadRawParser = express.raw({
+    type: ['video/*', 'image/*', 'audio/*', 'application/octet-stream'],
+    limit: '52mb',
+  });
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    if (
+      req.path === '/api/v1/reference-lab/ingest-media' ||
+      req.path.startsWith('/api/v1/reference-lab/signed-upload/')
+    ) {
+      const contentType = (req.headers['content-type'] || '').toLowerCase();
+      if (contentType.includes('application/json') || contentType === '') {
+        return mediaUploadJsonParser(req, res, next);
+      }
+      return mediaUploadRawParser(req, res, next);
+    }
+    return defaultJsonParser(req, res, next);
+  });
 
   const verifyToken: TokenVerifierFn =
     options.tokenVerifier || verifyFirebaseIdTokenWithGoogle;
@@ -8216,11 +8258,433 @@ export function createApiApp(options: ApiAppOptions = {}) {
   });
 
   // --- REFERENCE LAB (REFERENCE VIDEO / LINK / SCREENSHOT RECONSTRUCTION) ENDPOINTS ---
+  interface SignedReferenceUploadTicket {
+    ticketId: string;
+    ownerUid: string;
+    fileName: string;
+    mimeType: string;
+    declaredSizeBytes: number;
+    usageMode: ReferenceUsageMode;
+    rightsConfirmedByUser: boolean;
+    attributionText?: string;
+    retentionMode: MediaRetentionMode;
+    allowRemoteModelUpload: boolean;
+    cancelledBeforeRemoteUpload: boolean;
+    connectionId?: string | null;
+    title?: string;
+    signature: string;
+    createdAt: string;
+    expiresAt: string;
+    consumedAt?: string | null;
+  }
+
+  const referenceSignedUploadTickets = new Map<string, SignedReferenceUploadTicket>();
+  const referenceUploadTicketSigningKey = crypto
+    .createHash('sha256')
+    .update(
+      process.env.SOWVEIL_MASTER_VAULT_KEY ||
+        process.env.OWNER_BOOTSTRAP_SECRET ||
+        'sowveil-reference-upload-ticket-hmac-key'
+    )
+    .digest('hex');
+
+  function signUploadTicketPayload(payload: {
+    ticketId: string;
+    ownerUid: string;
+    fileName: string;
+    mimeType: string;
+    declaredSizeBytes: number;
+    expiresAt: string;
+  }): string {
+    return crypto
+      .createHmac('sha256', referenceUploadTicketSigningKey)
+      .update(
+        `${payload.ticketId}:${payload.ownerUid}:${payload.fileName}:${payload.mimeType}:${payload.declaredSizeBytes}:${payload.expiresAt}`
+      )
+      .digest('hex');
+  }
+
+  function persistReferenceBinaryFileAndAsset(input: {
+    ownerUid: string;
+    fileName: string;
+    mimeType: string;
+    bytes: Uint8Array;
+    sha256Checksum: string;
+    sourceKind: ReferenceInputSourceKind;
+    usageMode: ReferenceUsageMode;
+    rightsConfirmedByUser: boolean;
+    attributionText?: string;
+    retentionPolicy: MediaAccessAndRetentionPolicy;
+    width?: number;
+    height?: number;
+    durationSec?: number;
+  }): {
+    mediaAsset: AssetMetadataRecord;
+    storageRelativePath: string;
+    diskAbsolutePath: string;
+  } {
+    const safeFileName = sanitizeMediaFileName(input.fileName || 'reference-media.bin');
+    const mediaAssetId = `asset_ref_${input.sha256Checksum.slice(0, 14)}_${Date.now()}`;
+    const baseDir = path.resolve(
+      process.cwd(),
+      '.sowveil-data',
+      'reference-media',
+      input.ownerUid.replace(/[^a-zA-Z0-9_-]/g, '_')
+    );
+    fs.mkdirSync(baseDir, { recursive: true });
+    const storedFileName = `${mediaAssetId}_${safeFileName}`;
+    const diskAbsolutePath = path.join(baseDir, storedFileName);
+    fs.writeFileSync(diskAbsolutePath, Buffer.from(input.bytes));
+
+    const storageRelativePath = `.sowveil-data/reference-media/${input.ownerUid.replace(
+      /[^a-zA-Z0-9_-]/g,
+      '_'
+    )}/${storedFileName}`;
+    const nowIso = new Date().toISOString();
+    const assetKind: AssetMetadataRecord['assetKind'] =
+      input.sourceKind === 'uploaded-screenshots'
+        ? 'image'
+        : input.sourceKind === 'uploaded-audio'
+          ? 'audio'
+          : input.sourceKind === 'uploaded-project-file'
+            ? 'svg'
+            : 'video';
+
+    const mediaAsset: AssetMetadataRecord & {
+      storagePath?: string;
+      sha256Checksum?: string;
+    } = {
+      id: mediaAssetId,
+      title: safeFileName,
+      labels: ['reference-lab-upload', input.usageMode],
+      tags: ['reference-lab', input.sourceKind],
+      moduleId: 'templates',
+      catalogItemId: null,
+      assetKind,
+      ownerUid: input.ownerUid,
+      visibility: 'private',
+      licenseType: input.rightsConfirmedByUser ? 'User Owned' : 'Unknown',
+      licenseNote: `Retention policy: ${input.retentionPolicy.retentionMode} (expires ${input.retentionPolicy.expiresAt})`,
+      sourceNote: `Uploaded reference media (${input.fileName})`,
+      provenance: 'user-uploaded',
+      attribution:
+        input.attributionText ||
+        `User-confirmed reference upload (${input.usageMode}, retention=${input.retentionPolicy.retentionMode})`,
+      storageProvider: 'durable-local-store',
+      storageObjectKey: storageRelativePath,
+      storagePath: storageRelativePath,
+      mimeType: input.mimeType,
+      sizeBytes: input.bytes.byteLength,
+      dimensions:
+        input.width && input.height ? `${input.width}×${input.height}` : undefined,
+      durationSec: input.durationSec,
+      checksumSha256: input.sha256Checksum,
+      sha256Checksum: input.sha256Checksum,
+      versions: [
+        {
+          version: '1.0.0',
+          checksumSha256: input.sha256Checksum,
+          sizeBytes: input.bytes.byteLength,
+          mimeType: input.mimeType,
+          updatedAt: nowIso,
+          updatedByUid: input.ownerUid,
+          note: 'Initial reference media binary upload',
+        },
+      ],
+      missingAssetDetected: false,
+      usedByTemplateIds: [],
+      usedByVariantIds: [],
+      status: 'stored',
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    };
+
+    assetsStore.set(mediaAsset.id, mediaAsset);
+    persistState();
+
+    return {
+      mediaAsset,
+      storageRelativePath,
+      diskAbsolutePath,
+    };
+  }
+
+  async function executeOptionalReferenceVisionAndAsrAnalysis(input: {
+    ownerUid: string;
+    allowRemoteModelUpload: boolean;
+    cancelledBeforeRemoteUpload: boolean;
+    preferredConnectionId?: string | null;
+    parsedMeta: ReturnType<typeof parseActualReferenceMediaBytes>;
+  }): Promise<{
+    providerTelemetry: ReferenceProviderModelTelemetry[];
+    visionOverrides?: Array<{
+      shotIndex: number;
+      detectedTypography?: string;
+      summary?: string;
+    }>;
+    asrTranscriptOverride?: Array<{
+      startTimeSec: number;
+      endTimeSec: number;
+      text: string;
+    }>;
+  }> {
+    const nowIso = new Date().toISOString();
+    const defaultVision: ReferenceProviderModelTelemetry = {
+      taskKind: 'vision-frame-analysis',
+      connectionId: null,
+      requestedModelId: 'local-deterministic-frame-analyzer-v2',
+      actualContactedModelId: null,
+      status: 'skipped-local-only',
+      latencyMs: 0,
+      sanitizedNote:
+        !input.allowRemoteModelUpload || input.cancelledBeforeRemoteUpload
+          ? 'Vision model not invoked: remote model upload consent is disabled (local-only pixel & container analysis active).'
+          : 'No verified Vision provider connection configured; used local deterministic pixel & container measurements.',
+      invokedAt: nowIso,
+    };
+    const defaultAsr: ReferenceProviderModelTelemetry = {
+      taskKind: 'audio-asr-analysis',
+      connectionId: null,
+      requestedModelId: 'local-pcm-envelope-detector',
+      actualContactedModelId: null,
+      status: 'skipped-local-only',
+      latencyMs: 0,
+      sanitizedNote: !input.parsedMeta.hasAudioTrack
+        ? 'No audio stream present in media.'
+        : !input.allowRemoteModelUpload || input.cancelledBeforeRemoteUpload
+          ? 'Remote ASR model not invoked: remote upload consent is disabled (local PCM/envelope audio analysis active).'
+          : 'No verified ASR provider connection configured; used local audio stream & envelope analysis.',
+      invokedAt: nowIso,
+    };
+
+    if (!input.allowRemoteModelUpload || input.cancelledBeforeRemoteUpload) {
+      return {
+        providerTelemetry: [defaultVision, defaultAsr],
+      };
+    }
+
+    const userConns = await getOrSeedAuthoritativeUserProviderConnections(input.ownerUid);
+    const activeConns = userConns.filter(
+      (c) =>
+        c.credentialStatus !== 'revoked' &&
+        (c.encryptedCredential !== null || c.authMode === 'server-env')
+    );
+    const selectedConn =
+      (input.preferredConnectionId
+        ? activeConns.find((c) => c.id === input.preferredConnectionId)
+        : undefined) || activeConns[0];
+
+    if (!selectedConn) {
+      return {
+        providerTelemetry: [defaultVision, defaultAsr],
+      };
+    }
+
+    let apiKey = '';
+    try {
+      if (selectedConn.authMode === 'server-env') {
+        apiKey = process.env.GEMINI_API_KEY || '';
+      } else if (selectedConn.encryptedCredential) {
+        apiKey = decryptCredentialFromVault(selectedConn.encryptedCredential, {
+          ownerUid: selectedConn.ownerUid,
+          workspaceId: selectedConn.workspaceId,
+          connectionId: selectedConn.id,
+          protocol: selectedConn.protocol,
+        });
+      }
+    } catch (err: any) {
+      return {
+        providerTelemetry: [
+          {
+            ...defaultVision,
+            connectionId: selectedConn.id,
+            requestedModelId: selectedConn.modelId,
+            status: 'failed',
+            sanitizedNote: redactSensitiveDiagnosticString(
+              err?.message || 'Could not decrypt provider credential for vision analysis.'
+            ),
+          },
+          defaultAsr,
+        ],
+      };
+    }
+
+    const fetchFn = options.providerProbeFetchImpl ?? fetch;
+    const visionStartMs = Date.now();
+    let visionModelTelemetry: ReferenceProviderModelTelemetry = {
+      ...defaultVision,
+      connectionId: selectedConn.id,
+      requestedModelId: selectedConn.modelId,
+    };
+    const visionOverrides: Array<{
+      shotIndex: number;
+      detectedTypography?: string;
+      summary?: string;
+    }> = [];
+    let asrTranscriptOverride:
+      | Array<{
+          startTimeSec: number;
+          endTimeSec: number;
+          text: string;
+        }>
+      | undefined;
+
+    try {
+      const promptText = JSON.stringify({
+        task: 'reference-media-vision-and-audio-interpretation',
+        measuredWidth: input.parsedMeta.width,
+        measuredHeight: input.parsedMeta.height,
+        measuredDurationSec: input.parsedMeta.durationSec,
+        measuredFps: input.parsedMeta.fps,
+        detectedShotBoundariesSec: input.parsedMeta.detectedShotBoundariesSec,
+        sampledColorsHex: input.parsedMeta.sampledColorsHex,
+        sampledFrames: (input.parsedMeta.sampledFrames || []).map((f) => ({
+          timestampSec: f.timestampSec,
+          dominantColorsHex: f.dominantColorsHex,
+          meanLuminance: f.meanLuminance,
+          contrastRatio: f.contrastRatio,
+          edgeDensity: f.edgeDensity,
+        })),
+        audioAnalysis: input.parsedMeta.audioAnalysis || null,
+      });
+
+      const reqSpec = buildProtocolRequest({
+        connection: selectedConn,
+        resolvedSecret: apiKey,
+        systemInstruction:
+          'You are Sowveil Reference Lab Vision & Audio Analyzer. Return JSON with {"visionSummary": string, "shotNotes": string[], "transcriptEstimate": string}. Never claim hidden keyframes were recovered.',
+        userPrompt: promptText,
+      });
+
+      const upstream = await executeSafeUpstreamRequest({
+        url: reqSpec.url,
+        method: reqSpec.method,
+        headers: reqSpec.headers,
+        body: reqSpec.body,
+        timeoutMs: 9000,
+        fetchImpl: fetchFn,
+      });
+      const latencyMs = Date.now() - visionStartMs;
+      if (upstream.ok) {
+        const parsed = parseProtocolResponse(selectedConn.protocol, upstream.rawBody);
+        let structured: any = null;
+        try {
+          structured = JSON.parse(parsed.text);
+        } catch {
+          structured = null;
+        }
+        const aiEstimatedSummary =
+          typeof structured?.visionSummary === 'string' && structured.visionSummary.trim()
+            ? structured.visionSummary.trim()
+            : parsed.text.slice(0, 260) ||
+              `Vision model ${selectedConn.modelId} inspected ${
+                (input.parsedMeta.sampledFrames || []).length
+              } sampled frame(s).`;
+        if (Array.isArray(structured?.shotNotes)) {
+          structured.shotNotes.forEach((note: unknown, idx: number) => {
+            if (typeof note === 'string' && note.trim()) {
+              visionOverrides.push({
+                shotIndex: idx,
+                summary: note.trim(),
+              });
+            }
+          });
+        }
+        if (visionOverrides.length === 0) {
+          visionOverrides.push({
+            shotIndex: 0,
+            summary: aiEstimatedSummary,
+          });
+        }
+        if (
+          typeof structured?.transcriptEstimate === 'string' &&
+          structured.transcriptEstimate.trim() &&
+          input.parsedMeta.detectedShotBoundariesSec
+        ) {
+          asrTranscriptOverride = input.parsedMeta.detectedShotBoundariesSec.map((b) => ({
+            startTimeSec: b.startTimeSec,
+            endTimeSec: b.endTimeSec,
+            text: structured.transcriptEstimate.trim(),
+          }));
+        }
+
+        visionModelTelemetry = {
+          taskKind: 'vision-frame-analysis',
+          connectionId: selectedConn.id,
+          requestedModelId: selectedConn.modelId,
+          actualContactedModelId: selectedConn.modelId,
+          status: 'succeeded',
+          latencyMs,
+          sanitizedNote: aiEstimatedSummary,
+          invokedAt: new Date().toISOString(),
+        };
+      } else {
+        visionModelTelemetry = {
+          taskKind: 'vision-frame-analysis',
+          connectionId: selectedConn.id,
+          requestedModelId: selectedConn.modelId,
+          actualContactedModelId: null,
+          status: 'failed',
+          latencyMs,
+          sanitizedNote: `Vision provider returned HTTP ${upstream.httpStatus}; retained local deterministic measurements.`,
+          invokedAt: new Date().toISOString(),
+        };
+      }
+    } catch (err: any) {
+      visionModelTelemetry = {
+        taskKind: 'vision-frame-analysis',
+        connectionId: selectedConn.id,
+        requestedModelId: selectedConn.modelId,
+        actualContactedModelId: null,
+        status: 'failed',
+        latencyMs: Date.now() - visionStartMs,
+        sanitizedNote: redactSensitiveDiagnosticString(
+          err?.message || 'Vision request failed; retained local deterministic measurements.'
+        ),
+        invokedAt: new Date().toISOString(),
+      };
+    }
+
+    const asrModelTelemetry: ReferenceProviderModelTelemetry = input.parsedMeta.hasAudioTrack
+      ? {
+          taskKind: 'audio-asr-analysis',
+          connectionId: selectedConn.id,
+          requestedModelId: selectedConn.modelId,
+          actualContactedModelId:
+            visionModelTelemetry.status === 'succeeded' ? selectedConn.modelId : null,
+          status: visionModelTelemetry.status,
+          latencyMs: visionModelTelemetry.latencyMs,
+          sanitizedNote:
+            visionModelTelemetry.status === 'succeeded'
+              ? `Audio envelope & ASR cue analyzed with ${selectedConn.modelId}.`
+              : 'ASR provider call did not succeed; using local PCM/container audio analysis.',
+          invokedAt: new Date().toISOString(),
+        }
+      : defaultAsr;
+
+    return {
+      providerTelemetry: [visionModelTelemetry, asrModelTelemetry],
+      visionOverrides: visionOverrides.length > 0 ? visionOverrides : undefined,
+      asrTranscriptOverride,
+    };
+  }
+
   app.get('/api/v1/reference-lab/presets', (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     return sendOk(res, authReq.requestId, {
       presets: BUILT_IN_REFERENCE_PRESETS,
       total: BUILT_IN_REFERENCE_PRESETS.length,
+      documentedMediaFormats: DOCUMENTED_REFERENCE_MEDIA_FORMATS,
+    });
+  });
+
+  app.get('/api/v1/reference-lab/media-formats', (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    return sendOk(res, authReq.requestId, {
+      formats: DOCUMENTED_REFERENCE_MEDIA_FORMATS,
+      defaultConsentRequired: true,
+      defaultRightsConfirmedByUser: false,
+      defaultAllowRemoteModelUpload: false,
     });
   });
 
@@ -8234,7 +8698,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
       authReq.authIdentity!.email,
       inspection.allowedForIngestion ? 'REFERENCE_URL_INSPECTED' : 'REFERENCE_URL_BLOCKED',
       inspection.normalizedUrl || rawUrl.slice(0, 120) || 'empty-url',
-      `Reference Lab URL inspection (${inspection.platformCategory}, allowed=${inspection.allowedForIngestion}, code=${inspection.errorCode || 'OK'})`,
+      `Reference Lab URL inspection (${inspection.platformCategory}, allowed=${inspection.allowedForIngestion}, mediaBytesFetched=${inspection.mediaBytesFetched}, code=${inspection.errorCode || 'OK'})`,
       authReq.requestId,
       'user',
       inspection.allowedForIngestion ? 'success' : 'denied'
@@ -8253,6 +8717,578 @@ export function createApiApp(options: ApiAppOptions = {}) {
 
     return sendOk(res, authReq.requestId, { inspection });
   });
+
+  app.post(
+    '/api/v1/reference-lab/signed-upload-ticket',
+    requireAuth,
+    (req: Request, res: Response) => {
+      const authReq = req as AuthenticatedRequest;
+      const uid = authReq.authIdentity!.uid;
+      const body = req.body || {};
+
+      const fileName = typeof body.fileName === 'string' ? body.fileName.trim() : '';
+      const mimeType = typeof body.mimeType === 'string' ? body.mimeType.trim() : '';
+      const declaredSizeBytes =
+        typeof body.sizeBytes === 'number' ? Math.floor(body.sizeBytes) : 0;
+      const usageMode = body.usageMode as ReferenceUsageMode;
+      const rightsConfirmedByUser = body.rightsConfirmedByUser === true;
+
+      if (usageMode !== 'authorized-reconstruction' && usageMode !== 'reference-inspired') {
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          'USAGE_MODE_REQUIRED',
+          'A valid usageMode ("authorized-reconstruction" or "reference-inspired") is required.'
+        );
+      }
+
+      if (!rightsConfirmedByUser) {
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          'RIGHTS_CONFIRMATION_REQUIRED',
+          'Default rights acknowledgement is false. You must explicitly confirm required rights (rightsConfirmedByUser: true) before requesting a signed media upload ticket.'
+        );
+      }
+
+      const formatCheck = validateUploadedMediaFormatAndSize({
+        fileName,
+        mimeType,
+        sizeBytes: declaredSizeBytes,
+      });
+      if (!formatCheck.valid || !formatCheck.spec) {
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          formatCheck.errorCode || 'UNSUPPORTED_MEDIA_FORMAT',
+          formatCheck.errorMessage || 'Unsupported media format or size limit exceeded.'
+        );
+      }
+
+      const resolvedMime = formatCheck.spec.mimeTypes[0];
+      const ticketId = `upl_ticket_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
+      const createdAt = new Date().toISOString();
+      const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+      const signature = signUploadTicketPayload({
+        ticketId,
+        ownerUid: uid,
+        fileName,
+        mimeType: resolvedMime,
+        declaredSizeBytes,
+        expiresAt,
+      });
+
+      const retentionMode: MediaRetentionMode =
+        body.retentionMode === 'ephemeral-24h' ||
+        body.retentionMode === 'workspace-durable-30d' ||
+        body.retentionMode === 'session-bound-7d'
+          ? body.retentionMode
+          : 'session-bound-7d';
+
+      const ticket: SignedReferenceUploadTicket = {
+        ticketId,
+        ownerUid: uid,
+        fileName,
+        mimeType: resolvedMime,
+        declaredSizeBytes,
+        usageMode,
+        rightsConfirmedByUser: true,
+        attributionText:
+          typeof body.attributionText === 'string' ? body.attributionText : undefined,
+        retentionMode,
+        allowRemoteModelUpload: body.allowRemoteModelUpload === true,
+        cancelledBeforeRemoteUpload: Boolean(body.cancelledBeforeRemoteUpload),
+        connectionId: typeof body.connectionId === 'string' ? body.connectionId : null,
+        title: typeof body.title === 'string' ? body.title : undefined,
+        signature,
+        createdAt,
+        expiresAt,
+        consumedAt: null,
+      };
+      referenceSignedUploadTickets.set(ticketId, ticket);
+
+      recordAudit(
+        uid,
+        authReq.authIdentity!.email,
+        'REFERENCE_SIGNED_UPLOAD_TICKET_ISSUED',
+        ticketId,
+        `Issued signed upload ticket for "${fileName}" (${declaredSizeBytes} bytes, ${ticket.mimeType})`,
+        authReq.requestId,
+        'user',
+        'success'
+      );
+
+      return sendOk(
+        res,
+        authReq.requestId,
+        {
+          ticket: {
+            ticketId,
+            uploadUrl: `/api/v1/reference-lab/signed-upload/${ticketId}`,
+            method: 'PUT',
+            signature,
+            fileName: ticket.fileName,
+            mimeType: ticket.mimeType,
+            declaredSizeBytes: ticket.declaredSizeBytes,
+            maxAllowedBytes: formatCheck.spec.maxSizeBytes,
+            expiresAt,
+          },
+        },
+        201
+      );
+    }
+  );
+
+  app.put(
+    '/api/v1/reference-lab/signed-upload/:ticketId',
+    requireAuth,
+    async (req: Request, res: Response) => {
+      const authReq = req as AuthenticatedRequest;
+      const uid = authReq.authIdentity!.uid;
+      const ticketId = req.params.ticketId;
+      const ticket = referenceSignedUploadTickets.get(ticketId);
+
+      if (!ticket) {
+        return sendError(
+          res,
+          authReq.requestId,
+          404,
+          'SIGNED_UPLOAD_TICKET_NOT_FOUND',
+          'Signed upload ticket was not found or has expired.'
+        );
+      }
+
+      if (ticket.ownerUid !== uid) {
+        return sendError(
+          res,
+          authReq.requestId,
+          403,
+          'FORBIDDEN_SIGNED_UPLOAD_TICKET',
+          'Only the user who requested the signed upload ticket may upload to it.'
+        );
+      }
+
+      if (ticket.consumedAt) {
+        return sendError(
+          res,
+          authReq.requestId,
+          409,
+          'SIGNED_UPLOAD_TICKET_ALREADY_USED',
+          'This signed upload ticket has already been consumed.'
+        );
+      }
+
+      if (Date.now() > new Date(ticket.expiresAt).getTime()) {
+        return sendError(
+          res,
+          authReq.requestId,
+          410,
+          'SIGNED_UPLOAD_TICKET_EXPIRED',
+          'Signed upload ticket has expired. Request a new ticket.'
+        );
+      }
+
+      const providedSignature =
+        (typeof req.headers['x-upload-signature'] === 'string'
+          ? req.headers['x-upload-signature']
+          : typeof (req.body as any)?.signature === 'string'
+            ? (req.body as any).signature
+            : '') || '';
+      const expectedSig = signUploadTicketPayload({
+        ticketId: ticket.ticketId,
+        ownerUid: ticket.ownerUid,
+        fileName: ticket.fileName,
+        mimeType: ticket.mimeType,
+        declaredSizeBytes: ticket.declaredSizeBytes,
+        expiresAt: ticket.expiresAt,
+      });
+
+      if (!providedSignature || providedSignature !== expectedSig) {
+        return sendError(
+          res,
+          authReq.requestId,
+          403,
+          'INVALID_SIGNED_UPLOAD_SIGNATURE',
+          'Signed upload signature verification failed.'
+        );
+      }
+
+      let rawBytes: Uint8Array;
+      if (Buffer.isBuffer(req.body)) {
+        rawBytes = new Uint8Array(req.body);
+      } else if (typeof (req.body as any)?.bytesBase64 === 'string') {
+        rawBytes = new Uint8Array(Buffer.from((req.body as any).bytesBase64, 'base64'));
+      } else {
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          'MISSING_UPLOAD_BYTES',
+          'Provide raw binary body or JSON {"bytesBase64": "..."} when completing a signed upload.'
+        );
+      }
+
+      try {
+        const preParsed = parseActualReferenceMediaBytes({
+          fileName: ticket.fileName,
+          mimeType: ticket.mimeType,
+          bytes: rawBytes,
+        });
+        const providerAnalysis = await executeOptionalReferenceVisionAndAsrAnalysis({
+          ownerUid: uid,
+          allowRemoteModelUpload: ticket.allowRemoteModelUpload,
+          cancelledBeforeRemoteUpload: ticket.cancelledBeforeRemoteUpload,
+          preferredConnectionId: ticket.connectionId,
+          parsedMeta: preParsed,
+        });
+
+        const session = ingestAndReconstructReferenceMedia({
+          ownerUid: uid,
+          title: ticket.title || ticket.fileName.replace(/\.[^.]+$/, ''),
+          fileName: ticket.fileName,
+          mimeType: ticket.mimeType,
+          bytes: rawBytes,
+          usageMode: ticket.usageMode,
+          rightsConfirmedByUser: ticket.rightsConfirmedByUser,
+          attributionText: ticket.attributionText,
+          retentionMode: ticket.retentionMode,
+          allowRemoteModelUpload: ticket.allowRemoteModelUpload,
+          cancelledBeforeRemoteUpload: ticket.cancelledBeforeRemoteUpload,
+          providerTelemetry: providerAnalysis.providerTelemetry,
+          visionOverrides: providerAnalysis.visionOverrides,
+          asrTranscriptOverride: providerAnalysis.asrTranscriptOverride,
+        });
+
+        const sha256Checksum =
+          session.sourceAnalysisReport?.checksumSha256 || computeSha256HexFromBytes(rawBytes);
+        const retentionPolicy = session.sourceAnalysisReport!.accessAndRetentionPolicy;
+
+        const stored = persistReferenceBinaryFileAndAsset({
+          ownerUid: uid,
+          fileName: ticket.fileName,
+          mimeType: session.sourceAnalysisReport!.mimeType,
+          bytes: rawBytes,
+          sha256Checksum,
+          sourceKind: session.sourceKind,
+          usageMode: ticket.usageMode,
+          rightsConfirmedByUser: ticket.rightsConfirmedByUser,
+          attributionText: ticket.attributionText,
+          retentionPolicy,
+          width: session.mediaSpecs.width,
+          height: session.mediaSpecs.height,
+          durationSec: session.mediaSpecs.durationSec,
+        });
+
+        session.mediaSpecs.storageLocation = stored.storageRelativePath;
+        session.mediaSpecs.checksumSha256 = sha256Checksum;
+        if (session.sourceAnalysisReport) {
+          session.sourceAnalysisReport.mediaAssetId = stored.mediaAsset.id;
+          session.sourceAnalysisReport.storageLocation = stored.storageRelativePath;
+        }
+
+        ticket.consumedAt = new Date().toISOString();
+        const savedSession = await saveAuthoritativeReferenceLabSession(session);
+
+        recordAudit(
+          uid,
+          authReq.authIdentity!.email,
+          'REFERENCE_SIGNED_MEDIA_UPLOAD_COMPLETED',
+          savedSession.id,
+          `Completed signed media ingestion "${ticket.fileName}" (${rawBytes.byteLength} bytes, sha256=${sha256Checksum.slice(0, 12)}, shots=${savedSession.shots.length})`,
+          authReq.requestId,
+          'user',
+          'success'
+        );
+
+        return sendOk(
+          res,
+          authReq.requestId,
+          {
+            session: savedSession,
+            sourceAnalysisReport: savedSession.sourceAnalysisReport,
+            mediaAsset: stored.mediaAsset,
+            retentionPolicy,
+          },
+          201
+        );
+      } catch (err: any) {
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          err?.code || 'SIGNED_UPLOAD_INGEST_FAILED',
+          err?.message || 'Failed to ingest uploaded media bytes.'
+        );
+      }
+    }
+  );
+
+  app.post(
+    '/api/v1/reference-lab/ingest-media',
+    requireAuth,
+    async (req: Request, res: Response) => {
+      const authReq = req as AuthenticatedRequest;
+      const uid = authReq.authIdentity!.uid;
+      const body = req.body || {};
+
+      const usageMode = body.usageMode as ReferenceUsageMode;
+      if (usageMode !== 'authorized-reconstruction' && usageMode !== 'reference-inspired') {
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          'USAGE_MODE_REQUIRED',
+          'A valid usageMode ("authorized-reconstruction" or "reference-inspired") must be selected before ingesting reference media.'
+        );
+      }
+
+      const rightsConfirmedByUser = body.rightsConfirmedByUser === true;
+      if (!rightsConfirmedByUser) {
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          'RIGHTS_CONFIRMATION_REQUIRED',
+          'Consent and rights acknowledgement default to false. You must actively confirm required rights (rightsConfirmedByUser: true) before ingesting media.'
+        );
+      }
+
+      let fileName = typeof body.fileName === 'string' ? body.fileName.trim() : '';
+      let mimeType = typeof body.mimeType === 'string' ? body.mimeType.trim() : '';
+      let rawBytes: Uint8Array | null = null;
+
+      if (typeof body.fixtureId === 'string' && body.fixtureId.trim()) {
+        const fixtureId = body.fixtureId.trim();
+        if (fixtureId === 'fixture-a') {
+          const fix = buildReferenceFixtureAVertical60FpsMp4();
+          fileName = fileName || fix.fileName;
+          mimeType = mimeType || fix.mimeType;
+          rawBytes = fix.bytes;
+        } else if (fixtureId === 'fixture-b') {
+          const fix = buildReferenceFixtureBLandscape24FpsMp4();
+          fileName = fileName || fix.fileName;
+          mimeType = mimeType || fix.mimeType;
+          rawBytes = fix.bytes;
+        } else if (fixtureId === 'fixture-c') {
+          const fix = buildReferenceFixtureCPngImage();
+          fileName = fileName || fix.fileName;
+          mimeType = mimeType || fix.mimeType;
+          rawBytes = fix.bytes;
+        } else if (fixtureId === 'fixture-d') {
+          const fix = buildReferenceFixtureDWavAudio();
+          fileName = fileName || fix.fileName;
+          mimeType = mimeType || fix.mimeType;
+          rawBytes = fix.bytes;
+        } else {
+          return sendError(
+            res,
+            authReq.requestId,
+            400,
+            'UNKNOWN_REFERENCE_FIXTURE',
+            `Unknown fixtureId "${fixtureId}". Supported fixtures: fixture-a, fixture-b, fixture-c, fixture-d.`
+          );
+        }
+      } else if (typeof body.bytesBase64 === 'string' && body.bytesBase64.trim()) {
+        rawBytes = new Uint8Array(Buffer.from(body.bytesBase64.trim(), 'base64'));
+      } else if (Buffer.isBuffer(req.body)) {
+        rawBytes = new Uint8Array(req.body);
+      }
+
+      if (!rawBytes || rawBytes.byteLength === 0) {
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          'MEDIA_BYTES_REQUIRED',
+          'Actual media bytes (bytesBase64 or binary body) are required. Filename-only or empty uploads are rejected.'
+        );
+      }
+
+      const retentionMode: MediaRetentionMode =
+        body.retentionMode === 'ephemeral-24h' ||
+        body.retentionMode === 'workspace-durable-30d' ||
+        body.retentionMode === 'session-bound-7d'
+          ? body.retentionMode
+          : 'session-bound-7d';
+      const allowRemoteModelUpload = body.allowRemoteModelUpload === true;
+      const cancelledBeforeRemoteUpload = Boolean(body.cancelledBeforeRemoteUpload);
+
+      try {
+        // Validate format, size, and magic bytes first
+        const validation = validateUploadedMediaFormatAndSize({
+          fileName: fileName || 'uploaded-media.mp4',
+          mimeType: mimeType || 'video/mp4',
+          sizeBytes: rawBytes.byteLength,
+          bytes: rawBytes,
+        });
+        if (!validation.valid || !validation.spec) {
+          return sendError(
+            res,
+            authReq.requestId,
+            400,
+            validation.errorCode || 'INVALID_MEDIA_UPLOAD',
+            validation.errorMessage || 'Uploaded media failed format, size, or magic-byte verification.'
+          );
+        }
+
+        const resolvedMime = validation.spec.mimeTypes[0] || mimeType || 'video/mp4';
+        const preParsed = parseActualReferenceMediaBytes({
+          fileName: fileName || 'uploaded-media.mp4',
+          mimeType: resolvedMime,
+          bytes: rawBytes,
+        });
+
+        const providerAnalysis = await executeOptionalReferenceVisionAndAsrAnalysis({
+          ownerUid: uid,
+          allowRemoteModelUpload,
+          cancelledBeforeRemoteUpload,
+          preferredConnectionId:
+            typeof body.connectionId === 'string' ? body.connectionId : null,
+          parsedMeta: preParsed,
+        });
+
+        const session = ingestAndReconstructReferenceMedia({
+          ownerUid: uid,
+          title:
+            typeof body.title === 'string' && body.title.trim()
+              ? body.title.trim()
+              : (fileName || 'Reference Media').replace(/\.[^.]+$/, ''),
+          fileName: fileName || 'uploaded-media.mp4',
+          mimeType: resolvedMime,
+          bytes: rawBytes,
+          usageMode,
+          rightsConfirmedByUser,
+          attributionText:
+            typeof body.attributionText === 'string' ? body.attributionText : undefined,
+          retentionMode,
+          allowRemoteModelUpload,
+          cancelledBeforeRemoteUpload,
+          providerTelemetry: providerAnalysis.providerTelemetry,
+          visionOverrides: providerAnalysis.visionOverrides,
+          asrTranscriptOverride: providerAnalysis.asrTranscriptOverride,
+        });
+
+        const sha256Checksum =
+          session.sourceAnalysisReport?.checksumSha256 || computeSha256HexFromBytes(rawBytes);
+        const retentionPolicy = session.sourceAnalysisReport!.accessAndRetentionPolicy;
+
+        const stored = persistReferenceBinaryFileAndAsset({
+          ownerUid: uid,
+          fileName: fileName || 'uploaded-media.mp4',
+          mimeType: session.sourceAnalysisReport!.mimeType,
+          bytes: rawBytes,
+          sha256Checksum,
+          sourceKind: session.sourceKind,
+          usageMode,
+          rightsConfirmedByUser,
+          attributionText:
+            typeof body.attributionText === 'string' ? body.attributionText : undefined,
+          retentionPolicy,
+          width: session.mediaSpecs.width,
+          height: session.mediaSpecs.height,
+          durationSec: session.mediaSpecs.durationSec,
+        });
+
+        session.mediaSpecs.storageLocation = stored.storageRelativePath;
+        session.mediaSpecs.checksumSha256 = sha256Checksum;
+        if (session.sourceAnalysisReport) {
+          session.sourceAnalysisReport.mediaAssetId = stored.mediaAsset.id;
+          session.sourceAnalysisReport.storageLocation = stored.storageRelativePath;
+        }
+
+        const savedSession = await saveAuthoritativeReferenceLabSession(session);
+
+        recordAudit(
+          uid,
+          authReq.authIdentity!.email,
+          'REFERENCE_MEDIA_INGESTED_AND_RECONSTRUCTED',
+          savedSession.id,
+          `Ingested actual media "${fileName}" (${rawBytes.byteLength} bytes, sha256=${sha256Checksum.slice(0, 12)}, ${savedSession.mediaSpecs.width}x${savedSession.mediaSpecs.height} @ ${savedSession.mediaSpecs.fps}fps, ${savedSession.shots.length} shots)`,
+          authReq.requestId,
+          'user',
+          'success'
+        );
+
+        return sendOk(
+          res,
+          authReq.requestId,
+          {
+            session: savedSession,
+            sourceAnalysisReport: savedSession.sourceAnalysisReport,
+            mediaAsset: stored.mediaAsset,
+            retentionPolicy,
+          },
+          201
+        );
+      } catch (err: any) {
+        if (err instanceof PersistenceContractError) {
+          return sendPersistenceError(
+            res,
+            authReq.requestId,
+            err,
+            'Failed to persist Reference Lab session.'
+          );
+        }
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          err?.code || 'REFERENCE_MEDIA_INGEST_FAILED',
+          err?.message || 'Failed to ingest and reconstruct reference media.'
+        );
+      }
+    }
+  );
+
+  app.get(
+    '/api/v1/reference-lab/media-assets/:assetId',
+    requireAuth,
+    (req: Request, res: Response) => {
+      const authReq = req as AuthenticatedRequest;
+      const uid = authReq.authIdentity!.uid;
+      const asset = assetsStore.get(req.params.assetId);
+      if (!asset) {
+        return sendError(
+          res,
+          authReq.requestId,
+          404,
+          'MEDIA_ASSET_NOT_FOUND',
+          'Reference media asset not found.'
+        );
+      }
+      if (asset.ownerUid !== uid && authReq.userRole !== 'admin' && authReq.userRole !== 'owner') {
+        return sendError(
+          res,
+          authReq.requestId,
+          403,
+          'FORBIDDEN_MEDIA_ASSET_ACCESS',
+          'You do not have permission to access this reference media asset.'
+        );
+      }
+
+      const relPath =
+        (asset as any).storagePath || asset.storageObjectKey || '';
+      const absPath = path.resolve(process.cwd(), relPath);
+      const existsOnDisk = Boolean(relPath) && fs.existsSync(absPath);
+      let verifiedDiskSha256: string | null = null;
+      if (existsOnDisk) {
+        const diskBytes = fs.readFileSync(absPath);
+        verifiedDiskSha256 = computeSha256HexFromBytes(new Uint8Array(diskBytes));
+      }
+      const expectedSha256 =
+        asset.checksumSha256 || (asset as any).sha256Checksum || null;
+
+      return sendOk(res, authReq.requestId, {
+        mediaAsset: asset,
+        existsOnDisk,
+        verifiedDiskSha256,
+        checksumMatches: Boolean(verifiedDiskSha256 && verifiedDiskSha256 === expectedSha256),
+      });
+    }
+  );
 
   app.get('/api/v1/reference-lab/sessions', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
@@ -8334,6 +9370,16 @@ export function createApiApp(options: ApiAppOptions = {}) {
       );
     }
 
+    if (body.rightsConfirmedByUser === false) {
+      return sendError(
+        res,
+        authReq.requestId,
+        400,
+        'RIGHTS_CONFIRMATION_REQUIRED',
+        'Default consent and rights acknowledgement is false until you actively confirm the required rights.'
+      );
+    }
+
     const sourceKind: ReferenceInputSourceKind =
       body.sourceKind || 'uploaded-video';
 
@@ -8374,6 +9420,11 @@ export function createApiApp(options: ApiAppOptions = {}) {
         licenseType: body.licenseType,
         attributionText:
           typeof body.attributionText === 'string' ? body.attributionText : undefined,
+        rightsConfirmedByUser:
+          typeof body.rightsConfirmedByUser === 'boolean'
+            ? body.rightsConfirmedByUser
+            : true,
+        retentionMode: body.retentionMode,
       });
 
       const session = await saveAuthoritativeReferenceLabSession(created);
@@ -9502,8 +10553,11 @@ export function createApiApp(options: ApiAppOptions = {}) {
         ownerUid: uid,
         name: body.name,
         kind: body.kind || 'github-repo',
+        classification: body.classification,
+        attribution: typeof body.attribution === 'string' ? body.attribution : undefined,
         sourceUrl: body.sourceUrl,
         commitOrReleasePin: body.commitOrReleasePin,
+        gitBranchOrTagOrCommitPin: body.gitBranchOrTagOrCommitPin || body.commitOrReleasePin,
         version: body.version,
         license: body.license,
         dependencies: Array.isArray(body.dependencies) ? body.dependencies : [],
@@ -9723,6 +10777,130 @@ export function createApiApp(options: ApiAppOptions = {}) {
     }
   );
 
+  app.post(
+    '/api/v1/extensions/:id/execute',
+    requireAuth,
+    async (req: Request, res: Response) => {
+      const authReq = req as AuthenticatedRequest;
+      const uid = authReq.authIdentity!.uid;
+      let existing: ExtensionPackageRecord | null = null;
+      try {
+        existing = await getAuthoritativeExtension(req.params.id, uid);
+      } catch (err) {
+        if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+          return sendError(
+            res,
+            authReq.requestId,
+            403,
+            'FORBIDDEN_EXTENSION_ACCESS',
+            'Cannot execute another user’s extension.'
+          );
+        }
+        return sendPersistenceError(res, authReq.requestId, err, 'Unable to load extension.');
+      }
+      if (!existing) {
+        return sendError(res, authReq.requestId, 404, 'EXTENSION_NOT_FOUND', 'Extension not found.');
+      }
+      if (existing.ownerUid !== uid) {
+        return sendError(
+          res,
+          authReq.requestId,
+          403,
+          'FORBIDDEN_EXTENSION_ACCESS',
+          'Cannot execute another user’s extension.'
+        );
+      }
+
+      const body = req.body || {};
+      const { result, updatedProjectDoc } = executeInIsolatedSandbox({
+        extension: existing,
+        operatorUid: uid,
+        inputPayload: body.inputPayload,
+        projectDoc: body.projectDoc,
+        timeoutMs: typeof body.timeoutMs === 'number' ? body.timeoutMs : undefined,
+      });
+
+      const updated: ExtensionPackageRecord = {
+        ...existing,
+        sandboxExecutions: [result, ...(existing.sandboxExecutions || [])].slice(0, 20),
+        installState: result.status === 'quarantined' ? 'quarantined' : existing.installState,
+        updatedAt: new Date().toISOString(),
+      };
+      const saved = await saveAuthoritativeExtension(updated);
+
+      recordAudit(
+        uid,
+        authReq.authIdentity!.email,
+        result.status === 'success' ? 'EXTENSION_SANDBOX_EXECUTED' : 'EXTENSION_SANDBOX_BLOCKED_OR_FAILED',
+        existing.id,
+        `Executed extension "${existing.name}" in sandbox (status=${result.status}, duration=${result.executionDurationMs}ms)`,
+        authReq.requestId,
+        'system',
+        result.status === 'success' ? 'success' : 'denied'
+      );
+
+      return sendOk(res, authReq.requestId, {
+        result,
+        updatedProjectDoc,
+        extension: saved,
+      });
+    }
+  );
+
+  app.post(
+    '/api/v1/extensions/:id/revoke',
+    requireAuth,
+    async (req: Request, res: Response) => {
+      const authReq = req as AuthenticatedRequest;
+      const uid = authReq.authIdentity!.uid;
+      let existing: ExtensionPackageRecord | null = null;
+      try {
+        existing = await getAuthoritativeExtension(req.params.id, uid);
+      } catch (err) {
+        if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+          return sendError(
+            res,
+            authReq.requestId,
+            403,
+            'FORBIDDEN_EXTENSION_ACCESS',
+            'Cannot revoke permissions for another user’s extension.'
+          );
+        }
+        return sendPersistenceError(res, authReq.requestId, err, 'Unable to load extension.');
+      }
+      if (!existing) {
+        return sendError(res, authReq.requestId, 404, 'EXTENSION_NOT_FOUND', 'Extension not found.');
+      }
+      if (existing.ownerUid !== uid) {
+        return sendError(
+          res,
+          authReq.requestId,
+          403,
+          'FORBIDDEN_EXTENSION_ACCESS',
+          'Cannot revoke permissions for another user’s extension.'
+        );
+      }
+
+      const body = req.body || {};
+      const reason = typeof body.reason === 'string' && body.reason.trim() ? body.reason.trim() : 'User initiated permission revocation';
+      const revoked = revokeExtensionPermissions(existing, reason);
+      const saved = await saveAuthoritativeExtension(revoked);
+
+      recordAudit(
+        uid,
+        authReq.authIdentity!.email,
+        'EXTENSION_PERMISSIONS_REVOKED',
+        existing.id,
+        `Revoked permissions for extension "${existing.name}": ${reason}`,
+        authReq.requestId,
+        'system',
+        'success'
+      );
+
+      return sendOk(res, authReq.requestId, { extension: saved });
+    }
+  );
+
   app.delete('/api/v1/extensions/:id', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const uid = authReq.authIdentity!.uid;
@@ -9910,7 +11088,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
     >;
 
     try {
-      const session = createAiDirectorSession({
+      let session = createAiDirectorSession({
         ownerUid: uid,
         title: typeof body.title === 'string' ? body.title : intakeObj.title,
         rawScriptText,
@@ -9948,18 +11126,67 @@ export function createApiApp(options: ApiAppOptions = {}) {
         autonomyMode: intakeObj.autonomyMode,
       });
 
+      const requestedConnectionId =
+        typeof body.connectionId === 'string' && body.connectionId.trim()
+          ? body.connectionId.trim()
+          : typeof intakeObj.connectionId === 'string' && intakeObj.connectionId.trim()
+          ? intakeObj.connectionId.trim()
+          : null;
+      const shouldRunLiveOrchestration =
+        Boolean(requestedConnectionId) || body.useLiveProvider === true;
+
+      if (shouldRunLiveOrchestration) {
+        const userConns = await getOrSeedAuthoritativeUserProviderConnections(uid);
+        const routingProfiles = await getOrInitAuthoritativeRoutingProfiles(uid, userConns);
+        const orchestrated = await orchestrateLiveAiDirectorSession({
+          session,
+          connections: userConns,
+          routingProfiles,
+          preferredConnectionId: requestedConnectionId,
+          taskType: (body.taskType as HubTaskType) || 'planning',
+          stream: Boolean(body.stream),
+          fetchImpl: options.providerProbeFetchImpl ?? fetch,
+        });
+        session = orchestrated.session;
+
+        // Update provider connection telemetry & spend in persistence
+        const inv = orchestrated.latestInvocation;
+        if (inv.connectionId) {
+          const targetConn = userConns.find((c) => c.id === inv.connectionId);
+          if (targetConn) {
+            targetConn.lastTestedAt = inv.createdAt;
+            targetConn.lastTestStatus = inv.status === 'succeeded' ? 'Verified' : 'Failed';
+            targetConn.lastSanitizedError = inv.sanitizedError
+              ? {
+                  code: inv.sanitizedError.code,
+                  message: inv.sanitizedError.message,
+                  httpStatus: inv.httpStatus ?? undefined,
+                  timestamp: inv.createdAt,
+                }
+              : null;
+            targetConn.budgetPolicy.spentCurrentMonthUsd = Number(
+              (targetConn.budgetPolicy.spentCurrentMonthUsd + inv.usage.estimatedCostUsd).toFixed(6)
+            );
+            targetConn.updatedAt = inv.createdAt;
+            await saveAuthoritativeProviderConnection(targetConn);
+          }
+        }
+
+      }
+
       const saved = await saveAuthoritativeAiDirectorSession(session);
       recordAudit(
         uid,
         authReq.authIdentity!.email,
         'AI_DIRECTOR_SESSION_CREATE',
         `/aiDirectorSessions/${saved.id}`,
-        `Created AI Director session "${saved.intake.title}" (${saved.segments.length} segments, stage=${saved.stage})`,
+        `Created AI Director session "${saved.intake.title}" (${saved.segments.length} segments, stage=${saved.stage}, mode=${saved.executionMode || 'deterministic-fallback'})`,
         authReq.requestId,
         'user',
         'success'
       );
       return sendOk(res, authReq.requestId, { session: saved }, 201);
+
     } catch (err) {
       if (err instanceof PersistenceContractError) {
         return sendPersistenceError(
@@ -10193,12 +11420,17 @@ export function createApiApp(options: ApiAppOptions = {}) {
       });
       const savedSession = await saveAuthoritativeAiDirectorSession(updated);
 
-      // Automatically save AI-generated assets & reusable scene components as private Drafts
+      // Automatically save AI-generated assets & reusable scene components with verified SVG bytes & SHA-256 checksum
       const callerUid = authReq.authIdentity!.uid;
       for (const genAsset of savedSession.generatedAssetRecords || []) {
+        const assetValidation = validateGeneratedAssetRecord(genAsset);
+        if (!assetValidation.valid) {
+          continue;
+        }
         if (!assetsStore.has(genAsset.assetTaskId)) {
           const nowIso = new Date().toISOString();
-          const hash = computeDeterministicSnapshotHash(genAsset);
+          const verifiedBytes = genAsset.byteLength;
+          const verifiedSha256 = genAsset.checksumSha256;
           assetsStore.set(genAsset.assetTaskId, {
             id: genAsset.assetTaskId,
             title: `${genAsset.title} (AI Draft Asset)`,
@@ -10210,25 +11442,26 @@ export function createApiApp(options: ApiAppOptions = {}) {
             visibility: 'private',
             licenseType: genAsset.licenseType,
             licenseNote: genAsset.provenanceNote,
-            sourceNote: `Auto-saved AI Director generated asset (${genAsset.kind})`,
+            sourceNote: `Auto-saved AI Director generated SVG asset (${genAsset.kind}, ${verifiedBytes} bytes)`,
             provenance: {
               originType: 'generated',
               importedAt: nowIso,
             },
-            storageProvider: 'durable-local-store',
-            storageObjectKey: null,
-            mimeType: 'image/svg+xml',
-            sizeBytes: 1024,
-            checksumSha256: hash,
+            storageProvider: 'inline-svg',
+            storageObjectKey: genAsset.storageLocation,
+            previewDataUri: `data:image/svg+xml;utf8,${encodeURIComponent(genAsset.svgContent)}`,
+            mimeType: genAsset.mimeType,
+            sizeBytes: verifiedBytes,
+            checksumSha256: verifiedSha256,
             versions: [
               {
                 version: '1.0.0',
-                checksumSha256: hash,
-                sizeBytes: 1024,
-                mimeType: 'image/svg+xml',
+                checksumSha256: verifiedSha256,
+                sizeBytes: verifiedBytes,
+                mimeType: genAsset.mimeType,
                 updatedAt: nowIso,
                 updatedByUid: callerUid,
-                note: 'Auto-saved AI generated draft asset',
+                note: 'Auto-saved AI generated draft asset with verified SVG payload and SHA-256 digest',
               },
             ],
             missingAssetDetected: false,
@@ -10240,6 +11473,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
           });
         }
       }
+
 
       if (savedSession.canonicalProject && savedSession.canonicalProject.scenes.length > 0) {
         const userDrafts = await listAuthoritativeTemplateFactoryDrafts(callerUid);
@@ -10425,6 +11659,218 @@ export function createApiApp(options: ApiAppOptions = {}) {
       );
     }
   });
+
+  app.post(
+    '/api/v1/ai-director/sessions/:id/orchestrate-live',
+    requireAuth,
+    async (req: Request, res: Response) => {
+      const authReq = req as AuthenticatedRequest;
+      const uid = authReq.authIdentity!.uid;
+      res.setHeader('Cache-Control', 'private, no-store');
+      let session: AiDirectorSessionRecord | null = null;
+      try {
+        session = await getAuthoritativeAiDirectorSession(req.params.id, uid, false);
+      } catch (err) {
+        if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+          return sendError(
+            res,
+            authReq.requestId,
+            403,
+            'FORBIDDEN_DIRECTOR_SESSION',
+            'You do not own this AI Director session.'
+          );
+        }
+        return sendPersistenceError(
+          res,
+          authReq.requestId,
+          err,
+          'Unable to load AI Director session.'
+        );
+      }
+      if (!session) {
+        return sendError(
+          res,
+          authReq.requestId,
+          404,
+          'DIRECTOR_SESSION_NOT_FOUND',
+          'AI Director session not found.'
+        );
+      }
+
+      const body = (req.body || {}) as {
+        connectionId?: string | null;
+        taskType?: HubTaskType;
+        stream?: boolean;
+      };
+
+      try {
+        const userConns = await getOrSeedAuthoritativeUserProviderConnections(uid);
+        const routingProfiles = await getOrInitAuthoritativeRoutingProfiles(uid, userConns);
+        const orchestrated = await orchestrateLiveAiDirectorSession({
+          session,
+          connections: userConns,
+          routingProfiles,
+          preferredConnectionId:
+            typeof body.connectionId === 'string' && body.connectionId.trim()
+              ? body.connectionId.trim()
+              : null,
+          taskType: body.taskType || 'planning',
+          stream: Boolean(body.stream),
+          fetchImpl: options.providerProbeFetchImpl ?? fetch,
+        });
+
+        const inv = orchestrated.latestInvocation;
+        if (inv.connectionId) {
+          const targetConn = userConns.find((c) => c.id === inv.connectionId);
+          if (targetConn) {
+            targetConn.lastTestedAt = inv.createdAt;
+            targetConn.lastTestStatus = inv.status === 'succeeded' ? 'Verified' : 'Failed';
+            targetConn.lastSanitizedError = inv.sanitizedError
+              ? {
+                  code: inv.sanitizedError.code,
+                  message: inv.sanitizedError.message,
+                  httpStatus: inv.httpStatus ?? undefined,
+                  timestamp: inv.createdAt,
+                }
+              : null;
+            targetConn.budgetPolicy.spentCurrentMonthUsd = Number(
+              (targetConn.budgetPolicy.spentCurrentMonthUsd + inv.usage.estimatedCostUsd).toFixed(6)
+            );
+            targetConn.updatedAt = inv.createdAt;
+            await saveAuthoritativeProviderConnection(targetConn);
+          }
+        }
+
+
+        const saved = await saveAuthoritativeAiDirectorSession(orchestrated.session);
+        recordAudit(
+          uid,
+          authReq.authIdentity!.email,
+          'AI_DIRECTOR_LIVE_ORCHESTRATE',
+          `/aiDirectorSessions/${saved.id}`,
+          `Executed live model orchestration (status=${inv.status}, model=${inv.actualContactedModelId || 'none'})`,
+          authReq.requestId,
+          'user',
+          inv.status === 'succeeded' ? 'success' : 'error'
+        );
+        return sendOk(res, authReq.requestId, {
+          session: saved,
+          latestInvocation: inv,
+        });
+      } catch (err) {
+        if (err instanceof PersistenceContractError) {
+          return sendPersistenceError(
+            res,
+            authReq.requestId,
+            err,
+            'Unable to persist AI Director live orchestration.'
+          );
+        }
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          'LIVE_ORCHESTRATION_FAILED',
+          err instanceof Error ? err.message : 'Live provider orchestration failed.'
+        );
+      }
+    }
+  );
+
+  app.post(
+    '/api/v1/ai-director/sessions/:id/revise-plan',
+    requireAuth,
+    async (req: Request, res: Response) => {
+      const authReq = req as AuthenticatedRequest;
+      const uid = authReq.authIdentity!.uid;
+      res.setHeader('Cache-Control', 'private, no-store');
+      let session: AiDirectorSessionRecord | null = null;
+      try {
+        session = await getAuthoritativeAiDirectorSession(req.params.id, uid, false);
+      } catch (err) {
+        if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+          return sendError(
+            res,
+            authReq.requestId,
+            403,
+            'FORBIDDEN_DIRECTOR_SESSION',
+            'You do not own this AI Director session.'
+          );
+        }
+        return sendPersistenceError(
+          res,
+          authReq.requestId,
+          err,
+          'Unable to load AI Director session.'
+        );
+      }
+      if (!session) {
+        return sendError(
+          res,
+          authReq.requestId,
+          404,
+          'DIRECTOR_SESSION_NOT_FOUND',
+          'AI Director session not found.'
+        );
+      }
+
+      const body = (req.body || {}) as {
+        reason?: string;
+        shotId?: string;
+        editablePatch?: Record<string, any>;
+        approvedByUser?: boolean;
+      };
+
+      if (!body.shotId || !body.editablePatch) {
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          'INVALID_REVISION_REQUEST',
+          'shotId, reason, and editablePatch are required to revise the plan.'
+        );
+      }
+
+      try {
+        const updated = reviseDirectorPlanDuringProduction(session, {
+          reason: body.reason || '',
+          shotId: body.shotId,
+          editablePatch: body.editablePatch,
+          actorUid: uid,
+          approvedByUser: body.approvedByUser !== false,
+        });
+        const saved = await saveAuthoritativeAiDirectorSession(updated);
+        recordAudit(
+          uid,
+          authReq.authIdentity!.email,
+          'AI_DIRECTOR_REVISE_PLAN',
+          `/aiDirectorSessions/${saved.id}`,
+          `Revised plan during production on shot ${body.shotId} (reason="${body.reason}", checkpoints=${saved.productionCheckpoints.length}, gate=${saved.acceptanceGate.passed})`,
+          authReq.requestId,
+          'user',
+          'success'
+        );
+        return sendOk(res, authReq.requestId, { session: saved });
+      } catch (err) {
+        if (err instanceof PersistenceContractError) {
+          return sendPersistenceError(
+            res,
+            authReq.requestId,
+            err,
+            'Unable to persist AI Director plan revision.'
+          );
+        }
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          'PLAN_REVISION_REJECTED',
+          err instanceof Error ? err.message : 'Plan revision rejected.'
+        );
+      }
+    }
+  );
+
 
   app.post(
     '/api/v1/ai-director/sessions/:id/save-project',
@@ -11922,6 +13368,22 @@ export function createApiApp(options: ApiAppOptions = {}) {
         { format: 'webm-video', ext: '.webm', status: 'Needs setup', description: 'Requires verified browser WebCodecs/MediaRecorder or configured render worker' },
         { format: 'mp4-video', ext: '.mp4', status: 'Needs setup', description: 'Requires configured H.264 server render worker (never renames WebM/ZIP to .mp4)' },
       ],
+    });
+  });
+
+  app.get('/api/v1/editor-adapters/compatibility-matrix', requireAuth, (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    res.setHeader('Cache-Control', 'private, no-store');
+    const matrix = getMobileEditorCompatibilityMatrix();
+    return sendOk(res, authReq.requestId, {
+      matrix,
+      total: matrix.length,
+      sourceOfTruth: 'Sowveil Canonical Project v2.0.0',
+      guarantees: {
+        forgedExtensionsProhibited: true,
+        honestMediaHandoffsLabled: true,
+        importTestsDocumented: true,
+      },
     });
   });
 

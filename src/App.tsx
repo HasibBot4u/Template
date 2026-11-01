@@ -63,17 +63,23 @@ import { ReferenceLabWorkspace } from './components/ReferenceLabWorkspace';
 import { ProviderHubWorkspace } from './components/ProviderHubWorkspace';
 import { AiDirectorWorkspace } from './components/AiDirectorWorkspace';
 import { EditingStudioWorkspace } from './components/EditingStudioWorkspace';
+import { LandscapeCreativeStudio } from './components/LandscapeCreativeStudio';
 import { TemplateFactoryWorkspace } from './components/TemplateFactoryWorkspace';
 import { RenderExportQaWorkspace } from './components/RenderExportQaWorkspace';
 import { OfflineIndicator, PWAInstallButton } from './components/PWAInstallBanner';
 import {
+  Film,
   FolderKanban,
   Heart,
   Layers,
+  Layout,
   ListChecks,
   Loader2,
   Lock,
   Settings,
+  Sliders,
+  SlidersHorizontal,
+  Sparkles,
   X,
 } from 'lucide-react';
 
@@ -225,8 +231,10 @@ const AuthenticatedAppShell: React.FC<{
     !location.pathname.startsWith('/app/template-factory') &&
     !location.pathname.startsWith('/app/project-library');
 
+  const [mobileLauncherOpen, setMobileLauncherOpen] = useState(false);
+
   return (
-    <div className="min-h-screen flex flex-col bg-[#080707] text-[#F3EEE8] pb-16 md:pb-0">
+    <div className="min-h-screen flex flex-col bg-[#080707] text-[#F3EEE8] pb-16 md:pb-0 safe-bottom">
       <OfflineIndicator />
       <header className="flex items-center justify-between gap-4 px-4 sm:px-6 py-2 border-b border-[#2A231E] bg-[#0B0A09]">
         <div className="flex items-center gap-3">
@@ -245,6 +253,13 @@ const AuthenticatedAppShell: React.FC<{
           aria-label="Workspace Navigation"
           className="hidden md:flex items-center gap-4 text-xs font-medium text-[#B8AAA0]"
         >
+          <Link
+            to="/app/landscape-studio"
+            className="hover:text-[#F06424] text-[#F06424] transition-colors whitespace-nowrap shrink-0 font-bold px-2 py-0.5 rounded bg-[#F06424]/10 border border-[#F06424]/40"
+            data-testid="nav-landscape-studio-link"
+          >
+            Landscape Studio
+          </Link>
           <Link
             to="/app"
             className="hover:text-[#F3EEE8] transition-colors whitespace-nowrap shrink-0"
@@ -396,15 +411,9 @@ const AuthenticatedAppShell: React.FC<{
 
       <footer className="border-t border-[#2A231E] bg-[#0B0A09] px-4 sm:px-6 py-2 flex flex-wrap items-center justify-between gap-3 text-xs font-mono-tabular text-[#83766D]">
         <div className="flex items-center gap-2">
-          <span
-            className={`w-2 h-2 rounded-full ${
-              companion.status === 'Connected' ? 'bg-[#55B98B]' : 'bg-[#55B98B]'
-            }`}
-          />
+          <span className="w-2 h-2 rounded-full bg-[#55B98B]" />
           <span className="text-[#B8AAA0]">
-            {companion.status === 'Connected'
-              ? `Connected · ${companion.aeActiveComp || 'No active comp'}`
-              : 'Connected · No active comp'}
+            Mobile Compositor Active · Native Canvas Engine
           </span>
           <span aria-hidden="true" className="hidden sm:inline">
             ·
@@ -418,14 +427,139 @@ const AuthenticatedAppShell: React.FC<{
             Help
           </Link>
           <span aria-hidden="true">·</span>
-          <span className="text-[#B8AAA0]">Sowveil 2.3.0 · After Effects</span>
+          <span className="text-[#B8AAA0]">Sowveil 2.3.0 · Mobile Creative Engine</span>
         </div>
       </footer>
+
+      {/* Portrait Mode Studio & Workspaces Launcher Sheet */}
+      {mobileLauncherOpen && (
+        <div
+          className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex flex-col justify-end p-2 safe-bottom safe-left safe-right md:hidden animate-in fade-in duration-150"
+          onClick={() => setMobileLauncherOpen(false)}
+        >
+          <div
+            className="bg-[#0E0D0C] border border-[#342A24] rounded-2xl p-4 shadow-2xl flex flex-col gap-3 max-h-[85vh] overflow-y-auto"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between pb-2 border-b border-[#26201C]">
+              <div>
+                <div className="text-sm font-bold text-[#F3EEE8]">Sowveil Workspaces</div>
+                <div className="text-[11px] text-[#83766D]">Instant mobile access to all 10 creative suites</div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setMobileLauncherOpen(false)}
+                className="p-1 rounded-full text-[#83766D] hover:text-[#F3EEE8] bg-[#191614]"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2 text-xs">
+              <Link
+                to="/app/landscape-studio"
+                onClick={() => setMobileLauncherOpen(false)}
+                className="p-2.5 rounded-xl border border-[#F06424]/40 bg-[#F06424]/10 hover:bg-[#F06424]/20 flex flex-col gap-1 transition-colors"
+              >
+                <div className="flex items-center gap-1.5 text-[#F06424] font-bold">
+                  <Layout className="w-4 h-4" />
+                  <span>Landscape Studio</span>
+                </div>
+                <span className="text-[10px] text-[#B8AAA0]">Multi-track timeline + preview</span>
+              </Link>
+
+              <Link
+                to="/app/ai-director"
+                onClick={() => setMobileLauncherOpen(false)}
+                className="p-2.5 rounded-xl border border-[#26201C] bg-[#141210] hover:border-[#F06424]/50 flex flex-col gap-1 transition-colors"
+              >
+                <div className="flex items-center gap-1.5 text-[#F06424] font-bold">
+                  <Sparkles className="w-4 h-4" />
+                  <span>AI Director</span>
+                </div>
+                <span className="text-[10px] text-[#B8AAA0]">Brief to timeline production</span>
+              </Link>
+
+              <Link
+                to="/app/editor"
+                onClick={() => setMobileLauncherOpen(false)}
+                className="p-2.5 rounded-xl border border-[#26201C] bg-[#141210] hover:border-[#F06424]/50 flex flex-col gap-1 transition-colors"
+              >
+                <div className="flex items-center gap-1.5 text-[#F3EEE8] font-bold">
+                  <SlidersHorizontal className="w-4 h-4 text-[#A855F7]" />
+                  <span>Editing Studio</span>
+                </div>
+                <span className="text-[10px] text-[#B8AAA0]">Pro keyframes & bezier curves</span>
+              </Link>
+
+              <Link
+                to="/app/reference-lab"
+                onClick={() => setMobileLauncherOpen(false)}
+                className="p-2.5 rounded-xl border border-[#26201C] bg-[#141210] hover:border-[#F06424]/50 flex flex-col gap-1 transition-colors"
+              >
+                <div className="flex items-center gap-1.5 text-[#F3EEE8] font-bold">
+                  <Film className="w-4 h-4 text-[#38BDF8]" />
+                  <span>Reference Lab</span>
+                </div>
+                <span className="text-[10px] text-[#B8AAA0]">Video-to-template reconstruct</span>
+              </Link>
+
+              <Link
+                to="/app/template-factory"
+                onClick={() => setMobileLauncherOpen(false)}
+                className="p-2.5 rounded-xl border border-[#26201C] bg-[#141210] hover:border-[#F06424]/50 flex flex-col gap-1 transition-colors"
+              >
+                <div className="flex items-center gap-1.5 text-[#F3EEE8] font-bold">
+                  <Layers className="w-4 h-4 text-[#EAB308]" />
+                  <span>Template Factory</span>
+                </div>
+                <span className="text-[10px] text-[#B8AAA0]">Reusable motion components</span>
+              </Link>
+
+              <Link
+                to="/app/render-export"
+                onClick={() => setMobileLauncherOpen(false)}
+                className="p-2.5 rounded-xl border border-[#26201C] bg-[#141210] hover:border-[#F06424]/50 flex flex-col gap-1 transition-colors"
+              >
+                <div className="flex items-center gap-1.5 text-[#55B98B] font-bold">
+                  <ListChecks className="w-4 h-4" />
+                  <span>Render &amp; QA</span>
+                </div>
+                <span className="text-[10px] text-[#B8AAA0]">8 mobile formats &amp; export</span>
+              </Link>
+
+              <Link
+                to="/app/provider-hub"
+                onClick={() => setMobileLauncherOpen(false)}
+                className="p-2.5 rounded-xl border border-[#26201C] bg-[#141210] hover:border-[#F06424]/50 flex flex-col gap-1 transition-colors"
+              >
+                <div className="flex items-center gap-1.5 text-[#F3EEE8] font-bold">
+                  <Sliders className="w-4 h-4 text-[#F97316]" />
+                  <span>Provider Hub</span>
+                </div>
+                <span className="text-[10px] text-[#B8AAA0]">AI models &amp; tools gateway</span>
+              </Link>
+
+              <Link
+                to="/app/jobs"
+                onClick={() => setMobileLauncherOpen(false)}
+                className="p-2.5 rounded-xl border border-[#26201C] bg-[#141210] hover:border-[#F06424]/50 flex flex-col gap-1 transition-colors"
+              >
+                <div className="flex items-center gap-1.5 text-[#F3EEE8] font-bold">
+                  <ListChecks className="w-4 h-4 text-[#83766D]" />
+                  <span>Jobs History</span>
+                </div>
+                <span className="text-[10px] text-[#B8AAA0]">{jobsCount} queued or done</span>
+              </Link>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Android Mobile Thumb-Zone Bottom Navigation Bar (5 destinations max) */}
       <nav
         aria-label="Mobile Bottom Navigation"
-        className="md:hidden fixed bottom-0 left-0 right-0 z-40 border-t border-[#342A24] bg-[#0B0A09]/95 backdrop-blur-md grid grid-cols-5 h-16 px-1"
+        className="md:hidden fixed bottom-0 left-0 right-0 z-40 border-t border-[#342A24] bg-[#0B0A09]/95 backdrop-blur-md grid grid-cols-5 h-16 px-1 safe-bottom"
       >
         <Link
           to="/app/text-animation"
@@ -435,6 +569,18 @@ const AuthenticatedAppShell: React.FC<{
         >
           <Layers className="w-4 h-4" />
           <span>Modules</span>
+        </Link>
+        <Link
+          to="/app/landscape-studio"
+          data-testid="mobile-nav-landscape-link"
+          className={`flex flex-col items-center justify-center gap-1 text-[10px] font-medium ${
+            location.pathname.startsWith('/app/landscape')
+              ? 'text-[#F06424]'
+              : 'text-[#B8AAA0]'
+          }`}
+        >
+          <Layout className="w-4 h-4" />
+          <span>Studio</span>
         </Link>
         <Link
           to="/app/project-library"
@@ -458,26 +604,16 @@ const AuthenticatedAppShell: React.FC<{
           <Heart className="w-4 h-4" />
           <span>Saved ({favoriteIds.length})</span>
         </Link>
-        <Link
-          to="/app/jobs"
+        <button
+          type="button"
+          onClick={() => setMobileLauncherOpen(true)}
           className={`flex flex-col items-center justify-center gap-1 text-[10px] font-medium ${
-            location.pathname.startsWith('/app/jobs') ? 'text-[#F06424]' : 'text-[#B8AAA0]'
+            mobileLauncherOpen ? 'text-[#F06424]' : 'text-[#B8AAA0]'
           }`}
         >
-          <ListChecks className="w-4 h-4" />
-          <span>Exports ({jobsCount})</span>
-        </Link>
-        <Link
-          to="/app/settings/profile"
-          className={`flex flex-col items-center justify-center gap-1 text-[10px] font-medium ${
-            location.pathname.startsWith('/app/settings')
-              ? 'text-[#F06424]'
-              : 'text-[#B8AAA0]'
-          }`}
-        >
-          <Settings className="w-4 h-4" />
-          <span>Settings</span>
-        </Link>
+          <SlidersHorizontal className="w-4 h-4" />
+          <span>More</span>
+        </button>
       </nav>
     </div>
   );
@@ -817,10 +953,10 @@ export default function App() {
         : {
             ...prev,
             status: 'Connected',
-            pairedDeviceName: 'Studio-Workstation-Sim',
-            aeActiveComp: 'Main_Comp_1080p (Diagnostic Sim)',
-            connectorVersion: '0.3.0-sim',
-            hostVersion: 'Studio Workstation Gateway (Diagnostic Sim)',
+            pairedDeviceName: 'Pixel 8 Pro (Simulated Android Session)',
+            aeActiveComp: 'Canvas_Comp_1080p (Native Engine)',
+            connectorVersion: '0.3.0-mobile',
+            hostVersion: 'Mobile Editor Gateway (Native Engine)',
             lastSeenAt: new Date().toISOString(),
             dependencies: {
               python: { installed: true, version: '3.11.8 (Sim)' },
@@ -1082,6 +1218,24 @@ export default function App() {
           )}
         />
         <Route
+          path="/app/landscape-studio"
+          element={
+            <ProtectedUserRoute authReady={authReady} currentUser={currentUser}>
+              <LandscapeStudioRouteWrapper
+                projects={projects}
+                ownerUid={currentUser?.uid || 'user-local'}
+                onAddProject={addProject}
+                onUpdateProject={updateProject}
+                onNotify={notify}
+              />
+            </ProtectedUserRoute>
+          }
+        />
+        <Route
+          path="/app/landscape"
+          element={<Navigate to="/app/landscape-studio" replace />}
+        />
+        <Route
           path="/app/editor"
           element={wrapUserProtected(
             <EditingStudioRouteWrapper
@@ -1271,6 +1425,31 @@ const EditingStudioRouteWrapper: React.FC<{
             ...record,
             id: stableId,
           });
+        }
+      }}
+      onNotify={onNotify}
+    />
+  );
+};
+
+const LandscapeStudioRouteWrapper: React.FC<{
+  projects: ProjectLibraryItem[];
+  ownerUid: string;
+  onAddProject: (
+    p: Omit<ProjectLibraryItem, 'id' | 'updatedAt'> & { id?: string; createdAt?: string }
+  ) => Promise<void>;
+  onUpdateProject: (id: string, patch: Partial<ProjectLibraryItem>) => Promise<void>;
+  onNotify: (message: string, tone?: 'info' | 'warning' | 'error' | 'success') => void;
+}> = ({ projects, ownerUid, onAddProject, onUpdateProject, onNotify }) => {
+  return (
+    <LandscapeCreativeStudio
+      projects={projects}
+      ownerUid={ownerUid}
+      onSaveProject={async (proj) => {
+        if (projects.some((p) => p.id === proj.id)) {
+          await onUpdateProject(proj.id, proj);
+        } else {
+          await onAddProject(proj);
         }
       }}
       onNotify={onNotify}

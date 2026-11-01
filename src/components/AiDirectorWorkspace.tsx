@@ -19,6 +19,7 @@ import {
   Upload,
 } from 'lucide-react';
 import type {
+  AiDirectorProviderInvocationEvidence,
   AiDirectorSessionRecord,
   BudgetLatencyPreferenceMode,
   DirectorAutonomyMode,
@@ -26,9 +27,12 @@ import type {
   IntendedPlatformId,
   ShotEditableParameters,
 } from '../services/aiDirectorProductionEngine';
+import type { ProviderConnectionPublicView } from '../types/providerHub';
 import type { MobileAspectRatio, ProjectLibraryItem } from '../types/sowveil';
+
 import { MobileProEditorModal } from './MobileProEditorModal';
 import { executeAuthenticatedApiRequest } from '../services/apiClient';
+
 
 interface SampleScriptItem {
   id: string;
@@ -120,6 +124,21 @@ export const AiDirectorWorkspace: React.FC<AiDirectorWorkspaceProps> = ({
   const [simulateFailShotIds] = useState<string[]>([]);
   const [isTimelineModalOpen, setIsTimelineModalOpen] = useState(false);
 
+  // Live Provider Hub Orchestration state
+  const [providerConnections, setProviderConnections] = useState<ProviderConnectionPublicView[]>([]);
+  const [selectedConnectionId, setSelectedConnectionId] = useState<string>('');
+
+  const [useLiveProvider, setUseLiveProvider] = useState<boolean>(false);
+
+  // Stage 6: Revise Plan During Production state
+  const [revisionShotId, setRevisionShotId] = useState<string>('');
+  const [revisionReason, setRevisionReason] = useState<string>('');
+  const [revisionHeadline, setRevisionHeadline] = useState<string>('');
+  const [revisionDurationSec, setRevisionDurationSec] = useState<number>(3.5);
+  const [revisionCameraMotion, setRevisionCameraMotion] =
+    useState<ShotEditableParameters['cameraMotion']>('push-in');
+
+
   const resolveToken = useCallback(
     async (forceRefresh = false) => {
       if (getAuthToken) return await getAuthToken(forceRefresh);
@@ -156,9 +175,14 @@ export const AiDirectorWorkspace: React.FC<AiDirectorWorkspaceProps> = ({
         '/api/v1/ai-director/sessions'
       );
 
-      const [samplesJson, sessionsRes] = await Promise.all([
+      const connectionsPromise = apiRequest<{ connections: ProviderConnectionPublicView[] }>(
+        '/api/v1/provider-hub/connections'
+      );
+
+      const [samplesJson, sessionsRes, connsRes] = await Promise.all([
         samplesPromise,
         sessionsPromise,
+        connectionsPromise,
       ]);
 
       if (samplesJson?.ok && Array.isArray(samplesJson.data?.samples)) {
@@ -182,10 +206,22 @@ export const AiDirectorWorkspace: React.FC<AiDirectorWorkspaceProps> = ({
           setActiveSession(items[0]);
         }
       }
+
+      if (connsRes.ok && Array.isArray(connsRes.data?.connections)) {
+        setProviderConnections(connsRes.data.connections);
+        const readyConn = connsRes.data.connections.find(
+          (c) => c.credentialStatus === 'active' || c.authMode === 'server-env'
+        );
+        if (readyConn && !selectedConnectionId) {
+          setSelectedConnectionId(readyConn.id);
+        }
+      }
+
     } catch {
       // Ignore transient network errors on initial load
     }
   };
+
 
   useEffect(() => {
     fetchSamplesAndSessions();
@@ -259,9 +295,12 @@ export const AiDirectorWorkspace: React.FC<AiDirectorWorkspaceProps> = ({
               noQuestionsWorkflow,
               autonomyMode,
             },
+            useLiveProvider,
+            connectionId: selectedConnectionId || undefined,
           },
         }
       );
+
       if (!res.ok || !res.data?.session) {
         throw new Error(res.errorMessage || 'Failed to create AI Director session');
       }
@@ -487,6 +526,95 @@ export const AiDirectorWorkspace: React.FC<AiDirectorWorkspaceProps> = ({
     setEditingShotId(null);
     setShotEditDraft(null);
   };
+
+  const handleRunLiveOrchestration = async () => {
+    if (!activeSession) return;
+    setLoading(true);
+    setErrorBanner(null);
+    setStatusBanner(null);
+    try {
+      const res = await apiRequest<{
+        session: AiDirectorSessionRecord;
+        latestInvocation: AiDirectorProviderInvocationEvidence;
+      }>(`/api/v1/ai-director/sessions/${activeSession.id}/orchestrate-live`, {
+        method: 'POST',
+        body: {
+          connectionId: selectedConnectionId || undefined,
+          taskType: 'planning',
+          stream: false,
+        },
+      });
+      if (!res.ok || !res.data?.session) {
+        throw new Error(res.errorMessage || 'Live provider orchestration failed');
+      }
+      const updated = res.data.session;
+      const inv = res.data.latestInvocation;
+      setActiveSession(updated);
+      setSessions((prev) => [updated, ...prev.filter((s) => s.id !== updated.id)]);
+      if (inv.status === 'succeeded') {
+        setStatusBanner(
+          `Live Provider Orchestration succeeded via "${inv.connectionLabel}" using exact model "${inv.actualContactedModelId}" (${inv.latencyMs}ms, ${inv.usage.totalTokens} tokens).`
+        );
+      } else {
+        setErrorBanner(
+          `Live Provider Call (${inv.connectionLabel} / ${inv.requestedModelId}) returned [${inv.status}]: ${inv.sanitizedError?.message || 'Error'}. Preserved deterministic 100% script coverage.`
+        );
+      }
+    } catch (err) {
+      setErrorBanner(err instanceof Error ? err.message : 'Live provider orchestration failed');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleRevisePlanDuringProduction = async () => {
+    if (!activeSession) return;
+    const targetShotId = revisionShotId || activeSession.shots[0]?.shotId;
+    if (!targetShotId) return;
+    if (revisionReason.trim().length < 3) {
+      setErrorBanner('Please enter a reason (at least 3 characters) for revising the plan during production.');
+      return;
+    }
+    setLoading(true);
+    setErrorBanner(null);
+    setStatusBanner(null);
+    try {
+      const patch: Partial<ShotEditableParameters> = {
+        durationSec: revisionDurationSec,
+        cameraMotion: revisionCameraMotion,
+      };
+      if (revisionHeadline.trim()) {
+        patch.headlineText = revisionHeadline.trim();
+      }
+      const res = await apiRequest<{ session: AiDirectorSessionRecord }>(
+        `/api/v1/ai-director/sessions/${activeSession.id}/revise-plan`,
+        {
+          method: 'POST',
+          body: {
+            reason: revisionReason.trim(),
+            shotId: targetShotId,
+            editablePatch: patch,
+            approvedByUser: true,
+          },
+        }
+      );
+      if (!res.ok || !res.data?.session) {
+        throw new Error(res.errorMessage || 'Failed to revise plan during production');
+      }
+      const updated = res.data.session;
+      setActiveSession(updated);
+      setSessions((prev) => [updated, ...prev.filter((s) => s.id !== updated.id)]);
+      setRevisionReason('');
+      setStatusBanner(
+        `Revised shot ${targetShotId} with reversible checkpoint and re-ran 10-Point Acceptance Gate QA (${updated.acceptanceGate.passed ? 'PASSED' : 'PENDING'}).`
+      );
+    } catch (err) {
+      setErrorBanner(err instanceof Error ? err.message : 'Plan revision failed');
+    } finally {
+      setLoading(false);
+    }
+  };
+
 
   return (
     <div
@@ -957,9 +1085,42 @@ export const AiDirectorWorkspace: React.FC<AiDirectorWorkspaceProps> = ({
                   className="w-full px-2.5 py-1.5 rounded bg-[#0D0F14] border border-[#262B38] text-xs text-white"
                 />
               </div>
+
+              {/* Live Provider Hub Connection Selector */}
+              <div className="pt-2 border-t border-[#222631] space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] font-semibold text-[#FF6B1A]">
+                    Provider Hub Orchestration (Server-Only Vault)
+                  </span>
+                  <label className="flex items-center gap-1.5 text-[11px] text-[#D5D8E0] cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={useLiveProvider}
+                      onChange={(e) => setUseLiveProvider(e.target.checked)}
+                      data-testid="director-use-live-provider-checkbox"
+                    />
+                    Run Live Model Synthesis
+                  </label>
+                </div>
+                <select
+                  value={selectedConnectionId}
+                  onChange={(e) => setSelectedConnectionId(e.target.value)}
+                  data-testid="director-provider-connection-select"
+                  className="w-full px-2.5 py-1.5 rounded bg-[#0D0F14] border border-[#262B38] text-xs text-white"
+                >
+                  <option value="">Auto-resolve from Task Routing Profile</option>
+                  {providerConnections.map((conn) => (
+                    <option key={conn.id} value={conn.id}>
+                      {conn.label} · {conn.modelId} ({conn.credentialStatus})
+                    </option>
+                  ))}
+
+                </select>
+              </div>
             </div>
           </div>
         )}
+
 
         {/* ================================================================
             STAGE 2: COVERAGE LEDGER & SEMANTIC ANALYSIS
@@ -1075,23 +1236,142 @@ export const AiDirectorWorkspace: React.FC<AiDirectorWorkspaceProps> = ({
 
               <div>
                 <h3 className="text-xs font-semibold text-[#FF6B1A] uppercase tracking-wider mb-1.5">
-                  Tone, Analyzer Model & Defaulted Fields
+                  Tone, Truthful Analyzer Model & Defaulted Fields
                 </h3>
                 <p className="text-xs text-[#D5D8E0] mb-1">
                   Tone:{' '}
                   <span className="font-medium">{activeSession.analysisReport.overallTone}</span>
                 </p>
                 <p className="text-[11px] text-[#8E95A5] mb-1">
-                  Analyzer: <span className="font-mono text-white">{activeSession.analysisReport.analyzerModelUsed}</span>
+                  Analyzer:{' '}
+                  <span
+                    className="font-mono text-white"
+                    data-testid="director-analyzer-model-badge"
+                  >
+                    {activeSession.analysisReport.analyzerModelUsed}
+                  </span>{' '}
+                  <span className="text-[10px] text-emerald-400">
+                    ({activeSession.executionMode || 'deterministic-fallback'})
+                  </span>
                 </p>
-                <p className="text-[11px] text-[#8E95A5]">
+                <p className="text-[11px] text-[#8E95A5] mb-2">
                   Defaulted Intake Fields:{' '}
                   {activeSession.intake.defaultedFields.length > 0
                     ? activeSession.intake.defaultedFields.join(', ')
                     : 'All explicitly provided'}
                 </p>
+                <div className="flex flex-wrap items-center gap-2 pt-1 border-t border-[#222631]">
+                  <button
+                    type="button"
+                    disabled={loading}
+                    onClick={handleRunLiveOrchestration}
+                    data-testid="director-run-live-orchestration-btn"
+                    className="px-2.5 py-1 rounded bg-[#FF6B1A]/20 hover:bg-[#FF6B1A]/30 border border-[#FF6B1A]/40 text-[11px] font-semibold text-[#FF6B1A] flex items-center gap-1"
+                  >
+                    <Sparkles className="w-3 h-3" />
+                    Run Live Provider Hub Orchestration
+                  </button>
+                </div>
               </div>
             </div>
+
+            {/* Live Provider Invocation Telemetry & Model-Driven Synthesis */}
+            {((activeSession.providerInvocations && activeSession.providerInvocations.length > 0) ||
+              activeSession.liveModelSynthesis) && (
+              <div
+                className="bg-[#12141A] border border-[#222631] rounded-xl p-4 space-y-3"
+                data-testid="director-live-provider-telemetry"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h3 className="text-xs font-semibold text-[#FF6B1A] uppercase tracking-wider">
+                    Provider Hub Invocation Evidence & Live Model Synthesis
+                  </h3>
+                  <span className="text-[11px] font-mono text-[#8E95A5]">
+                    Contacted Models:{' '}
+                    {activeSession.actualContactedModels && activeSession.actualContactedModels.length > 0
+                      ? activeSession.actualContactedModels.join(', ')
+                      : 'none (deterministic baseline)'}
+                  </span>
+                </div>
+
+                {activeSession.providerInvocations && activeSession.providerInvocations.length > 0 && (
+                  <div className="space-y-1.5">
+                    {activeSession.providerInvocations.slice(0, 5).map((inv) => (
+                      <div
+                        key={inv.invocationId}
+                        className="p-2.5 rounded bg-[#0E1015] border border-[#1E222D] text-[11px] flex flex-wrap items-center justify-between gap-2"
+                      >
+                        <div>
+                          <span className="font-semibold text-white">{inv.connectionLabel}</span>{' '}
+                          <span className="font-mono text-[#8E95A5]">
+                            ({inv.protocol} · requested={inv.requestedModelId} · actual=
+                            {inv.actualContactedModelId || 'none'})
+                          </span>
+                          {inv.usedFallbackConnection && (
+                            <span className="ml-2 px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 text-[10px]">
+                              Fallback Used
+                            </span>
+                          )}
+                          {inv.sanitizedError && (
+                            <div className="text-red-300 text-[10px] mt-0.5">
+                              [{inv.sanitizedError.code}] {inv.sanitizedError.message}
+                            </div>
+                          )}
+                        </div>
+                        <div className="font-mono text-[10px] text-[#B8BECB]">
+                          status={inv.status} · HTTP {inv.httpStatus ?? '—'} · {inv.latencyMs}ms ·{' '}
+                          {inv.usage.totalTokens} tok (${inv.usage.estimatedCostUsd})
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {activeSession.liveModelSynthesis && (
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3 pt-2 border-t border-[#1E222D] text-xs">
+                    <div className="p-2.5 rounded bg-[#0E1015] border border-[#1E222D] space-y-1">
+                      <div className="text-[10px] font-semibold text-[#FF6B1A] uppercase">
+                        Narrative Structure
+                      </div>
+                      <p className="text-[11px] text-[#D5D8E0]">
+                        <strong>Hook:</strong> {activeSession.liveModelSynthesis.narrativeStructure.hookStrategy}
+                      </p>
+                      <p className="text-[11px] text-[#D5D8E0]">
+                        <strong>Climax:</strong> {activeSession.liveModelSynthesis.narrativeStructure.climaxMoment}
+                      </p>
+                      <p className="text-[11px] text-[#8E95A5]">
+                        <strong>Pacing:</strong> {activeSession.liveModelSynthesis.narrativeStructure.pacingArc}
+                      </p>
+                    </div>
+                    <div className="p-2.5 rounded bg-[#0E1015] border border-[#1E222D] space-y-1">
+                      <div className="text-[10px] font-semibold text-[#FF6B1A] uppercase">
+                        Asset, Motion & Audio Master Plan
+                      </div>
+                      <p className="text-[11px] text-[#D5D8E0]">
+                        <strong>Assets:</strong> {activeSession.liveModelSynthesis.assetAndMotionPlan.primaryAssetStrategy}
+                      </p>
+                      <p className="text-[11px] text-[#D5D8E0]">
+                        <strong>Motion:</strong> {activeSession.liveModelSynthesis.assetAndMotionPlan.motionSystemSummary}
+                      </p>
+                      <p className="text-[11px] text-[#8E95A5]">
+                        <strong>Audio:</strong> {activeSession.liveModelSynthesis.assetAndMotionPlan.audioMasterPlan}
+                      </p>
+                    </div>
+                    <div className="p-2.5 rounded bg-[#0E1015] border border-[#1E222D] space-y-1">
+                      <div className="text-[10px] font-semibold text-[#FF6B1A] uppercase">
+                        Risk & Continuity Analysis
+                      </div>
+                      {activeSession.liveModelSynthesis.riskAndContinuityAnalysis.map((r, i) => (
+                        <div key={`${r.code}-${i}`} className="text-[11px] text-[#D5D8E0]">
+                          <span className="font-mono text-amber-300">[{r.code}]</span> {r.description}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
 
             {/* Offset-Exact Script Segment Table */}
             <div className="bg-[#12141A] border border-[#222631] rounded-xl overflow-hidden">
@@ -1968,39 +2248,114 @@ export const AiDirectorWorkspace: React.FC<AiDirectorWorkspaceProps> = ({
                 <p className="text-[11px] text-[#8E95A5]">
                   Every compile and refinement automatically snapshots the shot plan, coverage ledger, and Canonical Project v2.0.0 so you can roll back with one click.
                 </p>
-                <div className="space-y-2">
-                  {activeSession.productionCheckpoints.map((cp) => (
-                    <div
-                      key={cp.checkpointId}
-                      className="p-3 rounded-lg bg-[#0E1015] border border-[#1E222D] flex items-center justify-between gap-2 text-xs"
-                    >
-                      <div>
-                        <div className="font-semibold text-white flex items-center gap-1.5">
-                          <Clock className="w-3.5 h-3.5 text-[#FF6B1A]" />
-                          {cp.label}
+                  <div className="space-y-2">
+                    {activeSession.productionCheckpoints.map((cp) => (
+                      <div
+                        key={cp.checkpointId}
+                        className="p-3 rounded-lg bg-[#0E1015] border border-[#1E222D] flex items-center justify-between gap-2 text-xs"
+                      >
+                        <div>
+                          <div className="font-semibold text-white flex items-center gap-1.5">
+                            <Clock className="w-3.5 h-3.5 text-[#FF6B1A]" />
+                            {cp.label}
+                          </div>
+                          <div className="text-[11px] text-[#8E95A5]">{cp.reason}</div>
+                          <div className="text-[10px] font-mono text-[#6E7585]">
+                            {cp.checkpointId} · {cp.createdAt}
+                          </div>
                         </div>
-                        <div className="text-[11px] text-[#8E95A5]">{cp.reason}</div>
-                        <div className="text-[10px] font-mono text-[#6E7585]">
-                          {cp.checkpointId} · {cp.createdAt}
-                        </div>
+                        <button
+                          type="button"
+                          disabled={loading}
+                          onClick={() => handleRollbackCheckpoint(cp.checkpointId)}
+                          data-testid={`director-rollback-${cp.checkpointId}`}
+                          className="px-3 py-1.5 rounded bg-[#1C202B] hover:bg-[#272D3D] border border-[#31384A] text-xs text-[#FF6B1A] font-medium flex items-center gap-1 shrink-0"
+                        >
+                          <RotateCcw className="w-3.5 h-3.5" />
+                          Rollback
+                        </button>
                       </div>
+                    ))}
+                  </div>
+
+                  {/* Revise Plan During Production Control */}
+                  <div
+                    className="pt-3 mt-3 border-t border-[#1E222D] space-y-2.5"
+                    data-testid="director-revise-plan-panel"
+                  >
+                    <h4 className="text-xs font-semibold text-white">
+                      Revise Plan During Production (Checkpoint + Typed Commands + QA Re-Run)
+                    </h4>
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                      <select
+                        value={revisionShotId || activeSession.shots[0]?.shotId || ''}
+                        onChange={(e) => setRevisionShotId(e.target.value)}
+                        className="px-2.5 py-1.5 rounded bg-[#0D0F14] border border-[#262B38] text-xs text-white"
+                      >
+                        {activeSession.shots.map((s) => (
+                          <option key={s.shotId} value={s.shotId}>
+                            {s.shotId} (#{s.shotNumber}: {s.editableParameters.headlineText.slice(0, 24)})
+                          </option>
+                        ))}
+                      </select>
+                      <input
+                        type="number"
+                        step="0.5"
+                        min={0.5}
+                        value={revisionDurationSec}
+                        onChange={(e) => setRevisionDurationSec(Number(e.target.value) || 3.5)}
+                        placeholder="Duration (sec)"
+                        className="px-2.5 py-1.5 rounded bg-[#0D0F14] border border-[#262B38] text-xs text-white"
+                      />
+                      <select
+                        value={revisionCameraMotion}
+                        onChange={(e) =>
+                          setRevisionCameraMotion(
+                            e.target.value as ShotEditableParameters['cameraMotion']
+                          )
+                        }
+                        className="px-2.5 py-1.5 rounded bg-[#0D0F14] border border-[#262B38] text-xs text-white"
+                      >
+                        <option value="static">static</option>
+                        <option value="push-in">push-in</option>
+                        <option value="pull-out">pull-out</option>
+                        <option value="pan-right">pan-right</option>
+                        <option value="pan-left">pan-left</option>
+                        <option value="orbital-drift">orbital-drift</option>
+                      </select>
+                    </div>
+                    <input
+                      type="text"
+                      value={revisionHeadline}
+                      onChange={(e) => setRevisionHeadline(e.target.value)}
+                      placeholder="Optional revised headline text..."
+                      className="w-full px-2.5 py-1.5 rounded bg-[#0D0F14] border border-[#262B38] text-xs text-white"
+                    />
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="text"
+                        value={revisionReason}
+                        onChange={(e) => setRevisionReason(e.target.value)}
+                        data-testid="director-revision-reason-input"
+                        placeholder="Mandatory reason for revising plan during production..."
+                        className="flex-1 px-2.5 py-1.5 rounded bg-[#0D0F14] border border-[#262B38] text-xs text-white"
+                      />
                       <button
                         type="button"
                         disabled={loading}
-                        onClick={() => handleRollbackCheckpoint(cp.checkpointId)}
-                        data-testid={`director-rollback-${cp.checkpointId}`}
-                        className="px-3 py-1.5 rounded bg-[#1C202B] hover:bg-[#272D3D] border border-[#31384A] text-xs text-[#FF6B1A] font-medium flex items-center gap-1 shrink-0"
+                        onClick={handleRevisePlanDuringProduction}
+                        data-testid="director-submit-revision-btn"
+                        className="px-3 py-1.5 rounded bg-[#FF6B1A] hover:bg-[#FF7B33] text-black font-semibold text-xs shrink-0"
                       >
-                        <RotateCcw className="w-3.5 h-3.5" />
-                        Rollback
+                        Revise Plan & Re-Run QA
                       </button>
                     </div>
-                  ))}
+                  </div>
                 </div>
               </div>
             </div>
-          </div>
-        )}
+          )}
+
       </main>
 
       {/* Canonical Timeline Editor Modal */}

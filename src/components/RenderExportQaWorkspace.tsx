@@ -17,7 +17,9 @@ import {
   evaluateServerWorkerTransparency,
   getAllClipsFromProject,
   getMobileAdapterCapabilityManifests,
+  getMobileEditorCompatibilityMatrix,
   MobileAdapterCapabilityManifest,
+  MobileEditorCompatibilityMatrixRecord,
   RENDER_EXPORT_ENGINE_VERSION,
   renderCanonicalFrameSvg,
   RenderExecutionTier,
@@ -246,6 +248,10 @@ export const RenderExportQaWorkspace: React.FC<RenderExportQaWorkspaceProps> = (
   );
   const adapterManifests: MobileAdapterCapabilityManifest[] = useMemo(
     () => getMobileAdapterCapabilityManifests(),
+    []
+  );
+  const compatibilityMatrix: MobileEditorCompatibilityMatrixRecord[] = useMemo(
+    () => getMobileEditorCompatibilityMatrix(),
     []
   );
 
@@ -1041,6 +1047,106 @@ export const RenderExportQaWorkspace: React.FC<RenderExportQaWorkspaceProps> = (
                 </div>
               )}
             </div>
+          </div>
+        </div>
+
+        {/* Mobile Editor Verified Compatibility Matrix */}
+        <div className="p-4 rounded-xl bg-zinc-900/80 border border-zinc-800 space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800/80 pb-3">
+            <div>
+              <h2 className="text-xs font-semibold uppercase tracking-wider text-zinc-200 flex items-center gap-2">
+                <Smartphone className="w-3.5 h-3.5 text-sky-400" />
+                Mobile Editor Verified Compatibility Matrix ({compatibilityMatrix.length} Verified Targets)
+              </h2>
+              <p className="text-[11px] text-zinc-400 mt-0.5">
+                Target-app version, verified project format, editable vs unsupported properties, dependencies, and last import test evidence. Forging file extensions is strictly prohibited.
+              </p>
+            </div>
+            <span className="px-2 py-0.5 rounded text-[10px] font-mono bg-emerald-500/10 text-emerald-300 border border-emerald-500/20">
+              Source of Truth: Canonical v2.0.0
+            </span>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+            {compatibilityMatrix.map((rec) => (
+              <div
+                key={rec.adapterId}
+                className="p-3.5 rounded-lg bg-zinc-950/70 border border-zinc-800/80 flex flex-col justify-between space-y-3"
+              >
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-bold text-white">
+                      {rec.displayName}
+                    </span>
+                    <span
+                      className={`px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase ${
+                        rec.verificationBadge === 'Verified'
+                          ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30'
+                          : rec.verificationBadge === 'Tested subset'
+                          ? 'bg-sky-500/15 text-sky-300 border border-sky-500/30'
+                          : 'bg-amber-500/15 text-amber-300 border border-amber-500/30'
+                      }`}
+                    >
+                      {rec.verificationBadge}
+                    </span>
+                  </div>
+
+                  <div className="text-[11px] text-zinc-300 space-y-0.5">
+                    <div>
+                      <span className="text-zinc-500">Target App:</span> {rec.targetApp} ({rec.targetAppVersion})
+                    </div>
+                    <div>
+                      <span className="text-zinc-500">Format:</span>{' '}
+                      <span className="font-mono text-zinc-200">{rec.projectFormat}</span>
+                    </div>
+                    <div>
+                      <span className="text-zinc-500">Extension:</span>{' '}
+                      <span className="font-mono text-sky-400">{rec.nativeExtension}</span>{' '}
+                      {rec.isMediaHandoffOnly && (
+                        <span className="text-amber-400 text-[10px]">(Media Handoff Only)</span>
+                      )}
+                    </div>
+                  </div>
+
+                  <p className="text-[11px] text-zinc-400 italic">
+                    {rec.honestDisclosure}
+                  </p>
+
+                  <div className="pt-2 border-t border-zinc-800/60 space-y-1.5 text-[10px]">
+                    <div>
+                      <span className="font-semibold text-emerald-400">Editable Properties:</span>{' '}
+                      <span className="text-zinc-300">
+                        {rec.editableProperties.slice(0, 4).join(', ')}
+                        {rec.editableProperties.length > 4 && ` (+${rec.editableProperties.length - 4} more)`}
+                      </span>
+                    </div>
+                    {rec.unsupportedProperties.length > 0 && (
+                      <div>
+                        <span className="font-semibold text-rose-400">Unsupported:</span>{' '}
+                        <span className="text-zinc-400">
+                          {rec.unsupportedProperties.join(', ')}
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="pt-2 border-t border-zinc-800/80 flex items-center justify-between text-[10px] text-zinc-400">
+                  <span className="font-mono">
+                    Tested: {rec.lastSuccessfulImportTest.testDate}
+                  </span>
+                  <span
+                    className={`font-semibold ${
+                      rec.lastSuccessfulImportTest.status === 'Passed'
+                        ? 'text-emerald-400'
+                        : 'text-amber-400'
+                    }`}
+                  >
+                    Import Test: {rec.lastSuccessfulImportTest.status}
+                  </span>
+                </div>
+              </div>
+            ))}
           </div>
         </div>
 
