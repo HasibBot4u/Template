@@ -99,11 +99,25 @@ export function classifyLocalSnapshotStore(options?: {
   return allowed ? 'configured-shared-filesystem' : 'development-test-only';
 }
 
+let durableSnapshotWriterBlocked = false;
+
+export function setDurableSnapshotWriterBlocked(blocked: boolean): void {
+  durableSnapshotWriterBlocked = Boolean(blocked);
+}
+
+export function isDurableSnapshotWriterBlocked(): boolean {
+  return durableSnapshotWriterBlocked;
+}
+
 export function saveDurableSnapshot(
   filePath: string | null | undefined,
-  snapshot: DurableStoreSnapshot
-): void {
-  if (!filePath) return;
+  snapshot: DurableStoreSnapshot,
+  options?: { bypassCutoverGate?: boolean }
+): boolean {
+  if (!filePath) return false;
+  if (durableSnapshotWriterBlocked && !options?.bypassCutoverGate) {
+    return false;
+  }
   try {
     const dir = path.dirname(filePath);
     if (!fs.existsSync(dir)) {
@@ -117,8 +131,10 @@ export function saveDurableSnapshot(
     const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}`;
     fs.writeFileSync(tmpPath, JSON.stringify(enrichedSnapshot, null, 2), 'utf8');
     fs.renameSync(tmpPath, filePath);
+    return true;
   } catch (err) {
     console.error('[DurableStore] Failed to persist state snapshot:', err);
+    return false;
   }
 }
 

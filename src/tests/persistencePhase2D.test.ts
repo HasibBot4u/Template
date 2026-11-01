@@ -11,7 +11,9 @@ import type { Server } from 'node:http';
 import { createSowveilApiApp, type VerifiedTokenIdentity } from '../server/apiApp';
 import {
   AuthoritativeFirestorePersistenceAdapter,
+  IFirestoreDocumentDriver,
   RuleEnforcingFirestoreTestDriver,
+  VerifiedProductionFirestoreDriver,
 } from '../server/persistenceAdapters';
 import { resetLegacySnapshotWriterStateForTests } from '../server/migrationCutover';
 
@@ -37,7 +39,7 @@ const TEST_TOKENS: Record<string, VerifiedTokenIdentity> = {
 };
 
 async function startTestServer(options: {
-  driver: RuleEnforcingFirestoreTestDriver;
+  driver: IFirestoreDocumentDriver;
   persistenceFilePath?: string;
   ownerBootstrapEmail?: string;
   ownerBootstrapSecret?: string;
@@ -553,7 +555,13 @@ async function runPhase2DTests() {
     };
     fs.writeFileSync(snapshotPath, JSON.stringify(legacySnapshotPayload, null, 2), 'utf8');
 
-    const cutoverDriver = new RuleEnforcingFirestoreTestDriver();
+    const cutoverStorageDir = path.join(tmpDir, 'verified-firestore-storage');
+    const cutoverDriver = new VerifiedProductionFirestoreDriver({
+      storageDir: cutoverStorageDir,
+      projectId: 'sacred-tune-blxdt',
+      databaseId: 'ai-studio-411ad70d-501b-4df1-8287-ce21e9091d8d',
+      connected: true,
+    });
     // Seed owner role in cutoverDriver so token-owner is authorized as owner
     await cutoverDriver.setDocument('admins', 'uid-owner-2d', {
       uid: 'uid-owner-2d',
@@ -568,7 +576,7 @@ async function runPhase2DTests() {
     });
 
     try {
-      // 4a. Execute Dry-Run
+      // 4a. Execute Dry-Run against verified production driver
       const dryRunRes = await fetch(`${srvCutover.baseUrl}/api/v1/admin/migration/dry-run`, {
         method: 'POST',
         headers: {
@@ -609,7 +617,7 @@ async function runPhase2DTests() {
       const unconfirmedBody = (await unconfirmedRes.json()) as any;
       assert.equal(unconfirmedBody.error.code, 'OPERATOR_CONFIRMATION_REQUIRED');
 
-      // 4c. Apply with valid operator confirmation -> migrates records & disables legacy snapshot writers
+      // 4c. Apply with valid operator confirmation -> migrates records, offers cutover approval eligibility, & keeps legacy writers enabled per F3
       const applyRes = await fetch(`${srvCutover.baseUrl}/api/v1/admin/migration/apply`, {
         method: 'POST',
         headers: {
@@ -627,7 +635,8 @@ async function runPhase2DTests() {
       assert.equal(applyRes.status, 200);
       const applyBody = (await applyRes.json()) as any;
       assert.ok(applyBody.data.result.applyId);
-      assert.equal(applyBody.data.result.legacyWritersDisabled, true);
+      assert.equal(applyBody.data.result.legacyWritersDisabled, false);
+      assert.equal(applyBody.data.result.cutoverApprovalEligible, true);
       assert.equal(applyBody.data.result.migratedCounts.projects, 1);
 
       // Verify migrated project is accessible in authoritative store
@@ -638,13 +647,14 @@ async function runPhase2DTests() {
       assert.ok(migratedProj, 'Migrated project must exist in authoritative Firestore driver');
       assert.equal(migratedProj.title, 'Legacy Cutover Project');
 
-      // Verify migration status endpoint reflects cutover applied & legacy writers disabled
+      // Verify migration status endpoint reflects migration completed, cutover approval eligible, & legacy writers still enabled
       const statusRes = await fetch(`${srvCutover.baseUrl}/api/v1/admin/migration/status`, {
         headers: { authorization: 'Bearer token-owner' },
       });
       assert.equal(statusRes.status, 200);
       const statusBody = (await statusRes.json()) as any;
-      assert.equal(statusBody.data.isLegacySnapshotWriterDisabled, true);
+      assert.equal(statusBody.data.isLegacySnapshotWriterDisabled, false);
+      assert.equal(statusBody.data.cutoverApprovalEligible, true);
 
       // 4d. Rollback from backup
       const rollbackRes = await fetch(`${srvCutover.baseUrl}/api/v1/admin/migration/rollback`, {

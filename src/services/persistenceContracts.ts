@@ -49,6 +49,25 @@ export type PersistenceErrorCode =
   | 'VAULT_SECRET_IN_PUBLIC_DTO_FORBIDDEN'
   | 'STORAGE_NOT_CONFIGURED'
   | 'PRODUCTION_DURABLE_ADAPTER_REQUIRED'
+  | 'MIGRATION_BACKEND_NOT_PRODUCTION_READY'
+  | 'MIGRATION_LOCK_ALREADY_HELD'
+  | 'MIGRATION_PRECONDITIONS_FAILED'
+  | 'MIGRATION_INCOMPLETE_RECORD_FAILURES'
+  | 'DURABLE_PERSISTENCE_FAILED'
+  | 'ID_OWNER_COLLISION'
+  | 'CUTOVER_RECEIPT_MISSING_OR_INELIGIBLE'
+  | 'CUTOVER_PARITY_OR_CHECKSUM_MISMATCH'
+  | 'CUTOVER_UNRESOLVED_FAILURES_PRESENT'
+  | 'CUTOVER_DURABLE_BACKUP_MISSING'
+  | 'CUTOVER_OPERATOR_IDENTITY_REQUIRED'
+  | 'CUTOVER_SECOND_CONFIRMATION_REQUIRED'
+  | 'CUTOVER_CONFIRMATION_TOKEN_INVALID'
+  | 'CUTOVER_CONFIRMATION_TOKEN_EXPIRED'
+  | 'CUTOVER_CONFIRMATION_TOKEN_ALREADY_USED'
+  | 'CUTOVER_ALREADY_COMMITTED'
+  | 'CUTOVER_RECONCILIATION_ACCEPTANCE_FAILED'
+  | 'MAINTENANCE_READ_ONLY_WINDOW_ACTIVE'
+  | 'ROLLBACK_UNSAFE_PRECONDITIONS'
   | 'AUTHORITATIVE_STORE_WRITE_FAILED'
   | 'AUTHORITATIVE_STORE_READ_FAILED'
   | 'BOOTSTRAP_LOCK_ALREADY_CLAIMED';
@@ -82,17 +101,34 @@ export class PersistenceContractError extends Error {
         ? 404
         : params.code === 'REVISION_CONFLICT' ||
           params.code === 'ENTITY_ALREADY_EXISTS' ||
-          params.code === 'BOOTSTRAP_LOCK_ALREADY_CLAIMED'
+          params.code === 'BOOTSTRAP_LOCK_ALREADY_CLAIMED' ||
+          params.code === 'MIGRATION_LOCK_ALREADY_HELD' ||
+          params.code === 'MIGRATION_PRECONDITIONS_FAILED' ||
+          params.code === 'ID_OWNER_COLLISION' ||
+          params.code === 'CUTOVER_RECEIPT_MISSING_OR_INELIGIBLE' ||
+          params.code === 'CUTOVER_PARITY_OR_CHECKSUM_MISMATCH' ||
+          params.code === 'CUTOVER_UNRESOLVED_FAILURES_PRESENT' ||
+          params.code === 'CUTOVER_DURABLE_BACKUP_MISSING' ||
+          params.code === 'CUTOVER_CONFIRMATION_TOKEN_ALREADY_USED' ||
+          params.code === 'CUTOVER_ALREADY_COMMITTED' ||
+          params.code === 'ROLLBACK_UNSAFE_PRECONDITIONS'
         ? 409
         : params.code === 'CROSS_USER_ACCESS_FORBIDDEN' ||
           params.code === 'IMMUTABLE_OWNER_VIOLATION' ||
           params.code === 'IMMUTABLE_IDENTITY_VIOLATION' ||
-          params.code === 'IMMUTABLE_CREATED_AT_VIOLATION'
+          params.code === 'IMMUTABLE_CREATED_AT_VIOLATION' ||
+          params.code === 'CUTOVER_OPERATOR_IDENTITY_REQUIRED'
         ? 403
         : params.code === 'PRODUCTION_DURABLE_ADAPTER_REQUIRED' ||
+          params.code === 'MIGRATION_BACKEND_NOT_PRODUCTION_READY' ||
           params.code === 'AUTHORITATIVE_STORE_WRITE_FAILED' ||
-          params.code === 'AUTHORITATIVE_STORE_READ_FAILED'
+          params.code === 'AUTHORITATIVE_STORE_READ_FAILED' ||
+          params.code === 'DURABLE_PERSISTENCE_FAILED' ||
+          params.code === 'MAINTENANCE_READ_ONLY_WINDOW_ACTIVE'
         ? 503
+        : params.code === 'MIGRATION_INCOMPLETE_RECORD_FAILURES' ||
+          params.code === 'CUTOVER_RECONCILIATION_ACCEPTANCE_FAILED'
+        ? 500
         : 400);
     this.retryable = params.retryable ?? false;
   }
@@ -790,12 +826,14 @@ export interface IProjectPersistenceRepository {
     options?: { expectedRevision?: number; isAdmin?: boolean }
   ): Promise<ProjectLibraryItem>;
   delete(id: string, requesterUid: string, isAdmin?: boolean): Promise<boolean>;
+  listAllForAdmin?(): Promise<ProjectLibraryItem[]>;
 }
 
 export interface IAiDirectorSessionRepository {
   save(session: AiDirectorSessionRecord): Promise<AiDirectorSessionRecord>;
   getById(id: string, requesterUid: string, isAdmin?: boolean): Promise<AiDirectorSessionRecord | null>;
   listByOwner(ownerUid: string): Promise<AiDirectorSessionRecord[]>;
+  listAllForAdmin?(): Promise<AiDirectorSessionRecord[]>;
   delete(id: string, requesterUid: string): Promise<boolean>;
 }
 
@@ -803,6 +841,7 @@ export interface IReferenceLabSessionRepository {
   save(session: ReferenceLabSession): Promise<ReferenceLabSession>;
   getById(id: string, requesterUid: string, isAdmin?: boolean): Promise<ReferenceLabSession | null>;
   listByOwner(ownerUid: string): Promise<ReferenceLabSession[]>;
+  listAllForAdmin?(): Promise<ReferenceLabSession[]>;
   delete(id: string, requesterUid: string): Promise<boolean>;
 }
 
@@ -836,7 +875,11 @@ export interface ICatalogAndVariantRepository {
   listCatalogItems(): Promise<CatalogItem[]>;
   deleteCatalogItem(id: string): Promise<boolean>;
   saveVariant(variant: TemplateVariantInstance): Promise<TemplateVariantInstance>;
-  getVariantById(id: string, requesterUid: string): Promise<TemplateVariantInstance | null>;
+  getVariantById(
+    id: string,
+    requesterUid: string,
+    isAdmin?: boolean
+  ): Promise<TemplateVariantInstance | null>;
   listVariantsByOwner(ownerUid: string, baseTemplateId?: string): Promise<TemplateVariantInstance[]>;
   deleteVariant(id: string, requesterUid: string): Promise<boolean>;
 }
@@ -877,6 +920,11 @@ export interface IRoutingAndExtensionRepository {
     ownerUid: string
   ): Promise<Record<HubTaskType, TaskRoutingProfile> | null>;
   saveExtension(ext: ExtensionPackageRecord): Promise<ExtensionPackageRecord>;
+  getExtensionById?(
+    id: string,
+    requesterUid: string,
+    isAdmin?: boolean
+  ): Promise<ExtensionPackageRecord | null>;
   listExtensionsByOwner(ownerUid: string): Promise<ExtensionPackageRecord[]>;
   deleteExtension(id: string, requesterUid: string): Promise<boolean>;
   appendToolAudit(record: ToolExecutionAuditRecord): Promise<ToolExecutionAuditRecord>;
@@ -894,6 +942,7 @@ export interface IRenderExportJobRepository {
     isAdmin?: boolean
   ): Promise<DurableRenderExportJobRecord | null>;
   listJobsByOwner(ownerUid: string): Promise<DurableRenderExportJobRecord[]>;
+  listAllJobsForAdmin?(): Promise<DurableRenderExportJobRecord[]>;
   deleteJob(id: string, requesterUid: string): Promise<boolean>;
 }
 
@@ -905,6 +954,8 @@ export interface IUserAndSystemGovernanceRepository {
   removeFavorite(uid: string, itemId: string): Promise<string[]>;
   getRole(uid: string): Promise<UserRole>;
   setRole(uid: string, role: UserRole, grantedByUid: string): Promise<void>;
+  listRoles?(): Promise<Record<string, UserRole>>;
+  countActiveOwners?(): Promise<number>;
   getAccountStatus(uid: string): Promise<AccountStatus>;
   setAccountStatus(uid: string, status: AccountStatus): Promise<void>;
   getOwnerBootstrapLock(): Promise<OwnerBootstrapLockDto | null>;
@@ -922,12 +973,353 @@ export type PersistenceAdapterKind =
   | 'local-json-snapshot-dev-only'
   | 'local-json-snapshot-shared-fs';
 
+export interface DatabaseConnectivityCheckResult {
+  connected: boolean;
+  isProductionReadyDriver: boolean;
+  isTestOrInMemoryDriver: boolean;
+  isLocalSnapshotAdapter: boolean;
+  databaseId: string | null;
+  projectId: string | null;
+  expectedDatabaseId: string;
+  databaseIdentityVerified: boolean;
+  readWriteProbeVerified: boolean;
+  blockerCode: PersistenceErrorCode | null;
+  blockerMessage: string | null;
+  checkedAt: string;
+}
+
+export interface DurableMigrationDryRunRecordDto {
+  id: string;
+  dryRunId: string;
+  generatedAt: string;
+  expiresAtMs: number;
+  confirmationTokenHash: string;
+  canSafelyApply: boolean;
+  consumedAt: string | null;
+  consumedByApplyId: string | null;
+  sourceSnapshotPath: string;
+  sourceSnapshotSha256: string;
+  backupPath: string | null;
+  backupSha256: string | null;
+  durableBackupId?: string | null;
+  recoveryReportId?: string | null;
+  reviewedByUid?: string | null;
+  totalRecordsToMigrate: number;
+  reportJson: string;
+}
+
+export interface DurableMigrationBackupDto {
+  id: string;
+  backupId: string;
+  dryRunId: string;
+  createdAt: string;
+  createdByUid: string;
+  sourceSnapshotPath: string;
+  sourceSnapshotSha256: string;
+  backupSha256: string;
+  byteSize: number;
+  accessControlScope: 'server-only-owner-admin';
+  destinationKind: 'firestore-server-only-vault' | 'external-durable-filesystem';
+  externalFilePath: string | null;
+  entityCounts: Record<string, number>;
+  sanitizedSnapshotJson: string;
+  verifiedReadAfterWrite: boolean;
+}
+
+export interface MigrationRecoveryIssueItem {
+  entity: string;
+  recordId: string;
+  ownerUid: string | null;
+  issueCode:
+    | 'MALFORMED_RECORD'
+    | 'MISSING_OWNER_UID'
+    | 'DUPLICATE_RECORD_ID'
+    | 'ID_OWNER_COLLISION'
+    | 'UNREADABLE_VAULT_CIPHERTEXT'
+    | 'VAULT_REQUIRES_KEY_REENTRY';
+  reason: string;
+  remediationAction: string;
+  safeMetadata?: Record<string, string | number | boolean | null>;
+}
+
+export interface DurableMigrationRecoveryReportDto {
+  id: string;
+  recoveryId: string;
+  dryRunId: string;
+  generatedAt: string;
+  containsSecrets: false;
+  totalIssueCount: number;
+  unresolvedMalformedCount: number;
+  unreadableVaultCount: number;
+  requiresReentryVaultCount: number;
+  duplicateIdCount: number;
+  idOwnerCollisionCount: number;
+  issues: MigrationRecoveryIssueItem[];
+  recoveryFilePath: string | null;
+}
+
+export type MigrationLedgerRecordStatus =
+  | 'migrated'
+  | 'skipped-newer-target'
+  | 'skipped-already-migrated'
+  | 'collision-blocked'
+  | 'failed';
+
+export interface DurableMigrationLedgerEntryDto {
+  id: string;
+  dryRunId: string;
+  applyId: string;
+  batchIndex: number;
+  entity: string;
+  recordId: string;
+  ownerUid: string;
+  sourceRevision: number | null;
+  targetRevisionBefore: number | null;
+  targetRevisionAfter: number | null;
+  sourceUpdatedAt: string | null;
+  targetUpdatedAtBefore: string | null;
+  sourceCanonicalHash: string;
+  targetCanonicalHash: string | null;
+  status: MigrationLedgerRecordStatus;
+  verifiedReadAfterWrite: boolean;
+  errorCode: string | null;
+  errorMessage: string | null;
+  recordedAt: string;
+}
+
+export interface CrossEntityReferenceVerificationResult {
+  passed: boolean;
+  checkedReferencesCount: number;
+  ownerReferencesVerified: number;
+  variantTemplateReferencesVerified: number;
+  sessionProjectReferencesVerified: number;
+  renderJobProjectReferencesVerified: number;
+  providerVaultReferencesVerified: number;
+  failures: Array<{
+    sourceEntity: string;
+    sourceRecordId: string;
+    targetEntity: string;
+    targetRecordId: string;
+    reason: string;
+  }>;
+}
+
+export interface AppLevelLookupVerificationResult {
+  passed: boolean;
+  checkedCounts: Record<string, number>;
+  totalLookupsVerified: number;
+  failures: Array<{
+    entity: string;
+    recordId: string;
+    reason: string;
+  }>;
+}
+
+export interface DurableMigrationLockDto {
+  id: 'migrationCutover';
+  locked: boolean;
+  lockId: string;
+  dryRunId: string;
+  acquiredAt: string;
+  expiresAtMs: number;
+}
+
+export interface DurableMigrationRecordFailureDto {
+  entity: string;
+  recordId: string;
+  ownerUid?: string;
+  operation: 'validate' | 'write' | 'read-after-write' | 'parity' | 'collision-check' | 'cross-reference' | 'app-lookup';
+  errorCode: string;
+  message: string;
+}
+
+export interface DurableMigrationProgressDto {
+  id: string;
+  dryRunId: string;
+  status: 'in-progress' | 'completed' | 'failed-incomplete';
+  startedAt: string;
+  updatedAt: string;
+  completedRecordKeys: string[];
+  skippedNewerTargetKeys?: string[];
+  migratedCounts: Record<string, number>;
+  skippedNewerTargetCounts?: Record<string, number>;
+  totalMigrated: number;
+  expectedTotalRecords: number;
+  batchSize?: number;
+  batchesExecuted?: number;
+  failedRecords: DurableMigrationRecordFailureDto[];
+  parityVerified: boolean;
+  crossReferencesVerified?: boolean;
+  appLookupsVerified?: boolean;
+  sourceChecksum?: string;
+  targetChecksum?: string;
+  cutoverApprovalEligible?: boolean;
+  legacyWritersDisabled: boolean;
+}
+
+export interface DurableMigrationReceiptDto {
+  id: string;
+  applyId: string;
+  dryRunId: string;
+  appliedAt: string;
+  sourceSnapshotPath: string;
+  backupPath: string;
+  durableBackupId?: string | null;
+  sourceChecksum?: string;
+  targetChecksum?: string;
+  migratedCounts: Record<string, number>;
+  skippedNewerTargetCounts?: Record<string, number>;
+  totalMigrated: number;
+  legacyWritersDisabled: boolean;
+  cutoverApprovalEligible?: boolean;
+  authoritativeAdapterKind: string;
+  databaseId: string;
+  parityVerified: boolean;
+  crossReferencesVerified?: boolean;
+  appLookupsVerified?: boolean;
+  rollbackInstructions: string;
+  receiptSha256: string;
+}
+
+export interface DurableFinalCutoverProposalDto {
+  id: string;
+  proposalId: string;
+  applyId: string;
+  dryRunId: string;
+  durableBackupId: string | null;
+  backupPath: string;
+  sourceChecksum: string;
+  targetChecksum: string;
+  totalRecordsVerified: number;
+  entityCounts: Record<string, number>;
+  operatorUid: string;
+  operatorEmail: string;
+  adapterIdentity: string;
+  databaseId: string;
+  projectId: string | null;
+  releaseCommit: string;
+  reconciliationStrategy: 'maintenance-read-only-window' | 'dual-write-outbox-reconcile';
+  generatedAt: string;
+  expiresAtMs: number;
+  secondConfirmationTokenHash: string;
+  canSafelyCutover: boolean;
+  consumedAt: string | null;
+  consumedByCutoverId: string | null;
+}
+
+export interface DurableFinalCutoverReceiptDto {
+  id: string;
+  cutoverId: string;
+  proposalId: string;
+  applyId: string;
+  dryRunId: string;
+  durableBackupId: string | null;
+  backupPath: string;
+  cutoverTimestamp: string;
+  releaseCommit: string;
+  operatorUid: string;
+  operatorEmail: string;
+  adapterIdentity: string;
+  databaseId: string;
+  projectId: string | null;
+  reconciliationStrategy: 'maintenance-read-only-window' | 'dual-write-outbox-reconcile';
+  entityCounts: Record<string, number>;
+  totalRecordsVerified: number;
+  reconciledDeltaRecordsCount: number;
+  sourceChecksum: string;
+  targetChecksum: string;
+  readAfterWriteParityPassed: boolean;
+  applicationAcceptancePassed: boolean;
+  legacyWritersDisabled: true;
+  rollbackInstructions: string;
+  receiptSha256: string;
+}
+
+export interface DurableCutoverStateDto {
+  id: 'cutoverState';
+  isLegacySnapshotWriterDisabled: boolean;
+  cutoverApprovalEligible?: boolean;
+  maintenanceReadOnlyWindowActive?: boolean;
+  maintenanceWindowStartedAt?: string | null;
+  maintenanceWindowReason?: string | null;
+  lastDryRunId: string | null;
+  lastAppliedId: string | null;
+  lastAppliedAt: string | null;
+  lastCutoverId?: string | null;
+  lastCutoverTimestamp?: string | null;
+  lastCutoverOperatorUid?: string | null;
+  lastReleaseCommit?: string | null;
+  lastRollbackId?: string | null;
+  lastRolledBackAt?: string | null;
+  lastMigrationStatus:
+    | 'none'
+    | 'dry-run-ready'
+    | 'dry-run-blocked'
+    | 'in-progress'
+    | 'completed'
+    | 'cutover-committed'
+    | 'failed-incomplete'
+    | 'rolled-back';
+  updatedAt: string;
+}
+
+export interface IMigrationStateRepository {
+  saveDryRunRecord(record: DurableMigrationDryRunRecordDto): Promise<DurableMigrationDryRunRecordDto>;
+  getDryRunRecord(dryRunId: string): Promise<DurableMigrationDryRunRecordDto | null>;
+  consumeDryRunTokenAtomically(
+    dryRunId: string,
+    confirmationTokenHash: string,
+    applyId: string,
+    nowMs: number
+  ): Promise<{
+    ok: boolean;
+    reason?: 'NOT_FOUND' | 'INVALID_TOKEN' | 'EXPIRED_TOKEN' | 'ALREADY_USED' | 'PRECONDITIONS_NOT_MET';
+    record?: DurableMigrationDryRunRecordDto;
+  }>;
+  acquireMigrationLock(dryRunId: string, ttlMs?: number): Promise<DurableMigrationLockDto>;
+  releaseMigrationLock(lockId: string): Promise<void>;
+  getMigrationLock(): Promise<DurableMigrationLockDto | null>;
+  saveMigrationProgress(progress: DurableMigrationProgressDto): Promise<DurableMigrationProgressDto>;
+  getMigrationProgress(dryRunId: string): Promise<DurableMigrationProgressDto | null>;
+  saveMigrationReceipt(receipt: DurableMigrationReceiptDto): Promise<DurableMigrationReceiptDto>;
+  getMigrationReceipt?(applyId: string): Promise<DurableMigrationReceiptDto | null>;
+  getLatestMigrationReceipt(): Promise<DurableMigrationReceiptDto | null>;
+  getCutoverState(): Promise<DurableCutoverStateDto | null>;
+  saveCutoverState(state: DurableCutoverStateDto): Promise<DurableCutoverStateDto>;
+  saveDurableBackup?(backup: DurableMigrationBackupDto): Promise<DurableMigrationBackupDto>;
+  getDurableBackup?(backupId: string): Promise<DurableMigrationBackupDto | null>;
+  saveRecoveryReport?(report: DurableMigrationRecoveryReportDto): Promise<DurableMigrationRecoveryReportDto>;
+  getRecoveryReport?(dryRunId: string): Promise<DurableMigrationRecoveryReportDto | null>;
+  saveLedgerEntry?(entry: DurableMigrationLedgerEntryDto): Promise<DurableMigrationLedgerEntryDto>;
+  listLedgerEntries?(dryRunId: string): Promise<DurableMigrationLedgerEntryDto[]>;
+  saveCutoverProposal?(proposal: DurableFinalCutoverProposalDto): Promise<DurableFinalCutoverProposalDto>;
+  getCutoverProposal?(proposalId: string): Promise<DurableFinalCutoverProposalDto | null>;
+  consumeCutoverProposalTokenAtomically?(
+    proposalId: string,
+    secondConfirmationTokenHash: string,
+    cutoverId: string,
+    nowMs: number
+  ): Promise<{
+    ok: boolean;
+    reason?: 'NOT_FOUND' | 'INVALID_TOKEN' | 'EXPIRED_TOKEN' | 'ALREADY_USED' | 'PRECONDITIONS_NOT_MET';
+    proposal?: DurableFinalCutoverProposalDto;
+  }>;
+  saveFinalCutoverReceipt?(receipt: DurableFinalCutoverReceiptDto): Promise<DurableFinalCutoverReceiptDto>;
+  getLatestFinalCutoverReceipt?(): Promise<DurableFinalCutoverReceiptDto | null>;
+}
+
 export interface PersistenceReadinessReport {
   readyForProductionTraffic: boolean;
   status: 'ready' | 'development-only' | 'blocked';
   activeAdapterKind: PersistenceAdapterKind;
   authoritativeStoreLabel: string;
   isDevelopmentOrTestOnly: boolean;
+  isBackedByTestOrInMemoryDriver?: boolean;
+  configuredDatabaseId?: string | null;
+  configuredProjectId?: string | null;
+  authMode?: 'adc-workload-identity' | 'firestore-emulator' | 'test-driver' | 'local-verified-store' | 'unconfigured';
+  readWriteProbeVerified?: boolean;
+  requiredCollectionsVerified?: boolean;
   silentFallbackToMemoryEnabled: false; // Invariant: always false
   cloudStorageEnabled: boolean;
   binaryArtifactPolicy: 'metadata-only-stream-download' | 'cloud-storage-backed';
@@ -940,6 +1332,9 @@ export interface PersistenceReadinessReport {
 export interface ISowveilPersistenceAdapter {
   readonly adapterKind: PersistenceAdapterKind;
   readonly isDevelopmentOrTestOnly: boolean;
+  readonly isBackedByTestOrInMemoryDriver?: boolean;
+  readonly configuredDatabaseId?: string | null;
+  readonly configuredProjectId?: string | null;
   readonly silentFallbackToMemoryEnabled: false;
 
   readonly projects: IProjectPersistenceRepository;
@@ -952,6 +1347,9 @@ export interface ISowveilPersistenceAdapter {
   readonly routingAndExtensions: IRoutingAndExtensionRepository;
   readonly renderExportJobs: IRenderExportJobRepository;
   readonly governance: IUserAndSystemGovernanceRepository;
+  readonly migrationState?: IMigrationStateRepository;
 
   getReadinessReport(): PersistenceReadinessReport;
+  checkProductionReadinessAsync?(expectedDatabaseId?: string): Promise<PersistenceReadinessReport>;
+  verifyDatabaseConnectivity?(expectedDatabaseId?: string): Promise<DatabaseConnectivityCheckResult>;
 }

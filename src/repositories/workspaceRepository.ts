@@ -30,6 +30,12 @@ import {
   handleFirestoreError,
   OperationType,
 } from '../services/firebaseClient';
+import { executeAuthenticatedApiRequest, ApiRequestOptions } from '../services/apiClient';
+import {
+  deserializeProjectFromFirestoreDto,
+  ProjectFirestoreDto,
+  serializeProjectToFirestoreDto,
+} from '../services/persistenceContracts';
 
 export interface IWorkspaceRepository {
   readonly modeLabel: string;
@@ -105,11 +111,51 @@ function sanitizeFirestoreId(raw: string): string {
 /**
  * Production Cloud Firestore Repository.
  * Never falls back to localStorage for private user data.
- * Requires an authenticated Firebase user (request.auth.uid).
+ * Prefers server-mediated API operations (/api/v1/*) for canonical project and user records,
+ * and uses identical collection paths, stable document IDs, and DTO schemas when accessing Firestore directly.
  */
 export class FirestoreWorkspaceRepository implements IWorkspaceRepository {
   public readonly modeLabel =
-    'Cloud Firestore (sacred-tune-blxdt · RBAC & Rules Enforced)';
+    'Cloud Firestore (sacred-tune-blxdt · Authoritative Server & Rules Enforced)';
+
+  private apiTransportOverride: {
+    baseUrl?: string;
+    getAuthToken?: ApiRequestOptions['getAuthToken'];
+    fetchImpl?: ApiRequestOptions['fetchImpl'];
+  } | null = null;
+
+  public configureServerApiTransport(
+    config: {
+      baseUrl?: string;
+      getAuthToken?: ApiRequestOptions['getAuthToken'];
+      fetchImpl?: ApiRequestOptions['fetchImpl'];
+    } | null
+  ): void {
+    this.apiTransportOverride = config;
+  }
+
+  private shouldUseServerApi(): boolean {
+    if (this.apiTransportOverride) return true;
+    return typeof window !== 'undefined' && typeof globalThis.fetch === 'function';
+  }
+
+  private async callServerApi<T>(
+    path: string,
+    options: Omit<ApiRequestOptions, 'getAuthToken' | 'fetchImpl'> = {}
+  ): Promise<ReturnType<typeof executeAuthenticatedApiRequest<T>>> {
+    const fullPath = this.apiTransportOverride?.baseUrl
+      ? `${this.apiTransportOverride.baseUrl.replace(/\/$/, '')}${path}`
+      : path;
+    return executeAuthenticatedApiRequest<T>(fullPath, {
+      ...options,
+      ...(this.apiTransportOverride?.getAuthToken
+        ? { getAuthToken: this.apiTransportOverride.getAuthToken }
+        : {}),
+      ...(this.apiTransportOverride?.fetchImpl
+        ? { fetchImpl: this.apiTransportOverride.fetchImpl }
+        : {}),
+    });
+  }
 
   private requireUid(): string {
     const uid = auth.currentUser?.uid;
@@ -120,6 +166,19 @@ export class FirestoreWorkspaceRepository implements IWorkspaceRepository {
   }
 
   public async getFavorites(): Promise<string[]> {
+    if (this.shouldUseServerApi()) {
+      const apiRes = await this.callServerApi<{ items: string[] }>('/api/v1/me/favorites', {
+        method: 'GET',
+      });
+      if (apiRes.ok && apiRes.data && Array.isArray(apiRes.data.items)) {
+        return apiRes.data.items;
+      }
+      if (this.apiTransportOverride && !apiRes.ok && apiRes.status !== 0) {
+        if (apiRes.status === 401) return [];
+        throw new Error(`${apiRes.errorCode || 'API_ERROR'}: ${apiRes.errorMessage}`);
+      }
+    }
+
     const uid = auth.currentUser?.uid;
     if (!uid) return [];
     const favPath = `favorites/${uid}/items`;
@@ -136,8 +195,21 @@ export class FirestoreWorkspaceRepository implements IWorkspaceRepository {
   }
 
   public async addFavorite(itemId: string): Promise<string[]> {
-    const uid = this.requireUid();
     const safeId = sanitizeFirestoreId(itemId);
+    if (this.shouldUseServerApi()) {
+      const apiRes = await this.callServerApi<{ items: string[] }>(
+        `/api/v1/me/favorites/${encodeURIComponent(safeId)}`,
+        { method: 'PUT' }
+      );
+      if (apiRes.ok && apiRes.data && Array.isArray(apiRes.data.items)) {
+        return apiRes.data.items;
+      }
+      if (this.apiTransportOverride && !apiRes.ok && apiRes.status !== 0) {
+        throw new Error(`${apiRes.errorCode || 'API_ERROR'}: ${apiRes.errorMessage}`);
+      }
+    }
+
+    const uid = this.requireUid();
     const favDocPath = `favorites/${uid}/items/${safeId}`;
     const now = new Date().toISOString();
 
@@ -157,8 +229,21 @@ export class FirestoreWorkspaceRepository implements IWorkspaceRepository {
   }
 
   public async removeFavorite(itemId: string): Promise<string[]> {
-    const uid = this.requireUid();
     const safeId = sanitizeFirestoreId(itemId);
+    if (this.shouldUseServerApi()) {
+      const apiRes = await this.callServerApi<{ items: string[] }>(
+        `/api/v1/me/favorites/${encodeURIComponent(safeId)}`,
+        { method: 'DELETE' }
+      );
+      if (apiRes.ok && apiRes.data && Array.isArray(apiRes.data.items)) {
+        return apiRes.data.items;
+      }
+      if (this.apiTransportOverride && !apiRes.ok && apiRes.status !== 0) {
+        throw new Error(`${apiRes.errorCode || 'API_ERROR'}: ${apiRes.errorMessage}`);
+      }
+    }
+
+    const uid = this.requireUid();
     const favDocPath = `favorites/${uid}/items/${safeId}`;
 
     try {
@@ -173,13 +258,29 @@ export class FirestoreWorkspaceRepository implements IWorkspaceRepository {
   }
 
   public async listProjects(): Promise<ProjectLibraryItem[]> {
+    if (this.shouldUseServerApi()) {
+      const apiRes = await this.callServerApi<{ items: ProjectLibraryItem[] }>(
+        '/api/v1/projects?limit=100&offset=0',
+        { method: 'GET' }
+      );
+      if (apiRes.ok && apiRes.data && Array.isArray(apiRes.data.items)) {
+        return apiRes.data.items;
+      }
+      if (this.apiTransportOverride && !apiRes.ok && apiRes.status !== 0) {
+        if (apiRes.status === 401) return [];
+        throw new Error(`${apiRes.errorCode || 'API_ERROR'}: ${apiRes.errorMessage}`);
+      }
+    }
+
     const uid = auth.currentUser?.uid;
     if (!uid) return [];
     const path = 'projects';
     try {
       const q = query(collection(db, 'projects'), where('ownerUid', '==', uid));
       const snap = await getDocs(q);
-      const list = snap.docs.map((d) => d.data() as ProjectLibraryItem);
+      const list = snap.docs.map(
+        (d) => deserializeProjectFromFirestoreDto(d.data() as ProjectFirestoreDto).project
+      );
       return list.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
     } catch (err) {
       handleFirestoreError(err, OperationType.LIST, path);
@@ -188,17 +289,18 @@ export class FirestoreWorkspaceRepository implements IWorkspaceRepository {
 
   public async seedStarterProjectsForUserIfEmpty(): Promise<ProjectLibraryItem[]> {
     const uid = auth.currentUser?.uid;
-    if (!uid) return [];
+    if (!uid && !this.apiTransportOverride) return [];
     const current = await this.listProjects();
     if (current.length > 0) return current;
 
+    const effectiveUid = uid || 'user-seeded';
     const now = new Date().toISOString();
     const created: ProjectLibraryItem[] = [];
     for (const seed of SEED_PROJECT_LIBRARY.slice(0, 4)) {
-      const projId = sanitizeFirestoreId(`${uid.slice(0, 8)}_${seed.id}`);
+      const projId = sanitizeFirestoreId(`${effectiveUid.slice(0, 8)}_${seed.id}`);
       const payload: ProjectLibraryItem = {
         id: projId,
-        ownerUid: uid,
+        ownerUid: effectiveUid,
         title: seed.title.slice(0, 160),
         description: seed.description.slice(0, 2000),
         compCount: seed.compCount,
@@ -216,8 +318,8 @@ export class FirestoreWorkspaceRepository implements IWorkspaceRepository {
         updatedAt: now,
       };
       try {
-        await setDoc(doc(db, 'projects', projId), payload);
-        created.push(payload);
+        const saved = await this.createProject(payload);
+        created.push(saved);
       } catch (err) {
         handleFirestoreError(err, OperationType.CREATE, `projects/${projId}`);
       }
@@ -231,9 +333,6 @@ export class FirestoreWorkspaceRepository implements IWorkspaceRepository {
       createdAt?: string;
     }
   ): Promise<ProjectLibraryItem> {
-    const uid = this.requireUid();
-    const now = new Date().toISOString();
-
     if (
       input.description?.includes('blob:') ||
       input.title?.includes('blob:')
@@ -262,6 +361,27 @@ export class FirestoreWorkspaceRepository implements IWorkspaceRepository {
     const projId = sanitizeFirestoreId(
       candidateId || `proj_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
     );
+
+    if (this.shouldUseServerApi()) {
+      const apiRes = await this.callServerApi<ProjectLibraryItem>('/api/v1/projects', {
+        method: 'POST',
+        body: {
+          ...input,
+          id: projId,
+          revision: initialRevision,
+          ...(syncedCanonicalJson ? { canonicalProjectJson: syncedCanonicalJson } : {}),
+        },
+      });
+      if (apiRes.ok && apiRes.data) {
+        return apiRes.data;
+      }
+      if (apiRes.status !== 0) {
+        throw new Error(`${apiRes.errorCode || 'API_ERROR'}: ${apiRes.errorMessage}`);
+      }
+    }
+
+    const uid = this.requireUid();
+    const now = new Date().toISOString();
 
     if (syncedCanonicalJson) {
       try {
@@ -307,8 +427,9 @@ export class FirestoreWorkspaceRepository implements IWorkspaceRepository {
     };
 
     try {
-      await setDoc(doc(db, 'projects', projId), record);
-      return record;
+      const dto = serializeProjectToFirestoreDto(record);
+      await setDoc(doc(db, 'projects', projId), dto);
+      return deserializeProjectFromFirestoreDto(dto).project;
     } catch (err) {
       handleFirestoreError(err, OperationType.CREATE, `projects/${projId}`);
     }
@@ -318,8 +439,28 @@ export class FirestoreWorkspaceRepository implements IWorkspaceRepository {
     id: string,
     patch: Partial<ProjectLibraryItem> & { expectedRevision?: number }
   ): Promise<ProjectLibraryItem> {
-    const uid = this.requireUid();
     const safeId = sanitizeFirestoreId(id);
+
+    if (this.shouldUseServerApi()) {
+      const apiRes = await this.callServerApi<ProjectLibraryItem>(
+        `/api/v1/projects/${encodeURIComponent(safeId)}`,
+        {
+          method: 'PATCH',
+          body: patch,
+        }
+      );
+      if (apiRes.ok && apiRes.data) {
+        return apiRes.data;
+      }
+      if (apiRes.status === 409 || apiRes.errorCode === 'REVISION_CONFLICT') {
+        throw new Error(`REVISION_CONFLICT: ${apiRes.errorMessage || 'Stale project revision'}`);
+      }
+      if (apiRes.status !== 0) {
+        throw new Error(`${apiRes.errorCode || 'API_ERROR'}: ${apiRes.errorMessage}`);
+      }
+    }
+
+    const uid = this.requireUid();
     const docRef = doc(db, 'projects', safeId);
     const now = new Date().toISOString();
 
@@ -328,7 +469,9 @@ export class FirestoreWorkspaceRepository implements IWorkspaceRepository {
       if (!snap.exists()) {
         throw new Error(`Project "${safeId}" not found`);
       }
-      const existing = snap.data() as ProjectLibraryItem;
+      const existing = deserializeProjectFromFirestoreDto(
+        snap.data() as ProjectFirestoreDto
+      ).project;
       const existingRev = existing.revision || 1;
       if (
         patch.expectedRevision !== undefined &&
@@ -344,58 +487,67 @@ export class FirestoreWorkspaceRepository implements IWorkspaceRepository {
           ? Math.floor(patch.revision)
           : existingRev + 1;
 
-      const updatePayload: Record<string, unknown> = {
-        updatedAt: now,
+      const merged: ProjectLibraryItem = {
+        ...existing,
+        ...(patch.title !== undefined ? { title: patch.title.trim().slice(0, 160) } : {}),
+        ...(patch.description !== undefined
+          ? { description: patch.description.trim().slice(0, 2000) }
+          : {}),
+        ...(patch.compCount !== undefined ? { compCount: patch.compCount } : {}),
+        ...(patch.projectFileStatus !== undefined
+          ? { projectFileStatus: patch.projectFileStatus }
+          : {}),
+        ...(patch.fileSizeBytes !== undefined ? { fileSizeBytes: patch.fileSizeBytes } : {}),
+        ...(patch.fileSizeLabel !== undefined
+          ? { fileSizeLabel: patch.fileSizeLabel.slice(0, 80) }
+          : {}),
+        ...(patch.resolution !== undefined ? { resolution: patch.resolution } : {}),
+        ...(patch.durationLabel !== undefined ? { durationLabel: patch.durationLabel } : {}),
+        ...(patch.fps !== undefined ? { fps: patch.fps } : {}),
+        ...(patch.aeVersion !== undefined ? { aeVersion: patch.aeVersion } : {}),
+        ...(patch.targetEditor !== undefined ? { targetEditor: patch.targetEditor } : {}),
+        ...(patch.aspectRatio !== undefined ? { aspectRatio: patch.aspectRatio } : {}),
+        ...(patch.sowveilSpecJson !== undefined
+          ? { sowveilSpecJson: patch.sowveilSpecJson.slice(0, 15000) }
+          : {}),
+        ...(patch.activeBranch !== undefined
+          ? { activeBranch: patch.activeBranch.slice(0, 64) }
+          : {}),
+        ...(patch.checkpoints !== undefined
+          ? { checkpoints: patch.checkpoints.slice(0, 20) }
+          : {}),
+        ...(patch.hasExternalFootageWarning !== undefined
+          ? { hasExternalFootageWarning: Boolean(patch.hasExternalFootageWarning) }
+          : {}),
+        ...(patch.archived !== undefined ? { archived: Boolean(patch.archived) } : {}),
+        ...(patch.lastOpenedAt !== undefined ? { lastOpenedAt: patch.lastOpenedAt } : {}),
+        ...(patch.tags !== undefined
+          ? { tags: patch.tags.slice(0, 20).map((t) => String(t).slice(0, 64)) }
+          : {}),
+        ownerUid: existing.ownerUid || uid,
         revision: nextRevision,
+        updatedAt: now,
       };
-      if (patch.title !== undefined) updatePayload.title = patch.title.trim().slice(0, 160);
-      if (patch.description !== undefined)
-        updatePayload.description = patch.description.trim().slice(0, 2000);
-      if (patch.compCount !== undefined) updatePayload.compCount = patch.compCount;
-      if (patch.projectFileStatus !== undefined)
-        updatePayload.projectFileStatus = patch.projectFileStatus;
-      if (patch.fileSizeBytes !== undefined) updatePayload.fileSizeBytes = patch.fileSizeBytes;
-      if (patch.fileSizeLabel !== undefined)
-        updatePayload.fileSizeLabel = patch.fileSizeLabel.slice(0, 80);
-      if (patch.resolution !== undefined) updatePayload.resolution = patch.resolution;
-      if (patch.durationLabel !== undefined) updatePayload.durationLabel = patch.durationLabel;
-      if (patch.fps !== undefined) updatePayload.fps = patch.fps;
-      if (patch.aeVersion !== undefined) updatePayload.aeVersion = patch.aeVersion;
-      if (patch.targetEditor !== undefined) updatePayload.targetEditor = patch.targetEditor;
-      if (patch.aspectRatio !== undefined) updatePayload.aspectRatio = patch.aspectRatio;
-      if (patch.sowveilSpecJson !== undefined)
-        updatePayload.sowveilSpecJson = patch.sowveilSpecJson.slice(0, 15000);
+
       if (patch.canonicalProjectJson !== undefined) {
         let syncedJson = patch.canonicalProjectJson;
         try {
           const parsed = JSON.parse(syncedJson) as Record<string, unknown>;
           parsed.id = safeId;
-          parsed.ownerUid = existing.ownerUid || uid;
-          parsed.title = (updatePayload.title as string) || existing.title;
+          parsed.ownerUid = merged.ownerUid;
+          parsed.title = merged.title;
           parsed.revision = nextRevision;
           parsed.updatedAt = now;
           syncedJson = JSON.stringify(parsed);
         } catch {
           // Keep raw string if unparseable
         }
-        updatePayload.canonicalProjectJson = syncedJson.slice(0, 200000);
+        merged.canonicalProjectJson = syncedJson.slice(0, 200000);
       }
-      if (patch.activeBranch !== undefined)
-        updatePayload.activeBranch = patch.activeBranch.slice(0, 64);
-      if (patch.checkpoints !== undefined)
-        updatePayload.checkpoints = patch.checkpoints.slice(0, 20);
-      if (patch.hasExternalFootageWarning !== undefined)
-        updatePayload.hasExternalFootageWarning = Boolean(patch.hasExternalFootageWarning);
-      if (patch.archived !== undefined) updatePayload.archived = Boolean(patch.archived);
-      if (patch.lastOpenedAt !== undefined) updatePayload.lastOpenedAt = patch.lastOpenedAt;
-      if (patch.tags !== undefined)
-        updatePayload.tags = patch.tags.slice(0, 20).map((t) => String(t).slice(0, 64));
 
-      await updateDoc(docRef, updatePayload);
-      return {
-        ...existing,
-        ...(updatePayload as Partial<ProjectLibraryItem>),
-      };
+      const dto = serializeProjectToFirestoreDto(merged);
+      await setDoc(docRef, dto);
+      return deserializeProjectFromFirestoreDto(dto).project;
     } catch (err) {
       if (err instanceof Error && err.message.startsWith('REVISION_CONFLICT:')) {
         throw err;
@@ -405,25 +557,52 @@ export class FirestoreWorkspaceRepository implements IWorkspaceRepository {
   }
 
   public async upsertProjectRecord(project: ProjectLibraryItem): Promise<ProjectLibraryItem> {
+    const safeId = sanitizeFirestoreId(project.id);
+    if (this.shouldUseServerApi()) {
+      const apiRes = await this.callServerApi<ProjectLibraryItem>('/api/v1/projects', {
+        method: 'POST',
+        body: {
+          ...project,
+          id: safeId,
+        },
+      });
+      if (apiRes.ok && apiRes.data) {
+        return apiRes.data;
+      }
+    }
+
     const uid = auth.currentUser?.uid;
     if (!uid) return project;
-    const safeId = sanitizeFirestoreId(project.id);
     const record: ProjectLibraryItem = {
       ...project,
       id: safeId,
       ownerUid: project.ownerUid || uid,
     };
     try {
-      await setDoc(doc(db, 'projects', safeId), record);
-      return record;
+      const dto = serializeProjectToFirestoreDto(record);
+      await setDoc(doc(db, 'projects', safeId), dto);
+      return deserializeProjectFromFirestoreDto(dto).project;
     } catch {
       return record;
     }
   }
 
   public async deleteProject(id: string): Promise<void> {
-    this.requireUid();
     const safeId = sanitizeFirestoreId(id);
+    if (this.shouldUseServerApi()) {
+      const apiRes = await this.callServerApi<{ deletedId: string }>(
+        `/api/v1/projects/${encodeURIComponent(safeId)}`,
+        { method: 'DELETE' }
+      );
+      if (apiRes.ok) {
+        return;
+      }
+      if (apiRes.status !== 0) {
+        throw new Error(`${apiRes.errorCode || 'API_ERROR'}: ${apiRes.errorMessage}`);
+      }
+    }
+
+    this.requireUid();
     try {
       await deleteDoc(doc(db, 'projects', safeId));
     } catch (err) {
@@ -577,37 +756,93 @@ export class FirestoreWorkspaceRepository implements IWorkspaceRepository {
   }
 
   public async getPreferences(): Promise<UserPreferences> {
+    if (this.shouldUseServerApi()) {
+      const apiRes = await this.callServerApi<UserPreferences>('/api/v1/me/preferences', {
+        method: 'GET',
+      });
+      if (apiRes.ok && apiRes.data) {
+        return {
+          ...DEFAULT_USER_PREFERENCES,
+          ...apiRes.data,
+        };
+      }
+      if (this.apiTransportOverride && !apiRes.ok && apiRes.status !== 0) {
+        if (apiRes.status === 401) return DEFAULT_USER_PREFERENCES;
+        throw new Error(`${apiRes.errorCode || 'API_ERROR'}: ${apiRes.errorMessage}`);
+      }
+    }
+
     const uid = auth.currentUser?.uid;
     if (!uid) return DEFAULT_USER_PREFERENCES;
     try {
-      const snap = await getDoc(doc(db, 'users', uid));
-      if (!snap.exists()) return DEFAULT_USER_PREFERENCES;
-      const prefs = snap.data().preferences || {};
+      const prefSnap = await getDoc(doc(db, 'userPreferences', uid));
+      if (prefSnap.exists()) {
+        const data = prefSnap.data();
+        return {
+          ...DEFAULT_USER_PREFERENCES,
+          reducedMotion:
+            typeof data.reducedMotion === 'boolean'
+              ? data.reducedMotion
+              : DEFAULT_USER_PREFERENCES.reducedMotion,
+          defaultSortOrder:
+            data.defaultSortOrder === 'name' ||
+            data.defaultSortOrder === 'newest' ||
+            data.defaultSortOrder === 'favorites'
+              ? data.defaultSortOrder
+              : DEFAULT_USER_PREFERENCES.defaultSortOrder,
+          preserveSearchOnModuleSwitch:
+            typeof data.preserveSearchOnModuleSwitch === 'boolean'
+              ? data.preserveSearchOnModuleSwitch
+              : DEFAULT_USER_PREFERENCES.preserveSearchOnModuleSwitch,
+        };
+      }
+      const userSnap = await getDoc(doc(db, 'users', uid));
+      if (!userSnap.exists()) return DEFAULT_USER_PREFERENCES;
+      const prefs = userSnap.data().preferences || {};
       return {
         ...DEFAULT_USER_PREFERENCES,
         ...prefs,
       };
     } catch (err) {
-      handleFirestoreError(err, OperationType.GET, `users/${uid}`);
+      handleFirestoreError(err, OperationType.GET, `userPreferences/${uid}`);
     }
   }
 
   public async savePreferences(
     patch: Partial<UserPreferences>
   ): Promise<UserPreferences> {
+    if (this.shouldUseServerApi()) {
+      const apiRes = await this.callServerApi<UserPreferences>('/api/v1/me/preferences', {
+        method: 'PATCH',
+        body: patch,
+      });
+      if (apiRes.ok && apiRes.data) {
+        return {
+          ...DEFAULT_USER_PREFERENCES,
+          ...apiRes.data,
+        };
+      }
+      if (this.apiTransportOverride && !apiRes.ok && apiRes.status !== 0) {
+        throw new Error(`${apiRes.errorCode || 'API_ERROR'}: ${apiRes.errorMessage}`);
+      }
+    }
+
     const uid = this.requireUid();
     const current = await this.getPreferences();
     const next: UserPreferences = { ...current, ...patch };
     const now = new Date().toISOString();
 
     try {
-      await updateDoc(doc(db, 'users', uid), {
-        preferences: next,
+      await setDoc(doc(db, 'userPreferences', uid), {
+        ownerUid: uid,
+        reducedMotion: Boolean(next.reducedMotion),
+        defaultSortOrder: next.defaultSortOrder,
+        preserveSearchOnModuleSwitch: Boolean(next.preserveSearchOnModuleSwitch),
         updatedAt: now,
       });
       return next;
     } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `users/${uid}`);
+      handleFirestoreError(err, OperationType.UPDATE, `userPreferences/${uid}`);
     }
   }
 

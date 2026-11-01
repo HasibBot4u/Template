@@ -597,9 +597,29 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
-    // /systemLocks/{lockId} — Atomic server-managed system locks (owner bootstrap)
+    // /systemLocks/{lockId} — Atomic server-managed system locks (owner bootstrap & migration cutover)
     match /systemLocks/{lockId} {
       allow get: if isValidId(lockId) && isAdmin();
+      allow list: if isAdmin();
+      allow create, update, delete: if false;
+    }
+
+    // /migrationDryRuns/{dryRunId}, /migrationTokenClaims/{dryRunId}, /migrationProgress/{dryRunId}, /migrationReceipts/{applyId} — Durable server-managed migration records
+    match /migrationDryRuns/{dryRunId} {
+      allow get: if isValidId(dryRunId) && isAdmin();
+      allow list: if isAdmin();
+      allow create, update, delete: if false;
+    }
+    match /migrationTokenClaims/{dryRunId} {
+      allow read, write: if false;
+    }
+    match /migrationProgress/{dryRunId} {
+      allow get: if isValidId(dryRunId) && isAdmin();
+      allow list: if isAdmin();
+      allow create, update, delete: if false;
+    }
+    match /migrationReceipts/{applyId} {
+      allow get: if isValidId(applyId) && isAdmin();
       allow list: if isAdmin();
       allow create, update, delete: if false;
     }

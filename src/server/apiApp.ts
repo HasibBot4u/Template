@@ -187,21 +187,31 @@ import {
   RenderExecutionTier,
   RenderOutputFormat,
 } from '../services/renderExportQaEngine';
-import { loadDurableSnapshot, saveDurableSnapshot } from './durableStore';
+import { DurableStoreSnapshot, loadDurableSnapshot, saveDurableSnapshot } from './durableStore';
 import {
   ISowveilPersistenceAdapter,
   PersistenceContractError,
 } from '../services/persistenceContracts';
-import { LocalSnapshotPersistenceAdapter } from './persistenceAdapters';
+import {
+  BoundedOwnerScopedCache,
+  LocalSnapshotPersistenceAdapter,
+} from './persistenceAdapters';
 import { decryptCredentialFromVault } from './credentialVault';
 import {
   createSnapshotBackup,
+  executeFinalPersistenceCutover,
   executeMigrationApply,
   executeMigrationDryRun,
   executeMigrationRollback,
+  exportCurrentSourceSnapshot,
   getMigrationCutoverDiagnostics,
+  getMigrationCutoverDiagnosticsAsync,
+  hydrateCutoverStateFromDurableAdapter,
   isLegacySnapshotWriterDisabled,
+  isMaintenanceReadOnlyWindowActive,
+  prepareFinalPersistenceCutover,
   setLegacySnapshotWriterDisabled,
+  verifyMigrationBackendProductionReady,
 } from './migrationCutover';
 
 export interface VerifiedTokenIdentity {
@@ -373,6 +383,7 @@ const ProjectCreateSchema = z
       .trim()
       .regex(/^[a-zA-Z0-9_\-]{1,128}$/)
       .optional(),
+    ownerUid: z.string().trim().max(128).optional(),
     title: z.string().trim().min(1).max(160),
     description: z.string().trim().max(2000).default(''),
     compCount: z.number().int().min(0).max(5000).nullable().default(null),
@@ -597,6 +608,8 @@ export function createApiApp(options: ApiAppOptions = {}) {
   // Server-authoritative state stores
   const roleStore = new Map<string, UserRole>();
   const userStatusStore = new Map<string, AccountStatus>();
+  const snapshotOperatorFallbackRoles = new Map<string, UserRole>();
+  const snapshotOperatorFallbackStatuses = new Map<string, AccountStatus>();
   const usersDirectoryStore = new Map<string, SafeUserDirectoryRecord>();
   let ownerBootstrappedUid: string | null = null;
   let catalogCacheVersion = 1;
@@ -652,6 +665,57 @@ export function createApiApp(options: ApiAppOptions = {}) {
       refuseUnreadyProductionStartup: options.refuseUnreadyProductionStartup,
       cloudStorageEnabled: storageEnabled,
     });
+  const isAuthoritativeFirestoreAdapter =
+    activePersistenceAdapter.adapterKind === 'cloud-firestore-authoritative';
+
+  // Bounded owner-scoped caches (never used as source of truth; invalidated on writes)
+  const projectsCache = new BoundedOwnerScopedCache<ProjectLibraryItem>(200);
+  const catalogCache = new BoundedOwnerScopedCache<CatalogItem>(500);
+  const templateVariantsCache = new BoundedOwnerScopedCache<TemplateVariantInstance>(200);
+  const referenceLabSessionsCache = new BoundedOwnerScopedCache<ReferenceLabSession>(100);
+  const providerConnectionsCache = new BoundedOwnerScopedCache<ProviderConnectionRecord>(100);
+  const routingProfilesCache = new BoundedOwnerScopedCache<
+    Record<HubTaskType, TaskRoutingProfile>
+  >(100);
+  const extensionsCache = new BoundedOwnerScopedCache<ExtensionPackageRecord>(100);
+  const aiDirectorSessionsCache = new BoundedOwnerScopedCache<AiDirectorSessionRecord>(100);
+  const templateFactoryDraftsCache = new BoundedOwnerScopedCache<TemplateFactoryDraftRecord>(100);
+  const preferenceConsentsCache = new BoundedOwnerScopedCache<UserPreferenceConsentConfig>(100);
+  const renderExportJobsCache = new BoundedOwnerScopedCache<DurableRenderExportJobRecord>(100);
+  const preferencesCache = new BoundedOwnerScopedCache<UserPreferences>(200);
+  const favoritesCache = new BoundedOwnerScopedCache<string[]>(200);
+
+  (app as any).persistenceCaches = {
+    projectsCache,
+    catalogCache,
+    templateVariantsCache,
+    referenceLabSessionsCache,
+    providerConnectionsCache,
+    routingProfilesCache,
+    extensionsCache,
+    aiDirectorSessionsCache,
+    templateFactoryDraftsCache,
+    preferenceConsentsCache,
+    renderExportJobsCache,
+    preferencesCache,
+    favoritesCache,
+  };
+  (app as any).setSimulateCacheFailure = (fail: boolean) => {
+    projectsCache.setSimulateCacheFailure(fail);
+    catalogCache.setSimulateCacheFailure(fail);
+    templateVariantsCache.setSimulateCacheFailure(fail);
+    referenceLabSessionsCache.setSimulateCacheFailure(fail);
+    providerConnectionsCache.setSimulateCacheFailure(fail);
+    routingProfilesCache.setSimulateCacheFailure(fail);
+    extensionsCache.setSimulateCacheFailure(fail);
+    aiDirectorSessionsCache.setSimulateCacheFailure(fail);
+    templateFactoryDraftsCache.setSimulateCacheFailure(fail);
+    preferenceConsentsCache.setSimulateCacheFailure(fail);
+    renderExportJobsCache.setSimulateCacheFailure(fail);
+    preferencesCache.setSimulateCacheFailure(fail);
+    favoritesCache.setSimulateCacheFailure(fail);
+  };
+
   const isProductionBootstrapLockUnsafe =
     (runtimeNodeEnv === 'production' || process.env.NODE_ENV === 'production') &&
     activePersistenceAdapter.adapterKind !== 'cloud-firestore-authoritative';
@@ -693,7 +757,8 @@ export function createApiApp(options: ApiAppOptions = {}) {
     editorAdaptersStore.set(adapter.id, { ...adapter });
   }
 
-  // Seed catalog items into server store (including 1 draft item to verify ordinary user draft isolation)
+  // Prepare core seed catalog items (including 1 draft item to verify ordinary user draft isolation)
+  const coreSeedCatalogItems: CatalogItem[] = [];
   for (const item of SEED_CATALOG_ITEMS) {
     const enriched = enrichCatalogItemWithMarketplaceDefaults({
       ...item,
@@ -705,28 +770,42 @@ export function createApiApp(options: ApiAppOptions = {}) {
         'svg-frame',
       ],
     });
+    coreSeedCatalogItems.push(enriched);
     catalogStore.set(enriched.id, enriched);
+    catalogCache.set(enriched.ownerUid || 'public', enriched.id, enriched);
   }
-  catalogStore.set(
-    'draft-internal-rig',
-    enrichCatalogItemWithMarketplaceDefaults({
-      ...SEED_CATALOG_ITEMS[0],
-      id: 'draft-internal-rig',
-      name: 'Internal Unreleased Draft Preset',
-      slug: 'internal-unreleased-draft-preset',
-      visibility: 'draft',
-    })
-  );
-  for (const seededItem of catalogStore.values()) {
-    void activePersistenceAdapter.catalogAndVariants
-      .getCatalogItemById(seededItem.id)
-      .then((existing) => {
-        if (!existing) {
-          return activePersistenceAdapter.catalogAndVariants.saveCatalogItem(seededItem);
+  const internalDraftSeed = enrichCatalogItemWithMarketplaceDefaults({
+    ...SEED_CATALOG_ITEMS[0],
+    id: 'draft-internal-rig',
+    name: 'Internal Unreleased Draft Preset',
+    slug: 'internal-unreleased-draft-preset',
+    visibility: 'draft',
+  });
+  coreSeedCatalogItems.push(internalDraftSeed);
+  catalogStore.set(internalDraftSeed.id, internalDraftSeed);
+  catalogCache.set(internalDraftSeed.ownerUid || 'public', internalDraftSeed.id, internalDraftSeed);
+
+  let coreCatalogSeedsReadyPromise: Promise<void> | null = null;
+  function ensureCoreCatalogSeedsReady(): Promise<void> {
+    if (!coreCatalogSeedsReadyPromise) {
+      coreCatalogSeedsReadyPromise = (async () => {
+        for (const seededItem of coreSeedCatalogItems) {
+          try {
+            const existing = await activePersistenceAdapter.catalogAndVariants.getCatalogItemById(
+              seededItem.id
+            );
+            if (!existing) {
+              await activePersistenceAdapter.catalogAndVariants.saveCatalogItem(seededItem);
+            }
+          } catch {
+            // If driver is intentionally simulating failure or offline during startup, allow later retry
+          }
         }
-      })
-      .catch(() => {});
+      })();
+    }
+    return coreCatalogSeedsReadyPromise;
   }
+  void ensureCoreCatalogSeedsReady();
 
   // Seed asset metadata records from initial catalog items (no mocked binary URLs)
   for (const item of SEED_CATALOG_ITEMS.slice(0, 12)) {
@@ -779,9 +858,17 @@ export function createApiApp(options: ApiAppOptions = {}) {
     });
   }
 
-  // Load durable snapshot from disk if configured
+  // Load durable snapshot from disk ONLY for legacy LocalSnapshotPersistenceAdapter (never auto-migrate into authoritative Firestore on startup)
   const loadedSnapshot = loadDurableSnapshot(persistenceFilePath);
   if (loadedSnapshot) {
+    for (const [k, v] of Object.entries(loadedSnapshot.roles || {})) {
+      snapshotOperatorFallbackRoles.set(k, v);
+    }
+    for (const [k, v] of Object.entries(loadedSnapshot.userStatuses || {})) {
+      snapshotOperatorFallbackStatuses.set(k, v);
+    }
+  }
+  if (loadedSnapshot && !isAuthoritativeFirestoreAdapter) {
     catalogCacheVersion = loadedSnapshot.catalogCacheVersion || 1;
     ownerBootstrappedUid = loadedSnapshot.ownerBootstrappedUid || null;
     if (ownerBootstrappedUid) {
@@ -806,12 +893,18 @@ export function createApiApp(options: ApiAppOptions = {}) {
     }
     for (const [k, v] of Object.entries(loadedSnapshot.userPreferences || {})) {
       userPreferencesStore.set(k, v);
+      preferencesCache.set(k, 'preferences', v);
       void activePersistenceAdapter.governance
         .savePreferences(k, v)
         .catch(() => {});
     }
     for (const [k, v] of Object.entries(loadedSnapshot.userFavorites || {})) {
-      userFavoritesStore.set(k, new Set(v));
+      const favArr = Array.isArray(v) ? v : [];
+      userFavoritesStore.set(k, new Set(favArr));
+      favoritesCache.set(k, 'favorites', favArr);
+      for (const itemId of favArr) {
+        void activePersistenceAdapter.governance.addFavorite(k, itemId).catch(() => {});
+      }
     }
     for (const [k, v] of Object.entries(loadedSnapshot.userRecentItems || {})) {
       userRecentStore.set(k, Array.isArray(v) ? v : []);
@@ -819,12 +912,14 @@ export function createApiApp(options: ApiAppOptions = {}) {
     for (const item of loadedSnapshot.catalogItems || []) {
       const enriched = enrichCatalogItemWithMarketplaceDefaults(item);
       catalogStore.set(enriched.id, enriched);
+      catalogCache.set(enriched.ownerUid || 'public', enriched.id, enriched);
       void activePersistenceAdapter.catalogAndVariants
         .saveCatalogItem(enriched)
         .catch(() => {});
     }
     for (const variant of loadedSnapshot.templateVariants || []) {
       templateVariantsStore.set(variant.id, variant);
+      templateVariantsCache.set(variant.ownerUid, variant.id, variant);
       void activePersistenceAdapter.catalogAndVariants
         .saveVariant(variant)
         .catch(() => {});
@@ -834,6 +929,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
     }
     for (const proj of loadedSnapshot.projects || []) {
       projectsStore.set(proj.id, proj);
+      projectsCache.set(proj.ownerUid || 'user-local', proj.id, proj);
       void activePersistenceAdapter.projects
         .getById(proj.id, proj.ownerUid || 'user-local', true)
         .then((existing) => {
@@ -860,6 +956,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
     }
     for (const sess of loadedSnapshot.referenceLabSessions || []) {
       referenceLabSessionsStore.set(sess.id, sess);
+      referenceLabSessionsCache.set(sess.ownerUid, sess.id, sess);
       void activePersistenceAdapter.referenceLabSessions
         .save(sess)
         .catch(() => {});
@@ -867,30 +964,35 @@ export function createApiApp(options: ApiAppOptions = {}) {
     for (const conn of loadedSnapshot.providerConnections || []) {
       const inspected = inspectPersistedConnectionVaultHealth(conn);
       providerConnectionsStore.set(inspected.id, inspected);
+      providerConnectionsCache.set(inspected.ownerUid, inspected.id, inspected);
       void activePersistenceAdapter.providerConnections
         .saveMetadata(inspected)
         .catch(() => {});
     }
     for (const [uid, profiles] of Object.entries(loadedSnapshot.routingProfiles || {})) {
       routingProfilesStore.set(uid, profiles);
+      routingProfilesCache.set(uid, 'routing', profiles);
       void activePersistenceAdapter.routingAndExtensions
         .saveRoutingProfiles(uid, profiles)
         .catch(() => {});
     }
     for (const ext of loadedSnapshot.extensionPackages || []) {
       extensionPackagesStore.set(ext.id, ext);
+      extensionsCache.set(ext.ownerUid, ext.id, ext);
       void activePersistenceAdapter.routingAndExtensions
         .saveExtension(ext)
         .catch(() => {});
     }
     for (const dirSess of loadedSnapshot.aiDirectorSessions || []) {
       aiDirectorSessionsStore.set(dirSess.id, dirSess);
+      aiDirectorSessionsCache.set(dirSess.ownerUid, dirSess.id, dirSess);
       void activePersistenceAdapter.aiDirectorSessions
         .save(dirSess)
         .catch(() => {});
     }
     for (const fDraft of loadedSnapshot.templateFactoryDrafts || []) {
       templateFactoryDraftsStore.set(fDraft.id, fDraft);
+      templateFactoryDraftsCache.set(fDraft.ownerUid, fDraft.id, fDraft);
       void activePersistenceAdapter.templateFactoryDrafts
         .save(fDraft)
         .catch(() => {});
@@ -916,6 +1018,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
     }
     for (const [uid, cCfg] of Object.entries(loadedSnapshot.userPreferenceConsents || {})) {
       userPreferenceConsentsStore.set(uid, cCfg);
+      preferenceConsentsCache.set(uid, 'consent', cCfg);
       void activePersistenceAdapter.templateFactoryDrafts
         .savePreferenceConsent(cCfg)
         .catch(() => {});
@@ -926,6 +1029,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
       );
       for (const rJob of recoveredJobs) {
         renderExportJobsStore.set(rJob.id, rJob);
+        renderExportJobsCache.set(rJob.ownerUid, rJob.id, rJob);
         void activePersistenceAdapter.renderExportJobs
           .saveJob(rJob, { cloudStorageEnabled: storageEnabled })
           .catch(() => {});
@@ -961,14 +1065,15 @@ export function createApiApp(options: ApiAppOptions = {}) {
     })
     .catch(() => {});
 
-  function persistState() {
-    if (!persistenceFilePath) return;
-    if (isLegacySnapshotWriterDisabled()) return;
+  // Hydrate durable cutover state on startup
+  void hydrateCutoverStateFromDurableAdapter(activePersistenceAdapter).catch(() => {});
+
+  function buildCurrentRuntimeSnapshot(): DurableStoreSnapshot {
     const favObj: Record<string, string[]> = {};
     for (const [uid, set] of userFavoritesStore.entries()) {
       favObj[uid] = Array.from(set);
     }
-    saveDurableSnapshot(persistenceFilePath, {
+    return {
       schemaVersion: '1.0.0',
       savedAt: new Date().toISOString(),
       catalogCacheVersion,
@@ -998,7 +1103,14 @@ export function createApiApp(options: ApiAppOptions = {}) {
       toolAuditRecords: toolAuditRecordsStore.slice(0, 500),
       auditEvents: auditLog.slice(0, 500),
       platformSettings,
-    });
+    };
+  }
+
+  function persistState() {
+    if (!persistenceFilePath) return;
+    if (isAuthoritativeFirestoreAdapter) return;
+    if (isLegacySnapshotWriterDisabled()) return;
+    saveDurableSnapshot(persistenceFilePath, buildCurrentRuntimeSnapshot());
   }
 
   function sendOk<T>(res: Response, requestId: string, data: T, status = 200) {
@@ -1061,7 +1173,44 @@ export function createApiApp(options: ApiAppOptions = {}) {
     void activePersistenceAdapter.governance.appendAuditEvent(evt).catch(() => {});
   }
 
-  function countActiveOwners(): number {
+  async function resolveCallerRoleAsync(uid: string): Promise<UserRole> {
+    try {
+      const fromAdapter = await activePersistenceAdapter.governance.getRole(uid);
+      if (fromAdapter && fromAdapter !== 'user') {
+        roleStore.set(uid, fromAdapter);
+        return fromAdapter;
+      }
+      const inMem = roleStore.get(uid) || snapshotOperatorFallbackRoles.get(uid);
+      if (inMem && inMem !== 'user') {
+        return inMem;
+      }
+      return 'user';
+    } catch {
+      return roleStore.get(uid) || snapshotOperatorFallbackRoles.get(uid) || 'user';
+    }
+  }
+
+  async function resolveCallerAccountStatusAsync(uid: string): Promise<AccountStatus> {
+    try {
+      const fromAdapter = await activePersistenceAdapter.governance.getAccountStatus(uid);
+      userStatusStore.set(uid, fromAdapter);
+      return fromAdapter;
+    } catch {
+      return userStatusStore.get(uid) || snapshotOperatorFallbackStatuses.get(uid) || 'active';
+    }
+  }
+
+  async function countActiveOwnersAsync(): Promise<number> {
+    try {
+      if (typeof activePersistenceAdapter.governance.countActiveOwners === 'function') {
+        const adapterCount = await activePersistenceAdapter.governance.countActiveOwners();
+        if (adapterCount > 0) {
+          return adapterCount;
+        }
+      }
+    } catch {
+      // Fallback to in-memory roleStore
+    }
     let count = 0;
     for (const [uid, r] of roleStore.entries()) {
       const st = userStatusStore.get(uid) || 'active';
@@ -1227,6 +1376,31 @@ export function createApiApp(options: ApiAppOptions = {}) {
     return next();
   });
 
+  // 2b. Maintenance / Read-Only Reconciliation Window Gate (Prompt F4)
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    const authReq = req as AuthenticatedRequest;
+    const isMutatingMethod =
+      req.method === 'POST' ||
+      req.method === 'PUT' ||
+      req.method === 'PATCH' ||
+      req.method === 'DELETE';
+    if (
+      isMutatingMethod &&
+      isMaintenanceReadOnlyWindowActive() &&
+      !req.path.startsWith('/api/v1/admin/migration')
+    ) {
+      res.setHeader('Retry-After', '5');
+      return sendError(
+        res,
+        authReq.requestId,
+        503,
+        'MAINTENANCE_READ_ONLY_WINDOW_ACTIVE',
+        'A final persistence cutover reconciliation window is briefly active (read-only mode). Please retry your write operation in a few seconds.'
+      );
+    }
+    return next();
+  });
+
   // 3. Authentication & Authoritative Role Resolution Middleware
   async function requireAuth(
     req: Request,
@@ -1278,15 +1452,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
         );
       }
 
-      let accountStatus = userStatusStore.get(identity.uid);
-      if (!accountStatus) {
-        try {
-          accountStatus = await activePersistenceAdapter.governance.getAccountStatus(identity.uid);
-          userStatusStore.set(identity.uid, accountStatus);
-        } catch {
-          accountStatus = 'active';
-        }
-      }
+      const accountStatus = await resolveCallerAccountStatusAsync(identity.uid);
       if (accountStatus === 'suspended') {
         recordAudit(
           identity.uid,
@@ -1309,19 +1475,8 @@ export function createApiApp(options: ApiAppOptions = {}) {
 
       authReq.authIdentity = identity;
 
-      // Resolve role strictly from server-side trusted role store / persistence adapter (NEVER from client headers or body)
-      let resolvedRole: UserRole | undefined = roleStore.get(identity.uid);
-      if (!resolvedRole) {
-        try {
-          resolvedRole = await activePersistenceAdapter.governance.getRole(identity.uid);
-          if (resolvedRole !== 'user') {
-            roleStore.set(identity.uid, resolvedRole);
-          }
-        } catch {
-          resolvedRole = 'user';
-        }
-      }
-      authReq.userRole = resolvedRole || 'user';
+      // Resolve role strictly from server-side persistence adapter (NEVER from client headers or body)
+      authReq.userRole = await resolveCallerRoleAsync(identity.uid);
       syncUserIntoDirectory(identity, authReq.userRole);
       return next();
     } catch (err) {
@@ -1409,10 +1564,16 @@ export function createApiApp(options: ApiAppOptions = {}) {
     });
   });
 
-  app.get('/api/v1/ready', (req: Request, res: Response) => {
+  app.get('/api/v1/ready', async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
-    const persistenceReadiness = activePersistenceAdapter.getReadinessReport();
-    if (runtimeNodeEnv === 'production' && !persistenceReadiness.readyForProductionTraffic) {
+    const persistenceReadiness = activePersistenceAdapter.checkProductionReadinessAsync
+      ? await activePersistenceAdapter.checkProductionReadinessAsync()
+      : activePersistenceAdapter.getReadinessReport();
+    const shouldRejectUnready =
+      (runtimeNodeEnv === 'production' ||
+        activePersistenceAdapter.adapterKind === 'cloud-firestore-authoritative') &&
+      !persistenceReadiness.readyForProductionTraffic;
+    if (shouldRejectUnready) {
       return sendError(
         res,
         authReq.requestId,
@@ -1434,12 +1595,20 @@ export function createApiApp(options: ApiAppOptions = {}) {
     const authReq = req as AuthenticatedRequest;
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
     const persistenceReadiness = activePersistenceAdapter.getReadinessReport();
+    const maybeDiagProvider = activePersistenceAdapter as unknown as {
+      getSanitizedDriverDiagnostics?: () => unknown;
+    };
+    const driverDiagnostics =
+      typeof maybeDiagProvider.getSanitizedDriverDiagnostics === 'function'
+        ? maybeDiagProvider.getSanitizedDriverDiagnostics()
+        : null;
     const migrationCutover = getMigrationCutoverDiagnostics({
       persistenceAdapter: activePersistenceAdapter,
       snapshotFilePath: persistenceFilePath,
     });
     return sendOk(res, authReq.requestId, {
       persistenceReadiness,
+      driverDiagnostics,
       migrationCutover,
       entitiesCovered: [
         'projects',
@@ -1480,7 +1649,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
         const identity = await verifyToken(authHeader.slice(7).trim());
         if (identity.emailVerified) {
           callerUid = identity.uid;
-          callerRole = roleStore.get(identity.uid) || 'user';
+          callerRole = await resolveCallerRoleAsync(identity.uid);
           syncUserIntoDirectory(identity, callerRole);
         }
       } catch {
@@ -1650,7 +1819,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
     });
   });
 
-  app.get('/api/v1/editors/:id/capabilities', (req: Request, res: Response) => {
+  app.get('/api/v1/editors/:id/capabilities', async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const editorId = req.params.id as TargetMobileEditorId;
     const descriptor = editorAdaptersStore.get(editorId);
@@ -1659,7 +1828,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
     }
     const adapter = getEditorAdapter(editorId);
     const itemId = typeof req.query.itemId === 'string' ? req.query.itemId : undefined;
-    const item = itemId ? catalogStore.get(itemId) : undefined;
+    const item = itemId ? (await getAuthoritativeCatalogItem(itemId)) ?? undefined : undefined;
     const capability = adapter.discoverCapabilities(item?.moduleId);
     const alightXmlClassification = item ? classifyPresetForAlightMotionXml(item) : null;
 
@@ -1682,7 +1851,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
         const identity = await verifyToken(authHeader.slice(7).trim());
         if (identity.emailVerified) {
           callerUid = identity.uid;
-          const r = roleStore.get(identity.uid) || 'user';
+          const r = await resolveCallerRoleAsync(identity.uid);
           callerIsAdmin = r === 'admin' || r === 'owner';
         }
       } catch {
@@ -1779,9 +1948,17 @@ export function createApiApp(options: ApiAppOptions = {}) {
       return true;
     });
 
-    const favoriteIds = callerUid
-      ? userFavoritesStore.get(callerUid) || new Set<string>()
-      : new Set<string>();
+    let favoriteIds = new Set<string>();
+    if (callerUid) {
+      try {
+        const favList = await activePersistenceAdapter.governance.getFavorites(callerUid);
+        favoriteIds = new Set(favList);
+        userFavoritesStore.set(callerUid, favoriteIds);
+        favoritesCache.set(callerUid, 'favorites', favList);
+      } catch {
+        favoriteIds = userFavoritesStore.get(callerUid) || new Set<string>();
+      }
+    }
     const recentIds = callerUid ? userRecentStore.get(callerUid) || [] : [];
 
     const filtered = filterAndSortCatalog(rawItems, {
@@ -1814,6 +1991,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
       total: filtered.length,
       limit,
       offset,
+      hasMore: offset + sliced.length < filtered.length,
       cacheVersion: catalogCacheVersion,
     });
   });
@@ -1843,7 +2021,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
         const identity = await verifyToken(authHeader.slice(7).trim());
         if (identity.emailVerified) {
           callerUid = identity.uid;
-          const r = roleStore.get(identity.uid) || 'user';
+          const r = await resolveCallerRoleAsync(identity.uid);
           callerIsAdmin = r === 'admin' || r === 'owner';
         }
       } catch {
@@ -1887,17 +2065,16 @@ export function createApiApp(options: ApiAppOptions = {}) {
     const authReq = req as AuthenticatedRequest;
     const identity = authReq.authIdentity!;
     const role = authReq.userRole!;
-    let storedPrefs = userPreferencesStore.get(identity.uid);
-    if (!storedPrefs) {
-      try {
-        storedPrefs =
-          (await activePersistenceAdapter.governance.getPreferences(identity.uid)) || undefined;
-        if (storedPrefs) {
-          userPreferencesStore.set(identity.uid, storedPrefs);
-        }
-      } catch {
-        // Fallback to default
+    let storedPrefs: UserPreferences | undefined;
+    try {
+      storedPrefs =
+        (await activePersistenceAdapter.governance.getPreferences(identity.uid)) || undefined;
+      if (storedPrefs) {
+        userPreferencesStore.set(identity.uid, storedPrefs);
+        preferencesCache.set(identity.uid, 'preferences', storedPrefs);
       }
+    } catch {
+      storedPrefs = preferencesCache.get(identity.uid, 'preferences') ?? userPreferencesStore.get(identity.uid);
     }
     const preferences = storedPrefs || {
       reducedMotion: false,
@@ -1924,7 +2101,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
       emailVerified: identity.emailVerified,
       displayName: identity.displayName || 'Studio User',
       role,
-      status: userStatusStore.get(identity.uid) || 'active',
+      status: await resolveCallerAccountStatusAsync(identity.uid),
       preferences,
       canBootstrapOwner:
         !isProductionBootstrapLockUnsafe &&
@@ -1936,7 +2113,35 @@ export function createApiApp(options: ApiAppOptions = {}) {
     });
   });
 
-  app.patch('/api/v1/me/preferences', requireAuth, (req: Request, res: Response) => {
+  app.get('/api/v1/me/preferences', requireAuth, async (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const identity = authReq.authIdentity!;
+    try {
+      const cached = preferencesCache.get(identity.uid, 'preferences');
+      if (cached) {
+        return sendOk(res, authReq.requestId, cached);
+      }
+      const existing = await activePersistenceAdapter.governance.getPreferences(identity.uid);
+      const prefs =
+        existing ||
+        userPreferencesStore.get(identity.uid) || {
+          reducedMotion: false,
+          defaultSortOrder: 'name',
+          preserveSearchOnModuleSwitch: false,
+        };
+      preferencesCache.set(identity.uid, 'preferences', prefs);
+      return sendOk(res, authReq.requestId, prefs);
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to load user preferences.'
+      );
+    }
+  });
+
+  app.patch('/api/v1/me/preferences', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const identity = authReq.authIdentity!;
 
@@ -1976,30 +2181,57 @@ export function createApiApp(options: ApiAppOptions = {}) {
       );
     }
 
-    const current = userPreferencesStore.get(identity.uid) || {
-      reducedMotion: false,
-      defaultSortOrder: 'name',
-      preserveSearchOnModuleSwitch: false,
-    };
-    const updated: UserPreferences = { ...current, ...parsed.data };
-    userPreferencesStore.set(identity.uid, updated);
-    void activePersistenceAdapter.governance.savePreferences(identity.uid, updated).catch(() => {});
-    persistState();
-    return sendOk(res, authReq.requestId, updated);
+    try {
+      preferencesCache.invalidate(identity.uid, 'preferences');
+      const existingPrefs = await activePersistenceAdapter.governance.getPreferences(identity.uid);
+      const current = existingPrefs ||
+        userPreferencesStore.get(identity.uid) || {
+          reducedMotion: false,
+          defaultSortOrder: 'name',
+          preserveSearchOnModuleSwitch: false,
+        };
+      const updated: UserPreferences = { ...current, ...parsed.data };
+      const saved = await activePersistenceAdapter.governance.savePreferences(
+        identity.uid,
+        updated
+      );
+      userPreferencesStore.set(identity.uid, saved);
+      preferencesCache.set(identity.uid, 'preferences', saved);
+      persistState();
+      return sendOk(res, authReq.requestId, saved);
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to persist user preferences.'
+      );
+    }
   });
 
-  // Favorites (Owner-scoped, Idempotent)
-  app.get('/api/v1/me/favorites', requireAuth, (req: Request, res: Response) => {
+  // Favorites (Owner-scoped, Idempotent, Authoritative)
+  app.get('/api/v1/me/favorites', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const uid = authReq.authIdentity!.uid;
-    const set = userFavoritesStore.get(uid) || new Set<string>();
-    return sendOk(res, authReq.requestId, {
-      items: Array.from(set),
-      total: set.size,
-    });
+    try {
+      const items = await activePersistenceAdapter.governance.getFavorites(uid);
+      userFavoritesStore.set(uid, new Set(items));
+      favoritesCache.set(uid, 'favorites', items);
+      return sendOk(res, authReq.requestId, {
+        items,
+        total: items.length,
+      });
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to read user favorites.'
+      );
+    }
   });
 
-  app.put('/api/v1/me/favorites/:itemId', requireAuth, (req: Request, res: Response) => {
+  app.put('/api/v1/me/favorites/:itemId', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const uid = authReq.authIdentity!.uid;
     const itemId = req.params.itemId.trim();
@@ -2007,32 +2239,52 @@ export function createApiApp(options: ApiAppOptions = {}) {
       return sendError(res, authReq.requestId, 400, 'VALIDATION_ERROR', 'Invalid itemId.');
     }
 
-    let set = userFavoritesStore.get(uid);
-    if (!set) {
-      set = new Set<string>();
-      userFavoritesStore.set(uid, set);
+    try {
+      favoritesCache.invalidate(uid, 'favorites');
+      const items = await activePersistenceAdapter.governance.addFavorite(uid, itemId);
+      userFavoritesStore.set(uid, new Set(items));
+      favoritesCache.set(uid, 'favorites', items);
+      persistState();
+      return sendOk(res, authReq.requestId, {
+        items,
+        total: items.length,
+      });
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to save favorite item.'
+      );
     }
-    set.add(itemId);
-    persistState();
-    return sendOk(res, authReq.requestId, {
-      items: Array.from(set),
-      total: set.size,
-    });
   });
 
-  app.delete('/api/v1/me/favorites/:itemId', requireAuth, (req: Request, res: Response) => {
+  app.delete('/api/v1/me/favorites/:itemId', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const uid = authReq.authIdentity!.uid;
     const itemId = req.params.itemId.trim();
-    const set = userFavoritesStore.get(uid);
-    if (set) {
-      set.delete(itemId);
+    if (!/^[a-zA-Z0-9_\-]{1,128}$/.test(itemId)) {
+      return sendError(res, authReq.requestId, 400, 'VALIDATION_ERROR', 'Invalid itemId.');
     }
-    persistState();
-    return sendOk(res, authReq.requestId, {
-      items: set ? Array.from(set) : [],
-      total: set ? set.size : 0,
-    });
+
+    try {
+      favoritesCache.invalidate(uid, 'favorites');
+      const items = await activePersistenceAdapter.governance.removeFavorite(uid, itemId);
+      userFavoritesStore.set(uid, new Set(items));
+      favoritesCache.set(uid, 'favorites', items);
+      persistState();
+      return sendOk(res, authReq.requestId, {
+        items,
+        total: items.length,
+      });
+    } catch (err) {
+      return sendPersistenceError(
+        res,
+        authReq.requestId,
+        err,
+        'Unable to remove favorite item.'
+      );
+    }
   });
 
   // Recent Items (Owner-scoped)
@@ -2076,7 +2328,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
         const identity = await verifyToken(authHeader.slice(7).trim());
         if (identity.emailVerified) {
           callerUid = identity.uid;
-          callerRole = roleStore.get(identity.uid) || 'user';
+          callerRole = await resolveCallerRoleAsync(identity.uid);
         }
       } catch {
         callerUid = null;
@@ -2089,10 +2341,10 @@ export function createApiApp(options: ApiAppOptions = {}) {
       : callerUid
       ? Array.from(jobsStore.values()).filter((j) => j.ownerUid === callerUid)
       : [];
-    const scopedRenderJobs = isAdminOrOwner
-      ? Array.from(renderExportJobsStore.values())
-      : callerUid
-      ? Array.from(renderExportJobsStore.values()).filter((j) => j.ownerUid === callerUid)
+    const scopedRenderJobs = callerUid
+      ? await listAuthoritativeRenderExportJobs(callerUid)
+      : isAdminOrOwner && activePersistenceAdapter.renderExportJobs.listAllJobsForAdmin
+      ? await activePersistenceAdapter.renderExportJobs.listAllJobsForAdmin()
       : [];
 
     const jobStateCounts: Record<string, number> = {};
@@ -2237,6 +2489,16 @@ export function createApiApp(options: ApiAppOptions = {}) {
         toPublicRenderJobView
       );
 
+      const userPreferences =
+        (await activePersistenceAdapter.governance.getPreferences(uid)) ||
+        userPreferencesStore.get(uid) ||
+        null;
+      const userFavorites = await activePersistenceAdapter.governance.getFavorites(uid);
+      const userRoutingProfiles =
+        (await activePersistenceAdapter.routingAndExtensions.getRoutingProfiles(uid)) ||
+        routingProfilesStore.get(uid) ||
+        null;
+
       recordAudit(
         uid,
         authReq.authIdentity!.email,
@@ -2256,12 +2518,12 @@ export function createApiApp(options: ApiAppOptions = {}) {
           email: authReq.authIdentity!.email,
           displayName: authReq.authIdentity!.displayName || 'Studio User',
           role: authReq.userRole || 'user',
-          preferences: userPreferencesStore.get(uid) || null,
+          preferences: userPreferences,
           telemetryOptIn: Boolean(userTelemetryOptInStore.get(uid)),
           preferenceLearningConsent:
             preferenceConsent || userPreferenceConsentsStore.get(uid) || null,
         },
-        favorites: Array.from(userFavoritesStore.get(uid) || []),
+        favorites: userFavorites,
         recentItems: userRecentStore.get(uid) || [],
         projects: ownedProjects,
         templateVariants: ownedVariants,
@@ -2270,7 +2532,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
         legacyExportJobs: ownedJobs,
         referenceLabSessions: ownedReferenceSessions,
         providerConnectionsRedacted: ownedProviderConnections,
-        routingProfiles: routingProfilesStore.get(uid) || null,
+        routingProfiles: userRoutingProfiles,
         extensions: ownedExtensions,
         aiDirectorSessions: ownedDirectorSessions,
         templateFactoryDrafts: ownedFactoryDrafts,
@@ -2429,11 +2691,29 @@ export function createApiApp(options: ApiAppOptions = {}) {
         }
       }
 
+      const ownedFavs = await activePersistenceAdapter.governance.getFavorites(uid);
+      for (const favId of ownedFavs) {
+        await activePersistenceAdapter.governance.removeFavorite(uid, favId);
+      }
+
       userFavoritesStore.delete(uid);
       userRecentStore.delete(uid);
       userPreferencesStore.delete(uid);
       userTelemetryOptInStore.delete(uid);
       usersDirectoryStore.delete(uid);
+
+      projectsCache.invalidateOwner(uid);
+      templateVariantsCache.invalidateOwner(uid);
+      referenceLabSessionsCache.invalidateOwner(uid);
+      providerConnectionsCache.invalidateOwner(uid);
+      routingProfilesCache.invalidateOwner(uid);
+      extensionsCache.invalidateOwner(uid);
+      aiDirectorSessionsCache.invalidateOwner(uid);
+      templateFactoryDraftsCache.invalidateOwner(uid);
+      preferenceConsentsCache.invalidateOwner(uid);
+      renderExportJobsCache.invalidateOwner(uid);
+      preferencesCache.invalidateOwner(uid);
+      favoritesCache.invalidateOwner(uid);
 
       persistState();
 
@@ -2483,6 +2763,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
       );
     }
 
+    const { limit, offset } = parsePagination(req);
     try {
       const ownedAll = await listAuthoritativeVariantsByOwner(uid, baseTemplateId);
       const owned = ownedAll
@@ -2491,10 +2772,14 @@ export function createApiApp(options: ApiAppOptions = {}) {
           return true;
         })
         .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+      const sliced = owned.slice(offset, offset + limit);
 
       return sendOk(res, authReq.requestId, {
-        items: owned,
+        items: sliced,
         total: owned.length,
+        limit,
+        offset,
+        hasMore: offset + sliced.length < owned.length,
       });
     } catch (err) {
       return sendPersistenceError(
@@ -2665,16 +2950,16 @@ export function createApiApp(options: ApiAppOptions = {}) {
     const uid = authReq.authIdentity!.uid;
     const isAdmin = authReq.userRole === 'admin' || authReq.userRole === 'owner';
 
-    const inMem = templateVariantsStore.get(req.params.id);
-    if (inMem) {
-      await ensureMemoryVariantSeededInAdapter(inMem);
-    }
     let variant: TemplateVariantInstance | null = null;
     try {
       variant = await activePersistenceAdapter.catalogAndVariants.getVariantById(
         req.params.id,
-        isAdmin && inMem ? inMem.ownerUid : uid
+        uid,
+        isAdmin
       );
+      if (variant) {
+        templateVariantsCache.set(variant.ownerUid, variant.id, variant);
+      }
     } catch (err) {
       if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
         return sendError(
@@ -2719,10 +3004,6 @@ export function createApiApp(options: ApiAppOptions = {}) {
   app.patch('/api/v1/template-variants/:id', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const uid = authReq.authIdentity!.uid;
-    const inMem = templateVariantsStore.get(req.params.id);
-    if (inMem) {
-      await ensureMemoryVariantSeededInAdapter(inMem);
-    }
     let existing: TemplateVariantInstance | null = null;
     try {
       existing = await activePersistenceAdapter.catalogAndVariants.getVariantById(
@@ -2916,7 +3197,16 @@ export function createApiApp(options: ApiAppOptions = {}) {
 
     let sourceVariant: TemplateVariantInstance | undefined;
     if (parsed.data.variantId) {
-      const foundVar = templateVariantsStore.get(parsed.data.variantId);
+      let foundVar: TemplateVariantInstance | null = null;
+      try {
+        foundVar = await activePersistenceAdapter.catalogAndVariants.getVariantById(
+          parsed.data.variantId,
+          uid,
+          isAdmin
+        );
+      } catch {
+        foundVar = null;
+      }
       if (!foundVar || (foundVar.ownerUid !== uid && !isAdmin)) {
         return sendError(
           res,
@@ -3584,50 +3874,27 @@ export function createApiApp(options: ApiAppOptions = {}) {
     );
   }
 
-  async function ensureMemoryProjectSeededInAdapter(proj: ProjectLibraryItem): Promise<void> {
-    try {
-      const existing = await activePersistenceAdapter.projects.getById(
-        proj.id,
-        proj.ownerUid || 'user-local',
-        true
-      );
-      if (!existing) {
-        await activePersistenceAdapter.projects.create({
-          ...proj,
-          ownerUid: proj.ownerUid || 'user-local',
-        });
-      }
-    } catch {
-      // Ignore if already exists
-    }
-  }
-
   async function getAuthoritativeProject(
     id: string,
     requesterUid: string,
     isAdmin = false
   ): Promise<ProjectLibraryItem | null> {
-    const inMem = projectsStore.get(id);
-    if (inMem) {
-      await ensureMemoryProjectSeededInAdapter(inMem);
-    }
     const found = await activePersistenceAdapter.projects.getById(id, requesterUid, isAdmin);
     if (found) {
       projectsStore.set(found.id, found);
+      projectsCache.set(found.ownerUid || requesterUid, found.id, found);
       getOrInitCanonicalStore(found);
+    } else {
+      projectsCache.invalidate(requesterUid, id);
     }
     return found;
   }
 
   async function listAuthoritativeProjects(ownerUid: string): Promise<ProjectLibraryItem[]> {
-    for (const proj of projectsStore.values()) {
-      if (proj.ownerUid === ownerUid) {
-        await ensureMemoryProjectSeededInAdapter(proj);
-      }
-    }
     const owned = await activePersistenceAdapter.projects.listByOwner(ownerUid);
     for (const p of owned) {
       projectsStore.set(p.id, p);
+      projectsCache.set(p.ownerUid || ownerUid, p.id, p);
     }
     return owned.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
   }
@@ -3635,8 +3902,10 @@ export function createApiApp(options: ApiAppOptions = {}) {
   async function saveAuthoritativeNewProject(
     record: ProjectLibraryItem
   ): Promise<ProjectLibraryItem> {
+    projectsCache.invalidate(record.ownerUid || 'user-local', record.id);
     const created = await activePersistenceAdapter.projects.create(record);
     projectsStore.set(created.id, created);
+    projectsCache.set(created.ownerUid || 'user-local', created.id, created);
     getOrInitCanonicalStore(created);
     persistState();
     return created;
@@ -3648,10 +3917,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
     patch: Partial<ProjectLibraryItem>,
     updateOptions?: { expectedRevision?: number; isAdmin?: boolean }
   ): Promise<ProjectLibraryItem> {
-    const inMem = projectsStore.get(id);
-    if (inMem) {
-      await ensureMemoryProjectSeededInAdapter(inMem);
-    }
+    projectsCache.invalidate(requesterUid, id);
     const { createdAt: _ignoredCreatedAt, ...safePatch } = patch;
     const updated = await activePersistenceAdapter.projects.update(
       id,
@@ -3660,6 +3926,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
       updateOptions
     );
     projectsStore.set(updated.id, updated);
+    projectsCache.set(updated.ownerUid || requesterUid, updated.id, updated);
     getOrInitCanonicalStore(updated);
     persistState();
     return updated;
@@ -3670,10 +3937,8 @@ export function createApiApp(options: ApiAppOptions = {}) {
     requesterUid: string,
     isAdmin = false
   ): Promise<boolean> {
-    const inMem = projectsStore.get(id);
-    if (inMem) {
-      await ensureMemoryProjectSeededInAdapter(inMem);
-    }
+    projectsCache.invalidate(requesterUid, id);
+    projectsCache.invalidateById(id);
     const removed = await activePersistenceAdapter.projects.delete(id, requesterUid, isAdmin);
     projectsStore.delete(id);
     canonicalProjectStores.delete(id);
@@ -3681,51 +3946,42 @@ export function createApiApp(options: ApiAppOptions = {}) {
     return removed;
   }
 
-  // --- Phase 2C Authoritative Helpers: Catalog, Variants, Reference Lab, AI Director & Template Factory ---
-
-  async function ensureMemoryCatalogItemSeededInAdapter(item: CatalogItem): Promise<void> {
-    try {
-      const existing = await activePersistenceAdapter.catalogAndVariants.getCatalogItemById(item.id);
-      if (!existing) {
-        await activePersistenceAdapter.catalogAndVariants.saveCatalogItem(item);
-      }
-    } catch {
-      // Ignore if already exists
-    }
-  }
+  // --- Phase 2C + F2 Authoritative Helpers: Catalog, Variants, Reference Lab, AI Director & Template Factory ---
 
   async function getAuthoritativeCatalogItem(id: string): Promise<CatalogItem | null> {
-    const inMem = catalogStore.get(id);
-    if (inMem) {
-      await ensureMemoryCatalogItemSeededInAdapter(inMem);
-    }
+    await ensureCoreCatalogSeedsReady();
     const found = await activePersistenceAdapter.catalogAndVariants.getCatalogItemById(id);
     if (found) {
       catalogStore.set(found.id, found);
+      catalogCache.set(found.ownerUid || 'public', found.id, found);
+    } else {
+      catalogCache.invalidateById(id);
     }
     return found;
   }
 
   async function listAuthoritativeCatalogItems(): Promise<CatalogItem[]> {
-    for (const item of catalogStore.values()) {
-      await ensureMemoryCatalogItemSeededInAdapter(item);
-    }
+    await ensureCoreCatalogSeedsReady();
     const items = await activePersistenceAdapter.catalogAndVariants.listCatalogItems();
     for (const item of items) {
       catalogStore.set(item.id, item);
+      catalogCache.set(item.ownerUid || 'public', item.id, item);
     }
     return items;
   }
 
   async function saveAuthoritativeCatalogItem(item: CatalogItem): Promise<CatalogItem> {
+    catalogCache.invalidateById(item.id);
     const saved = await activePersistenceAdapter.catalogAndVariants.saveCatalogItem(item);
     catalogStore.set(saved.id, saved);
+    catalogCache.set(saved.ownerUid || 'public', saved.id, saved);
     catalogCacheVersion += 1;
     persistState();
     return saved;
   }
 
   async function deleteAuthoritativeCatalogItem(id: string): Promise<boolean> {
+    catalogCache.invalidateById(id);
     const removed = await activePersistenceAdapter.catalogAndVariants.deleteCatalogItem(id);
     catalogStore.delete(id);
     catalogCacheVersion += 1;
@@ -3733,35 +3989,17 @@ export function createApiApp(options: ApiAppOptions = {}) {
     return removed;
   }
 
-  async function ensureMemoryVariantSeededInAdapter(variant: TemplateVariantInstance): Promise<void> {
-    try {
-      const existing = await activePersistenceAdapter.catalogAndVariants.getVariantById(
-        variant.id,
-        variant.ownerUid
-      );
-      if (!existing) {
-        await activePersistenceAdapter.catalogAndVariants.saveVariant(variant);
-      }
-    } catch {
-      // Ignore if already exists
-    }
-  }
-
   async function listAuthoritativeVariantsByOwner(
     ownerUid: string,
     baseTemplateId?: string
   ): Promise<TemplateVariantInstance[]> {
-    for (const v of templateVariantsStore.values()) {
-      if (v.ownerUid === ownerUid) {
-        await ensureMemoryVariantSeededInAdapter(v);
-      }
-    }
     const list = await activePersistenceAdapter.catalogAndVariants.listVariantsByOwner(
       ownerUid,
       baseTemplateId
     );
     for (const v of list) {
       templateVariantsStore.set(v.id, v);
+      templateVariantsCache.set(v.ownerUid, v.id, v);
     }
     return list.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
   }
@@ -3769,8 +4007,10 @@ export function createApiApp(options: ApiAppOptions = {}) {
   async function saveAuthoritativeVariant(
     variant: TemplateVariantInstance
   ): Promise<TemplateVariantInstance> {
+    templateVariantsCache.invalidate(variant.ownerUid, variant.id);
     const saved = await activePersistenceAdapter.catalogAndVariants.saveVariant(variant);
     templateVariantsStore.set(saved.id, saved);
+    templateVariantsCache.set(saved.ownerUid, saved.id, saved);
     persistState();
     return saved;
   }
@@ -3779,10 +4019,8 @@ export function createApiApp(options: ApiAppOptions = {}) {
     id: string,
     requesterUid: string
   ): Promise<boolean> {
-    const inMem = templateVariantsStore.get(id);
-    if (inMem) {
-      await ensureMemoryVariantSeededInAdapter(inMem);
-    }
+    templateVariantsCache.invalidate(requesterUid, id);
+    templateVariantsCache.invalidateById(id);
     const removed = await activePersistenceAdapter.catalogAndVariants.deleteVariant(
       id,
       requesterUid
@@ -3792,32 +4030,11 @@ export function createApiApp(options: ApiAppOptions = {}) {
     return removed;
   }
 
-  async function ensureMemoryReferenceLabSessionSeededInAdapter(
-    session: ReferenceLabSession
-  ): Promise<void> {
-    try {
-      const existing = await activePersistenceAdapter.referenceLabSessions.getById(
-        session.id,
-        session.ownerUid,
-        true
-      );
-      if (!existing) {
-        await activePersistenceAdapter.referenceLabSessions.save(session);
-      }
-    } catch {
-      // Ignore if already exists
-    }
-  }
-
   async function getAuthoritativeReferenceLabSession(
     id: string,
     requesterUid: string,
     isAdmin = false
   ): Promise<ReferenceLabSession | null> {
-    const inMem = referenceLabSessionsStore.get(id);
-    if (inMem) {
-      await ensureMemoryReferenceLabSessionSeededInAdapter(inMem);
-    }
     const found = await activePersistenceAdapter.referenceLabSessions.getById(
       id,
       requesterUid,
@@ -3825,6 +4042,9 @@ export function createApiApp(options: ApiAppOptions = {}) {
     );
     if (found) {
       referenceLabSessionsStore.set(found.id, found);
+      referenceLabSessionsCache.set(found.ownerUid, found.id, found);
+    } else {
+      referenceLabSessionsCache.invalidate(requesterUid, id);
     }
     return found;
   }
@@ -3833,19 +4053,21 @@ export function createApiApp(options: ApiAppOptions = {}) {
     ownerUid: string,
     includeAllForAdmin = false
   ): Promise<ReferenceLabSession[]> {
-    for (const sess of referenceLabSessionsStore.values()) {
-      if (includeAllForAdmin || sess.ownerUid === ownerUid) {
-        await ensureMemoryReferenceLabSessionSeededInAdapter(sess);
+    if (
+      includeAllForAdmin &&
+      typeof activePersistenceAdapter.referenceLabSessions.listAllForAdmin === 'function'
+    ) {
+      const all = await activePersistenceAdapter.referenceLabSessions.listAllForAdmin();
+      for (const s of all) {
+        referenceLabSessionsStore.set(s.id, s);
+        referenceLabSessionsCache.set(s.ownerUid, s.id, s);
       }
+      return all.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
     }
     const owned = await activePersistenceAdapter.referenceLabSessions.listByOwner(ownerUid);
     for (const s of owned) {
       referenceLabSessionsStore.set(s.id, s);
-    }
-    if (includeAllForAdmin) {
-      return Array.from(referenceLabSessionsStore.values()).sort((a, b) =>
-        (b.updatedAt || '').localeCompare(a.updatedAt || '')
-      );
+      referenceLabSessionsCache.set(s.ownerUid, s.id, s);
     }
     return owned.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
   }
@@ -3853,8 +4075,10 @@ export function createApiApp(options: ApiAppOptions = {}) {
   async function saveAuthoritativeReferenceLabSession(
     session: ReferenceLabSession
   ): Promise<ReferenceLabSession> {
+    referenceLabSessionsCache.invalidate(session.ownerUid, session.id);
     const saved = await activePersistenceAdapter.referenceLabSessions.save(session);
     referenceLabSessionsStore.set(saved.id, saved);
+    referenceLabSessionsCache.set(saved.ownerUid, saved.id, saved);
     persistState();
     return saved;
   }
@@ -3863,31 +4087,12 @@ export function createApiApp(options: ApiAppOptions = {}) {
     id: string,
     requesterUid: string
   ): Promise<boolean> {
-    const inMem = referenceLabSessionsStore.get(id);
-    if (inMem) {
-      await ensureMemoryReferenceLabSessionSeededInAdapter(inMem);
-    }
+    referenceLabSessionsCache.invalidate(requesterUid, id);
+    referenceLabSessionsCache.invalidateById(id);
     const removed = await activePersistenceAdapter.referenceLabSessions.delete(id, requesterUid);
     referenceLabSessionsStore.delete(id);
     persistState();
     return removed;
-  }
-
-  async function ensureMemoryAiDirectorSessionSeededInAdapter(
-    session: AiDirectorSessionRecord
-  ): Promise<void> {
-    try {
-      const existing = await activePersistenceAdapter.aiDirectorSessions.getById(
-        session.id,
-        session.ownerUid,
-        true
-      );
-      if (!existing) {
-        await activePersistenceAdapter.aiDirectorSessions.save(session);
-      }
-    } catch {
-      // Ignore if already exists
-    }
   }
 
   async function getAuthoritativeAiDirectorSession(
@@ -3895,10 +4100,6 @@ export function createApiApp(options: ApiAppOptions = {}) {
     requesterUid: string,
     isAdmin = false
   ): Promise<AiDirectorSessionRecord | null> {
-    const inMem = aiDirectorSessionsStore.get(id);
-    if (inMem) {
-      await ensureMemoryAiDirectorSessionSeededInAdapter(inMem);
-    }
     const found = await activePersistenceAdapter.aiDirectorSessions.getById(
       id,
       requesterUid,
@@ -3906,6 +4107,9 @@ export function createApiApp(options: ApiAppOptions = {}) {
     );
     if (found) {
       aiDirectorSessionsStore.set(found.id, found);
+      aiDirectorSessionsCache.set(found.ownerUid, found.id, found);
+    } else {
+      aiDirectorSessionsCache.invalidate(requesterUid, id);
     }
     return found;
   }
@@ -3914,19 +4118,21 @@ export function createApiApp(options: ApiAppOptions = {}) {
     ownerUid: string,
     includeAllForAdmin = false
   ): Promise<AiDirectorSessionRecord[]> {
-    for (const sess of aiDirectorSessionsStore.values()) {
-      if (includeAllForAdmin || sess.ownerUid === ownerUid) {
-        await ensureMemoryAiDirectorSessionSeededInAdapter(sess);
+    if (
+      includeAllForAdmin &&
+      typeof activePersistenceAdapter.aiDirectorSessions.listAllForAdmin === 'function'
+    ) {
+      const all = await activePersistenceAdapter.aiDirectorSessions.listAllForAdmin();
+      for (const s of all) {
+        aiDirectorSessionsStore.set(s.id, s);
+        aiDirectorSessionsCache.set(s.ownerUid, s.id, s);
       }
+      return all.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
     }
     const owned = await activePersistenceAdapter.aiDirectorSessions.listByOwner(ownerUid);
     for (const s of owned) {
       aiDirectorSessionsStore.set(s.id, s);
-    }
-    if (includeAllForAdmin) {
-      return Array.from(aiDirectorSessionsStore.values()).sort((a, b) =>
-        (b.updatedAt || '').localeCompare(a.updatedAt || '')
-      );
+      aiDirectorSessionsCache.set(s.ownerUid, s.id, s);
     }
     return owned.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
   }
@@ -3934,8 +4140,10 @@ export function createApiApp(options: ApiAppOptions = {}) {
   async function saveAuthoritativeAiDirectorSession(
     session: AiDirectorSessionRecord
   ): Promise<AiDirectorSessionRecord> {
+    aiDirectorSessionsCache.invalidate(session.ownerUid, session.id);
     const saved = await activePersistenceAdapter.aiDirectorSessions.save(session);
     aiDirectorSessionsStore.set(saved.id, saved);
+    aiDirectorSessionsCache.set(saved.ownerUid, saved.id, saved);
     persistState();
     return saved;
   }
@@ -3944,31 +4152,12 @@ export function createApiApp(options: ApiAppOptions = {}) {
     id: string,
     requesterUid: string
   ): Promise<boolean> {
-    const inMem = aiDirectorSessionsStore.get(id);
-    if (inMem) {
-      await ensureMemoryAiDirectorSessionSeededInAdapter(inMem);
-    }
+    aiDirectorSessionsCache.invalidate(requesterUid, id);
+    aiDirectorSessionsCache.invalidateById(id);
     const removed = await activePersistenceAdapter.aiDirectorSessions.delete(id, requesterUid);
     aiDirectorSessionsStore.delete(id);
     persistState();
     return removed;
-  }
-
-  async function ensureMemoryTemplateFactoryDraftSeededInAdapter(
-    draft: TemplateFactoryDraftRecord
-  ): Promise<void> {
-    try {
-      const existing = await activePersistenceAdapter.templateFactoryDrafts.getById(
-        draft.id,
-        draft.ownerUid,
-        true
-      );
-      if (!existing) {
-        await activePersistenceAdapter.templateFactoryDrafts.save(draft);
-      }
-    } catch {
-      // Ignore if already exists
-    }
   }
 
   async function getAuthoritativeTemplateFactoryDraft(
@@ -3976,10 +4165,6 @@ export function createApiApp(options: ApiAppOptions = {}) {
     requesterUid: string,
     isAdmin = false
   ): Promise<TemplateFactoryDraftRecord | null> {
-    const inMem = templateFactoryDraftsStore.get(id);
-    if (inMem) {
-      await ensureMemoryTemplateFactoryDraftSeededInAdapter(inMem);
-    }
     const found = await activePersistenceAdapter.templateFactoryDrafts.getById(
       id,
       requesterUid,
@@ -3987,6 +4172,9 @@ export function createApiApp(options: ApiAppOptions = {}) {
     );
     if (found) {
       templateFactoryDraftsStore.set(found.id, found);
+      templateFactoryDraftsCache.set(found.ownerUid, found.id, found);
+    } else {
+      templateFactoryDraftsCache.invalidate(requesterUid, id);
     }
     return found;
   }
@@ -3994,14 +4182,10 @@ export function createApiApp(options: ApiAppOptions = {}) {
   async function listAuthoritativeTemplateFactoryDrafts(
     ownerUid: string
   ): Promise<TemplateFactoryDraftRecord[]> {
-    for (const draft of templateFactoryDraftsStore.values()) {
-      if (draft.ownerUid === ownerUid) {
-        await ensureMemoryTemplateFactoryDraftSeededInAdapter(draft);
-      }
-    }
     const owned = await activePersistenceAdapter.templateFactoryDrafts.listByOwner(ownerUid);
     for (const d of owned) {
       templateFactoryDraftsStore.set(d.id, d);
+      templateFactoryDraftsCache.set(d.ownerUid, d.id, d);
     }
     return owned.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
   }
@@ -4009,8 +4193,10 @@ export function createApiApp(options: ApiAppOptions = {}) {
   async function saveAuthoritativeTemplateFactoryDraft(
     draft: TemplateFactoryDraftRecord
   ): Promise<TemplateFactoryDraftRecord> {
+    templateFactoryDraftsCache.invalidate(draft.ownerUid, draft.id);
     const saved = await activePersistenceAdapter.templateFactoryDrafts.save(draft);
     templateFactoryDraftsStore.set(saved.id, saved);
+    templateFactoryDraftsCache.set(saved.ownerUid, saved.id, saved);
     persistState();
     return saved;
   }
@@ -4023,20 +4209,20 @@ export function createApiApp(options: ApiAppOptions = {}) {
     catalogItem: CatalogItem;
     idempotentNoOp: boolean;
   }> {
-    const inMem = templateFactoryDraftsStore.get(draft.id);
-    if (inMem) {
-      await ensureMemoryTemplateFactoryDraftSeededInAdapter(inMem);
-    }
-    const inMemCat = catalogStore.get(catalogItem.id);
-    if (inMemCat) {
-      await ensureMemoryCatalogItemSeededInAdapter(inMemCat);
-    }
+    templateFactoryDraftsCache.invalidate(draft.ownerUid, draft.id);
+    catalogCache.invalidateById(catalogItem.id);
     const result = await activePersistenceAdapter.templateFactoryDrafts.publishDraftToCatalog(
       draft,
       catalogItem
     );
     templateFactoryDraftsStore.set(result.draft.id, result.draft);
+    templateFactoryDraftsCache.set(result.draft.ownerUid, result.draft.id, result.draft);
     catalogStore.set(result.catalogItem.id, result.catalogItem);
+    catalogCache.set(
+      result.catalogItem.ownerUid || 'public',
+      result.catalogItem.id,
+      result.catalogItem
+    );
     if (!result.idempotentNoOp) {
       catalogCacheVersion += 1;
     }
@@ -4048,10 +4234,8 @@ export function createApiApp(options: ApiAppOptions = {}) {
     id: string,
     requesterUid: string
   ): Promise<boolean> {
-    const inMem = templateFactoryDraftsStore.get(id);
-    if (inMem) {
-      await ensureMemoryTemplateFactoryDraftSeededInAdapter(inMem);
-    }
+    templateFactoryDraftsCache.invalidate(requesterUid, id);
+    templateFactoryDraftsCache.invalidateById(id);
     const removed = await activePersistenceAdapter.templateFactoryDrafts.delete(id, requesterUid);
     templateFactoryDraftsStore.delete(id);
     persistState();
@@ -4066,27 +4250,26 @@ export function createApiApp(options: ApiAppOptions = {}) {
     );
     if (fromAdapter) {
       userPreferenceConsentsStore.set(uid, fromAdapter);
+      preferenceConsentsCache.set(uid, 'consent', fromAdapter);
       return fromAdapter;
     }
-    const inMem = userPreferenceConsentsStore.get(uid);
-    if (inMem) {
-      await activePersistenceAdapter.templateFactoryDrafts.savePreferenceConsent(inMem);
-      return inMem;
-    }
     const def = createDefaultPreferenceConsent(uid);
-    await activePersistenceAdapter.templateFactoryDrafts.savePreferenceConsent(def);
-    userPreferenceConsentsStore.set(uid, def);
+    const saved = await activePersistenceAdapter.templateFactoryDrafts.savePreferenceConsent(def);
+    userPreferenceConsentsStore.set(uid, saved);
+    preferenceConsentsCache.set(uid, 'consent', saved);
     persistState();
-    return def;
+    return saved;
   }
 
   async function saveAuthoritativeUserPreferenceConsent(
     consent: UserPreferenceConsentConfig
   ): Promise<UserPreferenceConsentConfig> {
+    preferenceConsentsCache.invalidate(consent.ownerUid, 'consent');
     const saved = await activePersistenceAdapter.templateFactoryDrafts.savePreferenceConsent(
       consent
     );
     userPreferenceConsentsStore.set(saved.ownerUid, saved);
+    preferenceConsentsCache.set(saved.ownerUid, 'consent', saved);
     persistState();
     return saved;
   }
@@ -4094,17 +4277,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
   async function listAuthoritativePreferenceSignals(
     uid: string
   ): Promise<TemplatePreferenceSignal[]> {
-    const fromAdapter = await activePersistenceAdapter.templateFactoryDrafts.listPreferenceSignals(
-      uid
-    );
-    if (fromAdapter.length > 0) {
-      return fromAdapter;
-    }
-    const inMem = templatePreferenceSignalsStore.filter((s) => s.ownerUid === uid);
-    if (inMem.length > 0) {
-      await activePersistenceAdapter.templateFactoryDrafts.savePreferenceSignals(uid, inMem);
-    }
-    return inMem;
+    return activePersistenceAdapter.templateFactoryDrafts.listPreferenceSignals(uid);
   }
 
   async function saveAuthoritativePreferenceSignals(
@@ -4122,24 +4295,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
     return userSignals;
   }
 
-  // --- PHASE 2D: AUTHORITATIVE PROVIDER CONNECTIONS, VAULT, EXTENSIONS & RENDER JOBS HELPERS ---
-
-  async function ensureMemoryProviderConnectionSeededInAdapter(
-    conn: ProviderConnectionRecord
-  ): Promise<void> {
-    try {
-      const existing = await activePersistenceAdapter.providerConnections.getMetadataById(
-        conn.id,
-        conn.ownerUid,
-        true
-      );
-      if (!existing) {
-        await activePersistenceAdapter.providerConnections.saveMetadata(conn);
-      }
-    } catch {
-      // Ignore if already seeded
-    }
-  }
+  // --- PHASE 2D + F2: AUTHORITATIVE PROVIDER CONNECTIONS, VAULT, EXTENSIONS & RENDER JOBS HELPERS ---
 
   async function hydrateAndInspectProviderConnection(
     dto: Omit<ProviderConnectionRecord, 'encryptedCredential'>,
@@ -4172,6 +4328,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
       await activePersistenceAdapter.providerConnections.saveMetadata(inspected);
     }
     providerConnectionsStore.set(inspected.id, inspected);
+    providerConnectionsCache.set(inspected.ownerUid, inspected.id, inspected);
     return inspected;
   }
 
@@ -4180,22 +4337,22 @@ export function createApiApp(options: ApiAppOptions = {}) {
     requesterUid: string,
     isAdmin = false
   ): Promise<ProviderConnectionRecord | null> {
-    const inMem = providerConnectionsStore.get(id);
-    if (inMem) {
-      await ensureMemoryProviderConnectionSeededInAdapter(inMem);
-    }
     const dto = await activePersistenceAdapter.providerConnections.getMetadataById(
       id,
       requesterUid,
       isAdmin
     );
-    if (!dto) return null;
+    if (!dto) {
+      providerConnectionsCache.invalidate(requesterUid, id);
+      return null;
+    }
     return hydrateAndInspectProviderConnection(dto, dto.ownerUid);
   }
 
   async function saveAuthoritativeProviderConnection(
     conn: ProviderConnectionRecord
   ): Promise<ProviderConnectionRecord> {
+    providerConnectionsCache.invalidate(conn.ownerUid, conn.id);
     await activePersistenceAdapter.providerConnections.saveMetadata(conn);
     if (!conn.encryptedCredential && conn.credentialStatus === 'revoked') {
       await activePersistenceAdapter.credentialVault
@@ -4203,6 +4360,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
         .catch(() => {});
     }
     providerConnectionsStore.set(conn.id, conn);
+    providerConnectionsCache.set(conn.ownerUid, conn.id, conn);
     persistState();
     return conn;
   }
@@ -4211,10 +4369,8 @@ export function createApiApp(options: ApiAppOptions = {}) {
     id: string,
     requesterUid: string
   ): Promise<boolean> {
-    const inMem = providerConnectionsStore.get(id);
-    if (inMem) {
-      await ensureMemoryProviderConnectionSeededInAdapter(inMem);
-    }
+    providerConnectionsCache.invalidate(requesterUid, id);
+    providerConnectionsCache.invalidateById(id);
     const removed = await activePersistenceAdapter.providerConnections.deleteMetadata(
       id,
       requesterUid
@@ -4227,11 +4383,6 @@ export function createApiApp(options: ApiAppOptions = {}) {
   async function getOrSeedAuthoritativeUserProviderConnections(
     uid: string
   ): Promise<ProviderConnectionRecord[]> {
-    for (const c of providerConnectionsStore.values()) {
-      if (c.ownerUid === uid) {
-        await ensureMemoryProviderConnectionSeededInAdapter(c);
-      }
-    }
     const dtos = await activePersistenceAdapter.providerConnections.listMetadataByOwner(uid);
     if (dtos.length > 0) {
       const hydrated: ProviderConnectionRecord[] = [];
@@ -4285,60 +4436,45 @@ export function createApiApp(options: ApiAppOptions = {}) {
     const fromAdapter = await activePersistenceAdapter.routingAndExtensions.getRoutingProfiles(uid);
     if (fromAdapter) {
       routingProfilesStore.set(uid, fromAdapter);
+      routingProfilesCache.set(uid, 'routing', fromAdapter);
       return fromAdapter;
     }
-    const inMem = routingProfilesStore.get(uid);
-    if (inMem) {
-      await activePersistenceAdapter.routingAndExtensions.saveRoutingProfiles(uid, inMem);
-      return inMem;
-    }
     const defaults = buildDefaultRoutingProfiles(userConnections);
-    await activePersistenceAdapter.routingAndExtensions.saveRoutingProfiles(uid, defaults);
-    routingProfilesStore.set(uid, defaults);
+    const saved = await activePersistenceAdapter.routingAndExtensions.saveRoutingProfiles(
+      uid,
+      defaults
+    );
+    routingProfilesStore.set(uid, saved);
+    routingProfilesCache.set(uid, 'routing', saved);
     persistState();
-    return defaults;
+    return saved;
   }
 
   async function saveAuthoritativeRoutingProfiles(
     uid: string,
     profiles: Record<HubTaskType, TaskRoutingProfile>
   ): Promise<Record<HubTaskType, TaskRoutingProfile>> {
+    routingProfilesCache.invalidate(uid, 'routing');
     const saved = await activePersistenceAdapter.routingAndExtensions.saveRoutingProfiles(
       uid,
       profiles
     );
     routingProfilesStore.set(uid, saved);
+    routingProfilesCache.set(uid, 'routing', saved);
     persistState();
     return saved;
-  }
-
-  async function ensureMemoryExtensionSeededInAdapter(ext: ExtensionPackageRecord): Promise<void> {
-    try {
-      const owned = await activePersistenceAdapter.routingAndExtensions.listExtensionsByOwner(
-        ext.ownerUid
-      );
-      if (!owned.some((e) => e.id === ext.id)) {
-        await activePersistenceAdapter.routingAndExtensions.saveExtension(ext);
-      }
-    } catch {
-      // Ignore
-    }
   }
 
   async function listAuthoritativeExtensions(
     ownerUid: string,
     includeUninstalled = false
   ): Promise<ExtensionPackageRecord[]> {
-    for (const ext of extensionPackagesStore.values()) {
-      if (ext.ownerUid === ownerUid) {
-        await ensureMemoryExtensionSeededInAdapter(ext);
-      }
-    }
     const list = await activePersistenceAdapter.routingAndExtensions.listExtensionsByOwner(
       ownerUid
     );
     for (const ext of list) {
       extensionPackagesStore.set(ext.id, ext);
+      extensionsCache.set(ext.ownerUid, ext.id, ext);
     }
     return list
       .filter((e) => includeUninstalled || e.installState !== 'uninstalled')
@@ -4349,9 +4485,18 @@ export function createApiApp(options: ApiAppOptions = {}) {
     id: string,
     requesterUid: string
   ): Promise<ExtensionPackageRecord | null> {
-    const inMem = extensionPackagesStore.get(id);
-    if (inMem) {
-      await ensureMemoryExtensionSeededInAdapter(inMem);
+    if (typeof activePersistenceAdapter.routingAndExtensions.getExtensionById === 'function') {
+      const found = await activePersistenceAdapter.routingAndExtensions.getExtensionById(
+        id,
+        requesterUid
+      );
+      if (found) {
+        extensionPackagesStore.set(found.id, found);
+        extensionsCache.set(found.ownerUid, found.id, found);
+      } else {
+        extensionsCache.invalidate(requesterUid, id);
+      }
+      return found;
     }
     const list = await activePersistenceAdapter.routingAndExtensions.listExtensionsByOwner(
       requesterUid
@@ -4359,17 +4504,8 @@ export function createApiApp(options: ApiAppOptions = {}) {
     const found = list.find((e) => e.id === id) || null;
     if (found) {
       extensionPackagesStore.set(found.id, found);
+      extensionsCache.set(found.ownerUid, found.id, found);
       return found;
-    }
-    // Check if owned by someone else for 403 vs 404 distinction
-    if (inMem && inMem.ownerUid !== requesterUid) {
-      throw new PersistenceContractError({
-        code: 'CROSS_USER_ACCESS_FORBIDDEN',
-        message: `User "${requesterUid}" cannot access extension "${id}".`,
-        entity: 'extensionPackages',
-        operation: 'get',
-        documentId: id,
-      });
     }
     return null;
   }
@@ -4377,8 +4513,10 @@ export function createApiApp(options: ApiAppOptions = {}) {
   async function saveAuthoritativeExtension(
     ext: ExtensionPackageRecord
   ): Promise<ExtensionPackageRecord> {
+    extensionsCache.invalidate(ext.ownerUid, ext.id);
     const saved = await activePersistenceAdapter.routingAndExtensions.saveExtension(ext);
     extensionPackagesStore.set(saved.id, saved);
+    extensionsCache.set(saved.ownerUid, saved.id, saved);
     persistState();
     return saved;
   }
@@ -4387,10 +4525,8 @@ export function createApiApp(options: ApiAppOptions = {}) {
     id: string,
     requesterUid: string
   ): Promise<boolean> {
-    const inMem = extensionPackagesStore.get(id);
-    if (inMem) {
-      await ensureMemoryExtensionSeededInAdapter(inMem);
-    }
+    extensionsCache.invalidate(requesterUid, id);
+    extensionsCache.invalidateById(id);
     const removed = await activePersistenceAdapter.routingAndExtensions.deleteExtension(
       id,
       requesterUid
@@ -4415,34 +4551,13 @@ export function createApiApp(options: ApiAppOptions = {}) {
     const fromAdapter = await activePersistenceAdapter.routingAndExtensions.listToolAuditsByOwner(
       ownerUid
     );
-    if (fromAdapter.length > 0) {
-      return fromAdapter.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-    }
-    return toolAuditRecordsStore.filter((a) => a.ownerUid === ownerUid);
-  }
-
-  async function ensureMemoryRenderExportJobSeededInAdapter(
-    job: DurableRenderExportJobRecord
-  ): Promise<void> {
-    try {
-      const existing = await activePersistenceAdapter.renderExportJobs.getJobById(
-        job.id,
-        job.ownerUid,
-        true
-      );
-      if (!existing) {
-        await activePersistenceAdapter.renderExportJobs.saveJob(job, {
-          cloudStorageEnabled: storageEnabled,
-        });
-      }
-    } catch {
-      // Ignore
-    }
+    return fromAdapter.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
 
   async function saveAuthoritativeRenderExportJob(
     job: DurableRenderExportJobRecord
   ): Promise<DurableRenderExportJobRecord> {
+    renderExportJobsCache.invalidate(job.ownerUid, job.id);
     const saved = await activePersistenceAdapter.renderExportJobs.saveJob(job, {
       cloudStorageEnabled: storageEnabled,
     });
@@ -4452,6 +4567,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
       ...(job.artifactBytesBase64 ? { artifactBytesBase64: job.artifactBytesBase64 } : {}),
     };
     renderExportJobsStore.set(merged.id, merged);
+    renderExportJobsCache.set(merged.ownerUid, merged.id, merged);
     persistState();
     return merged;
   }
@@ -4462,15 +4578,15 @@ export function createApiApp(options: ApiAppOptions = {}) {
     isAdmin = false
   ): Promise<DurableRenderExportJobRecord | null> {
     const inMem = renderExportJobsStore.get(id);
-    if (inMem) {
-      await ensureMemoryRenderExportJobSeededInAdapter(inMem);
-    }
     const found = await activePersistenceAdapter.renderExportJobs.getJobById(
       id,
       requesterUid,
       isAdmin
     );
-    if (!found) return null;
+    if (!found) {
+      renderExportJobsCache.invalidate(requesterUid, id);
+      return null;
+    }
     const merged: DurableRenderExportJobRecord = {
       ...found,
       ...(inMem?.artifactBytesBase64 && !found.artifactBytesBase64
@@ -4478,17 +4594,13 @@ export function createApiApp(options: ApiAppOptions = {}) {
         : {}),
     };
     renderExportJobsStore.set(merged.id, merged);
+    renderExportJobsCache.set(merged.ownerUid, merged.id, merged);
     return merged;
   }
 
   async function listAuthoritativeRenderExportJobs(
     ownerUid: string
   ): Promise<DurableRenderExportJobRecord[]> {
-    for (const j of renderExportJobsStore.values()) {
-      if (j.ownerUid === ownerUid) {
-        await ensureMemoryRenderExportJobSeededInAdapter(j);
-      }
-    }
     const list = await activePersistenceAdapter.renderExportJobs.listJobsByOwner(ownerUid);
     const mergedList = list.map((found) => {
       const inMem = renderExportJobsStore.get(found.id);
@@ -4499,6 +4611,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
           : {}),
       };
       renderExportJobsStore.set(merged.id, merged);
+      renderExportJobsCache.set(merged.ownerUid, merged.id, merged);
       return merged;
     });
     return mergedList.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
@@ -4522,11 +4635,13 @@ export function createApiApp(options: ApiAppOptions = {}) {
 
     try {
       const owned = await listAuthoritativeProjects(uid);
+      const sliced = owned.slice(offset, offset + limit);
       return sendOk(res, authReq.requestId, {
-        items: owned.slice(offset, offset + limit),
+        items: sliced,
         total: owned.length,
         limit,
         offset,
+        hasMore: offset + sliced.length < owned.length,
       });
     } catch (err) {
       return sendPersistenceError(
@@ -5173,7 +5288,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
     }
   >();
 
-  app.post('/api/v1/exports/generate', requireAuth, (req: Request, res: Response) => {
+  app.post('/api/v1/exports/generate', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const uid = authReq.authIdentity!.uid;
     const parsed = MobileExportGenerateSchema.safeParse(req.body);
@@ -5188,7 +5303,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
       );
     }
 
-    const item = catalogStore.get(parsed.data.itemId);
+    const item = await getAuthoritativeCatalogItem(parsed.data.itemId);
     if (!item || (item.visibility !== 'published' && authReq.userRole === 'user')) {
       return sendError(res, authReq.requestId, 404, 'NOT_FOUND', 'Catalog item not found.');
     }
@@ -5396,7 +5511,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
     });
   });
 
-  app.post('/api/v1/exports/jobs/:id/retry', requireAuth, (req: Request, res: Response) => {
+  app.post('/api/v1/exports/jobs/:id/retry', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const uid = authReq.authIdentity!.uid;
     const stored = exportJobsStore.get(req.params.id);
@@ -5412,7 +5527,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
         'You cannot retry another user’s export job.'
       );
     }
-    const item = catalogStore.get(stored.exportJob.itemId);
+    const item = await getAuthoritativeCatalogItem(stored.exportJob.itemId);
     if (!item) {
       return sendError(res, authReq.requestId, 404, 'NOT_FOUND', 'Source catalog item not found.');
     }
@@ -6014,7 +6129,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
     '/api/v1/admin/summary',
     requireAuth,
     requireRole(['admin', 'owner']),
-    (req: Request, res: Response) => {
+    async (req: Request, res: Response) => {
       const authReq = req as AuthenticatedRequest;
       const range =
         typeof req.query.range === 'string' &&
@@ -6032,14 +6147,23 @@ export function createApiApp(options: ApiAppOptions = {}) {
           ? nowMs - 30 * 24 * 3600_000
           : 0;
 
-      const allCatalog = Array.from(catalogStore.values());
+      const allCatalog = await listAuthoritativeCatalogItems();
       const allModules = Array.from(modulesStore.values());
       const allUsers = Array.from(usersDirectoryStore.values());
       const allJobs = Array.from(jobsStore.values()).filter(
         (j) => Date.parse(j.createdAt) >= cutoffMs || cutoffMs === 0
       );
       const allAssets = Array.from(assetsStore.values());
-      const rangeAudit = auditLog.filter(
+      let allAuditEvents = auditLog;
+      try {
+        const persistedAudit = await activePersistenceAdapter.governance.listAuditEvents(500);
+        if (persistedAudit.length > 0) {
+          allAuditEvents = persistedAudit;
+        }
+      } catch {
+        // Fallback to in-memory auditLog
+      }
+      const rangeAudit = allAuditEvents.filter(
         (a) => Date.parse(a.createdAt) >= cutoffMs || cutoffMs === 0
       );
 
@@ -6445,9 +6569,9 @@ export function createApiApp(options: ApiAppOptions = {}) {
     '/api/v1/admin/modules',
     requireAuth,
     requireRole(['admin', 'owner']),
-    (req: Request, res: Response) => {
+    async (req: Request, res: Response) => {
       const authReq = req as AuthenticatedRequest;
-      const allCatalog = Array.from(catalogStore.values());
+      const allCatalog = await listAuthoritativeCatalogItems();
       const items = Array.from(modulesStore.values())
         .sort((a, b) => a.displayOrder - b.displayOrder)
         .map((m) => ({
@@ -6683,10 +6807,35 @@ export function createApiApp(options: ApiAppOptions = {}) {
     '/api/v1/admin/users',
     requireAuth,
     requireRole(['admin', 'owner']),
-    (req: Request, res: Response) => {
+    async (req: Request, res: Response) => {
       const authReq = req as AuthenticatedRequest;
       const q = typeof req.query.q === 'string' ? req.query.q.trim().toLowerCase() : '';
       const roleFilter = typeof req.query.role === 'string' ? req.query.role : undefined;
+
+      try {
+        if (typeof activePersistenceAdapter.governance.listRoles === 'function') {
+          const allRoles = await activePersistenceAdapter.governance.listRoles();
+          for (const [uid, r] of Object.entries(allRoles)) {
+            roleStore.set(uid, r);
+            if (!usersDirectoryStore.has(uid)) {
+              const now = new Date().toISOString();
+              const status = await resolveCallerAccountStatusAsync(uid);
+              usersDirectoryStore.set(uid, {
+                uid,
+                emailMasked: 'user***@sowveil.studio',
+                emailVerified: true,
+                displayName: `User ${uid.slice(0, 8)}`,
+                role: r,
+                status,
+                createdAt: now,
+                updatedAt: now,
+              });
+            }
+          }
+        }
+      } catch {
+        // Ignore
+      }
 
       const all = Array.from(usersDirectoryStore.values()).filter((u) => {
         if (roleFilter && u.role !== roleFilter) return false;
@@ -6704,7 +6853,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
       return sendOk(res, authReq.requestId, {
         items: all,
         total: all.length,
-        activeOwnerCount: countActiveOwners(),
+        activeOwnerCount: await countActiveOwnersAsync(),
       });
     }
   );
@@ -6732,10 +6881,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
       }
 
       const nextRole = parsed.data.role;
-      let currentTargetRole = roleStore.get(targetUid);
-      if (!currentTargetRole) {
-        currentTargetRole = await activePersistenceAdapter.governance.getRole(targetUid);
-      }
+      const currentTargetRole = await resolveCallerRoleAsync(targetUid);
 
       // Guard 1: Only an owner can assign or modify the 'owner' role
       if ((nextRole === 'owner' || currentTargetRole === 'owner') && actorRole !== 'owner') {
@@ -6781,7 +6927,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
 
       // Guard 3: Last-Owner Lockout Protection
       if (currentTargetRole === 'owner' && nextRole !== 'owner') {
-        const activeOwners = countActiveOwners();
+        const activeOwners = await countActiveOwnersAsync();
         if (activeOwners <= 1) {
           recordAudit(
             actorUid,
@@ -6813,7 +6959,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
         emailVerified: existingDir?.emailVerified ?? true,
         displayName: existingDir?.displayName || `User ${targetUid.slice(0, 8)}`,
         role: nextRole,
-        status: userStatusStore.get(targetUid) || 'active',
+        status: await resolveCallerAccountStatusAsync(targetUid),
         createdAt: existingDir?.createdAt || now,
         updatedAt: now,
       });
@@ -6858,10 +7004,9 @@ export function createApiApp(options: ApiAppOptions = {}) {
         );
       }
 
-      const targetRole =
-        roleStore.get(targetUid) || (await activePersistenceAdapter.governance.getRole(targetUid));
+      const targetRole = await resolveCallerRoleAsync(targetUid);
       if (targetRole === 'owner' && parsed.data.status !== 'active') {
-        if (countActiveOwners() <= 1) {
+        if ((await countActiveOwnersAsync()) <= 1) {
           recordAudit(
             actorUid,
             authReq.authIdentity!.email,
@@ -7035,10 +7180,17 @@ export function createApiApp(options: ApiAppOptions = {}) {
     '/api/v1/admin/analytics',
     requireAuth,
     requireRole(['admin', 'owner']),
-    (req: Request, res: Response) => {
+    async (req: Request, res: Response) => {
       const authReq = req as AuthenticatedRequest;
       const allJobs = Array.from(jobsStore.values());
-      const allCatalog = Array.from(catalogStore.values());
+      const allCatalog = await listAuthoritativeCatalogItems();
+      const allProjects =
+        typeof activePersistenceAdapter.projects.listAllForAdmin === 'function'
+          ? await activePersistenceAdapter.projects.listAllForAdmin()
+          : Array.from(projectsStore.values());
+      const allAudit = await activePersistenceAdapter.governance
+        .listAuditEvents(500)
+        .catch(() => auditLog);
 
       const exportsByEditor: Record<string, number> = {};
       const exportsByFormat: Record<string, number> = {};
@@ -7071,8 +7223,8 @@ export function createApiApp(options: ApiAppOptions = {}) {
             (acc, s) => acc + s.size,
             0
           ),
-          totalProjectLibraryRecords: projectsStore.size,
-          totalAuditEvents: auditLog.length,
+          totalProjectLibraryRecords: allProjects.length,
+          totalAuditEvents: Math.max(allAudit.length, auditLog.length),
         },
         exportsByEditor,
         exportsByFormat,
@@ -7216,30 +7368,91 @@ export function createApiApp(options: ApiAppOptions = {}) {
         return true;
       });
 
+      const sliced = filtered.slice(offset, offset + limit);
       return sendOk(res, authReq.requestId, {
-        items: filtered.slice(offset, offset + limit),
+        items: sliced,
         total: filtered.length,
         limit,
         offset,
+        hasMore: offset + sliced.length < filtered.length,
       });
     }
   );
 
-  // 11. Admin Persistence Migration & Cutover Routes (Phase 2D)
+  // 11. Admin Persistence Migration & Cutover Routes (Phase 2D + Prompt F0 Emergency Safety Lock)
   app.get(
     '/api/v1/admin/migration/status',
     requireAuth,
     requireRole(['admin', 'owner']),
-    (req: Request, res: Response) => {
+    async (req: Request, res: Response) => {
       const authReq = req as AuthenticatedRequest;
-      return sendOk(
-        res,
-        authReq.requestId,
-        getMigrationCutoverDiagnostics({
+      const diagnostics = await getMigrationCutoverDiagnosticsAsync({
+        persistenceAdapter: activePersistenceAdapter,
+        snapshotFilePath: persistenceFilePath,
+      });
+      return sendOk(res, authReq.requestId, diagnostics);
+    }
+  );
+
+  app.post(
+    '/api/v1/admin/migration/export-source',
+    requireAuth,
+    requireRole(['admin', 'owner']),
+    async (req: Request, res: Response) => {
+      const authReq = req as AuthenticatedRequest;
+      const body = req.body || {};
+      const requestedPath =
+        typeof body.snapshotFilePath === 'string' && body.snapshotFilePath.trim()
+          ? body.snapshotFilePath.trim()
+          : persistenceFilePath || undefined;
+      const exportFromRuntime = body.exportFromRunningEnvironment === true;
+
+      try {
+        const exportResult = await exportCurrentSourceSnapshot({
           persistenceAdapter: activePersistenceAdapter,
-          snapshotFilePath: persistenceFilePath,
-        })
-      );
+          snapshotFilePath: exportFromRuntime ? undefined : requestedPath,
+          sourceSnapshotPayload: exportFromRuntime
+            ? buildCurrentRuntimeSnapshot()
+            : body.sourceSnapshotPayload && typeof body.sourceSnapshotPayload === 'object'
+            ? (body.sourceSnapshotPayload as DurableStoreSnapshot)
+            : undefined,
+          exportedByUid: authReq.authIdentity!.uid,
+          expectedDatabaseId:
+            typeof body.expectedDatabaseId === 'string' && body.expectedDatabaseId.trim()
+              ? body.expectedDatabaseId.trim()
+              : undefined,
+          externalDurableBackupDir:
+            typeof body.externalDurableBackupDir === 'string' && body.externalDurableBackupDir.trim()
+              ? body.externalDurableBackupDir.trim()
+              : undefined,
+          disableDurableBackupDestination: body.disableDurableBackupDestination === true,
+        });
+        recordAudit(
+          authReq.authIdentity!.uid,
+          authReq.authIdentity!.email,
+          'MIGRATION_DRY_RUN_EXECUTED',
+          exportResult.exportId,
+          `Exported source snapshot to independently durable backup (${exportResult.totalRecords} records, backupId=${exportResult.durableBackup.backupId})`,
+          authReq.requestId,
+          'system',
+          'success'
+        );
+        return sendOk(res, authReq.requestId, { exportResult });
+      } catch (err: any) {
+        const code = err?.code || 'MIGRATION_EXPORT_FAILED';
+        const status =
+          code === 'MIGRATION_BACKEND_NOT_PRODUCTION_READY' ||
+          code === 'DURABLE_PERSISTENCE_FAILED'
+            ? 503
+            : 400;
+        return sendError(
+          res,
+          authReq.requestId,
+          status,
+          code,
+          err?.message || 'Failed to export source snapshot to durable backup.'
+        );
+      }
     }
   );
 
@@ -7249,11 +7462,13 @@ export function createApiApp(options: ApiAppOptions = {}) {
     requireRole(['admin', 'owner']),
     async (req: Request, res: Response) => {
       const authReq = req as AuthenticatedRequest;
+      const body = req.body || {};
+      const exportFromRuntime = body.exportFromRunningEnvironment === true;
       const requestedPath =
-        typeof req.body?.snapshotFilePath === 'string' && req.body.snapshotFilePath.trim()
-          ? req.body.snapshotFilePath.trim()
-          : persistenceFilePath;
-      if (!requestedPath) {
+        typeof body.snapshotFilePath === 'string' && body.snapshotFilePath.trim()
+          ? body.snapshotFilePath.trim()
+          : persistenceFilePath || (exportFromRuntime ? 'runtime://live-sowveil-snapshot' : '');
+      if (!requestedPath && !exportFromRuntime && !body.sourceSnapshotPayload) {
         return sendError(
           res,
           authReq.requestId,
@@ -7266,14 +7481,34 @@ export function createApiApp(options: ApiAppOptions = {}) {
       try {
         const report = await executeMigrationDryRun({
           snapshotFilePath: requestedPath,
+          sourceSnapshotPayload: exportFromRuntime
+            ? buildCurrentRuntimeSnapshot()
+            : body.sourceSnapshotPayload && typeof body.sourceSnapshotPayload === 'object'
+            ? (body.sourceSnapshotPayload as DurableStoreSnapshot)
+            : undefined,
           persistenceAdapter: activePersistenceAdapter,
+          expectedDatabaseId:
+            typeof body.expectedDatabaseId === 'string' && body.expectedDatabaseId.trim()
+              ? body.expectedDatabaseId.trim()
+              : undefined,
+          tokenTtlMs:
+            typeof body.tokenTtlMs === 'number' && Number.isFinite(body.tokenTtlMs)
+              ? body.tokenTtlMs
+              : undefined,
+          reviewedByUid: authReq.authIdentity!.uid,
+          externalDurableBackupDir:
+            typeof body.externalDurableBackupDir === 'string' && body.externalDurableBackupDir.trim()
+              ? body.externalDurableBackupDir.trim()
+              : undefined,
+          disableDurableBackupDestination: body.disableDurableBackupDestination === true,
+          acknowledgeUnreadableVaultRecovery: body.acknowledgeUnreadableVaultRecovery === true,
         });
         recordAudit(
           authReq.authIdentity!.uid,
           authReq.authIdentity!.email,
           'MIGRATION_DRY_RUN_EXECUTED',
           report.dryRunId,
-          `Executed migration dry-run (${report.totalRecordsToMigrate} records, vaultRequiresReentry=${report.vaultHealth.requiresReentryCount})`,
+          `Executed migration dry-run (${report.totalRecordsToMigrate} records, canSafelyApply=${report.canSafelyApply}, vaultRequiresReentry=${report.vaultHealth.requiresReentryCount})`,
           authReq.requestId,
           'system',
           'success'
@@ -7298,11 +7533,12 @@ export function createApiApp(options: ApiAppOptions = {}) {
     async (req: Request, res: Response) => {
       const authReq = req as AuthenticatedRequest;
       const body = req.body || {};
+      const exportFromRuntime = body.exportFromRunningEnvironment === true;
       const requestedPath =
         typeof body.snapshotFilePath === 'string' && body.snapshotFilePath.trim()
           ? body.snapshotFilePath.trim()
-          : persistenceFilePath;
-      if (!requestedPath) {
+          : persistenceFilePath || (exportFromRuntime ? 'runtime://live-sowveil-snapshot' : '');
+      if (!requestedPath && !exportFromRuntime && !body.sourceSnapshotPayload) {
         return sendError(
           res,
           authReq.requestId,
@@ -7315,19 +7551,46 @@ export function createApiApp(options: ApiAppOptions = {}) {
       try {
         const result = await executeMigrationApply({
           snapshotFilePath: requestedPath,
+          sourceSnapshotPayload: exportFromRuntime
+            ? buildCurrentRuntimeSnapshot()
+            : body.sourceSnapshotPayload && typeof body.sourceSnapshotPayload === 'object'
+            ? (body.sourceSnapshotPayload as DurableStoreSnapshot)
+            : undefined,
           persistenceAdapter: activePersistenceAdapter,
           dryRunId: typeof body.dryRunId === 'string' ? body.dryRunId : '',
           confirmationToken:
             typeof body.confirmationToken === 'string' ? body.confirmationToken : '',
           confirmApply: Boolean(body.confirmApply),
-          disableLegacyWriters: body.disableLegacyWriters !== false,
+          // Prompt F3 invariant: legacy writers remain enabled until the separate cutover step
+          disableLegacyWriters: false,
+          expectedDatabaseId:
+            typeof body.expectedDatabaseId === 'string' && body.expectedDatabaseId.trim()
+              ? body.expectedDatabaseId.trim()
+              : undefined,
+          resumeFromDryRunId:
+            typeof body.resumeFromDryRunId === 'string' && body.resumeFromDryRunId.trim()
+              ? body.resumeFromDryRunId.trim()
+              : undefined,
+          batchSize:
+            typeof body.batchSize === 'number' && Number.isFinite(body.batchSize)
+              ? body.batchSize
+              : undefined,
+          maxBatches:
+            typeof body.maxBatches === 'number' && Number.isFinite(body.maxBatches)
+              ? body.maxBatches
+              : undefined,
+          externalDurableBackupDir:
+            typeof body.externalDurableBackupDir === 'string' && body.externalDurableBackupDir.trim()
+              ? body.externalDurableBackupDir.trim()
+              : undefined,
+          disableDurableBackupDestination: body.disableDurableBackupDestination === true,
         });
         recordAudit(
           authReq.authIdentity!.uid,
           authReq.authIdentity!.email,
           'MIGRATION_CUTOVER_APPLIED',
           result.dryRunId,
-          `Applied migration cutover (totalMigrated=${result.totalMigrated}, legacyWritersDisabled=${result.legacyWritersDisabled})`,
+          `Applied staged migration (totalMigrated=${result.totalMigrated}, status=${result.batchExecutionStatus}, cutoverApprovalEligible=${result.cutoverApprovalEligible}, legacyWritersDisabled=${result.legacyWritersDisabled})`,
           authReq.requestId,
           'system',
           'success'
@@ -7335,19 +7598,303 @@ export function createApiApp(options: ApiAppOptions = {}) {
         return sendOk(res, authReq.requestId, { result });
       } catch (err: any) {
         const code = err?.code || 'MIGRATION_APPLY_FAILED';
-        const status =
+        let status = 500;
+        if (
+          code === 'MIGRATION_BACKEND_NOT_PRODUCTION_READY' ||
+          code === 'DURABLE_PERSISTENCE_FAILED'
+        ) {
+          status = 503;
+        } else if (
+          code === 'MIGRATION_LOCK_ALREADY_HELD' ||
+          code === 'MIGRATION_PRECONDITIONS_FAILED' ||
+          code === 'ID_OWNER_COLLISION'
+        ) {
+          status = 409;
+        } else if (
           code === 'OPERATOR_CONFIRMATION_REQUIRED' ||
           code === 'CONFIRMATION_TOKEN_REQUIRED' ||
           code === 'INVALID_CONFIRMATION_TOKEN' ||
+          code === 'CONFIRMATION_TOKEN_EXPIRED' ||
+          code === 'CONFIRMATION_TOKEN_ALREADY_USED' ||
           code === 'DRY_RUN_ID_MISMATCH'
-            ? 400
-            : 500;
+        ) {
+          status = 400;
+        }
+        const details =
+          code === 'MIGRATION_INCOMPLETE_RECORD_FAILURES' || code === 'ID_OWNER_COLLISION'
+            ? {
+                failedRecords: err.failedRecords || [],
+                migratedCounts: err.migratedCounts || {},
+                totalMigrated: err.totalMigrated ?? 0,
+                expectedTotalRecords: err.expectedTotalRecords ?? 0,
+                legacyWritersDisabled: false,
+              }
+            : undefined;
         return sendError(
           res,
           authReq.requestId,
           status,
           code,
-          err?.message || 'Migration apply failed.'
+          err?.message || 'Migration apply failed.',
+          details
+        );
+      }
+    }
+  );
+
+  app.get(
+    '/api/v1/admin/migration/ledger/:dryRunId',
+    requireAuth,
+    requireRole(['admin', 'owner']),
+    async (req: Request, res: Response) => {
+      const authReq = req as AuthenticatedRequest;
+      const dryRunId = String(req.params.dryRunId || '').trim();
+      try {
+        await verifyMigrationBackendProductionReady(activePersistenceAdapter, {
+          throwOnNotReady: true,
+        });
+        const entries = activePersistenceAdapter.migrationState?.listLedgerEntries
+          ? await activePersistenceAdapter.migrationState.listLedgerEntries(dryRunId)
+          : [];
+        return sendOk(res, authReq.requestId, {
+          dryRunId,
+          entryCount: entries.length,
+          entries,
+        });
+      } catch (err: any) {
+        const code = err?.code || 'MIGRATION_LEDGER_ERROR';
+        const status = code === 'MIGRATION_BACKEND_NOT_PRODUCTION_READY' ? 503 : 400;
+        return sendError(
+          res,
+          authReq.requestId,
+          status,
+          code,
+          err?.message || 'Failed to read migration ledger.'
+        );
+      }
+    }
+  );
+
+  app.get(
+    '/api/v1/admin/migration/recovery/:dryRunId',
+    requireAuth,
+    requireRole(['admin', 'owner']),
+    async (req: Request, res: Response) => {
+      const authReq = req as AuthenticatedRequest;
+      const dryRunId = String(req.params.dryRunId || '').trim();
+      try {
+        await verifyMigrationBackendProductionReady(activePersistenceAdapter, {
+          throwOnNotReady: true,
+        });
+        const recoveryReport = activePersistenceAdapter.migrationState?.getRecoveryReport
+          ? await activePersistenceAdapter.migrationState.getRecoveryReport(dryRunId)
+          : null;
+        if (!recoveryReport) {
+          return sendError(
+            res,
+            authReq.requestId,
+            404,
+            'RECOVERY_REPORT_NOT_FOUND',
+            `No recovery report found for dryRunId "${dryRunId}".`
+          );
+        }
+        return sendOk(res, authReq.requestId, { recoveryReport });
+      } catch (err: any) {
+        const code = err?.code || 'MIGRATION_RECOVERY_ERROR';
+        const status = code === 'MIGRATION_BACKEND_NOT_PRODUCTION_READY' ? 503 : 400;
+        return sendError(
+          res,
+          authReq.requestId,
+          status,
+          code,
+          err?.message || 'Failed to read migration recovery report.'
+        );
+      }
+    }
+  );
+
+  app.post(
+    '/api/v1/admin/migration/cutover/prepare',
+    requireAuth,
+    requireRole(['admin', 'owner']),
+    async (req: Request, res: Response) => {
+      const authReq = req as AuthenticatedRequest;
+      const body = req.body || {};
+      try {
+        const prepared = await prepareFinalPersistenceCutover({
+          persistenceAdapter: activePersistenceAdapter,
+          applyId:
+            typeof body.applyId === 'string' && body.applyId.trim()
+              ? body.applyId.trim()
+              : undefined,
+          operatorUid: authReq.authIdentity!.uid,
+          operatorEmail: authReq.authIdentity!.email,
+          expectedDatabaseId:
+            typeof body.expectedDatabaseId === 'string' && body.expectedDatabaseId.trim()
+              ? body.expectedDatabaseId.trim()
+              : undefined,
+          releaseCommit:
+            typeof body.releaseCommit === 'string' && body.releaseCommit.trim()
+              ? body.releaseCommit.trim()
+              : undefined,
+          reconciliationStrategy:
+            body.reconciliationStrategy === 'dual-write-outbox-reconcile'
+              ? 'dual-write-outbox-reconcile'
+              : 'maintenance-read-only-window',
+          tokenTtlMs:
+            typeof body.tokenTtlMs === 'number' && Number.isFinite(body.tokenTtlMs)
+              ? body.tokenTtlMs
+              : undefined,
+        });
+        recordAudit(
+          authReq.authIdentity!.uid,
+          authReq.authIdentity!.email,
+          'MIGRATION_DRY_RUN_EXECUTED',
+          prepared.proposal.proposalId,
+          `Prepared final persistence cutover proposal (applyId=${prepared.proposal.applyId}, totalRecordsVerified=${prepared.proposal.totalRecordsVerified})`,
+          authReq.requestId,
+          'system',
+          'success'
+        );
+        return sendOk(res, authReq.requestId, prepared);
+      } catch (err: any) {
+        const code = err?.code || 'CUTOVER_PREPARE_FAILED';
+        const status =
+          typeof err?.statusCode === 'number'
+            ? err.statusCode
+            : code === 'MIGRATION_BACKEND_NOT_PRODUCTION_READY'
+            ? 503
+            : code === 'CUTOVER_OPERATOR_IDENTITY_REQUIRED'
+            ? 403
+            : 409;
+        return sendError(
+          res,
+          authReq.requestId,
+          status,
+          code,
+          err?.message || 'Failed to prepare final persistence cutover.'
+        );
+      }
+    }
+  );
+
+  app.post(
+    '/api/v1/admin/migration/cutover/commit',
+    requireAuth,
+    requireRole(['admin', 'owner']),
+    async (req: Request, res: Response) => {
+      const authReq = req as AuthenticatedRequest;
+      const body = req.body || {};
+      const requestedPath =
+        typeof body.snapshotFilePath === 'string' && body.snapshotFilePath.trim()
+          ? body.snapshotFilePath.trim()
+          : persistenceFilePath;
+
+      try {
+        const receipt = await executeFinalPersistenceCutover({
+          persistenceAdapter: activePersistenceAdapter,
+          proposalId: typeof body.proposalId === 'string' ? body.proposalId : '',
+          applyId:
+            typeof body.applyId === 'string' && body.applyId.trim()
+              ? body.applyId.trim()
+              : undefined,
+          secondConfirmationToken:
+            typeof body.secondConfirmationToken === 'string'
+              ? body.secondConfirmationToken
+              : '',
+          confirmFinalCutover: Boolean(body.confirmFinalCutover),
+          operatorUid: authReq.authIdentity!.uid,
+          operatorEmail: authReq.authIdentity!.email,
+          expectedDatabaseId:
+            typeof body.expectedDatabaseId === 'string' && body.expectedDatabaseId.trim()
+              ? body.expectedDatabaseId.trim()
+              : undefined,
+          releaseCommit:
+            typeof body.releaseCommit === 'string' && body.releaseCommit.trim()
+              ? body.releaseCommit.trim()
+              : undefined,
+          reconciliationStrategy:
+            body.reconciliationStrategy === 'dual-write-outbox-reconcile'
+              ? 'dual-write-outbox-reconcile'
+              : 'maintenance-read-only-window',
+          snapshotFilePath: requestedPath,
+          reconciliationDelayMs:
+            typeof body.reconciliationDelayMs === 'number' &&
+            Number.isFinite(body.reconciliationDelayMs)
+              ? body.reconciliationDelayMs
+              : undefined,
+          simulateAcceptanceFailure: body.simulateAcceptanceFailure === true,
+        });
+        recordAudit(
+          authReq.authIdentity!.uid,
+          authReq.authIdentity!.email,
+          'MIGRATION_CUTOVER_APPLIED',
+          receipt.cutoverId,
+          `Committed final persistence cutover (applyId=${receipt.applyId}, releaseCommit=${receipt.releaseCommit}, legacyWritersDisabled=${receipt.legacyWritersDisabled})`,
+          authReq.requestId,
+          'system',
+          'success'
+        );
+        return sendOk(res, authReq.requestId, { receipt });
+      } catch (err: any) {
+        const code = err?.code || 'FINAL_CUTOVER_FAILED';
+        const status =
+          typeof err?.statusCode === 'number'
+            ? err.statusCode
+            : code === 'MIGRATION_BACKEND_NOT_PRODUCTION_READY'
+            ? 503
+            : code === 'CUTOVER_OPERATOR_IDENTITY_REQUIRED'
+            ? 403
+            : code === 'CUTOVER_SECOND_CONFIRMATION_REQUIRED' ||
+              code === 'CUTOVER_CONFIRMATION_TOKEN_INVALID' ||
+              code === 'CUTOVER_CONFIRMATION_TOKEN_EXPIRED'
+            ? 400
+            : code === 'CUTOVER_RECONCILIATION_ACCEPTANCE_FAILED'
+            ? 500
+            : 409;
+        return sendError(
+          res,
+          authReq.requestId,
+          status,
+          code,
+          err?.message || 'Final persistence cutover failed.'
+        );
+      }
+    }
+  );
+
+  app.get(
+    '/api/v1/admin/migration/cutover/receipt',
+    requireAuth,
+    requireRole(['admin', 'owner']),
+    async (req: Request, res: Response) => {
+      const authReq = req as AuthenticatedRequest;
+      try {
+        await verifyMigrationBackendProductionReady(activePersistenceAdapter, {
+          throwOnNotReady: true,
+        });
+        const receipt = activePersistenceAdapter.migrationState?.getLatestFinalCutoverReceipt
+          ? await activePersistenceAdapter.migrationState.getLatestFinalCutoverReceipt()
+          : null;
+        if (!receipt) {
+          return sendError(
+            res,
+            authReq.requestId,
+            404,
+            'CUTOVER_RECEIPT_NOT_FOUND',
+            'No final persistence cutover receipt has been committed yet.'
+          );
+        }
+        return sendOk(res, authReq.requestId, { receipt });
+      } catch (err: any) {
+        const code = err?.code || 'CUTOVER_RECEIPT_READ_FAILED';
+        const status = code === 'MIGRATION_BACKEND_NOT_PRODUCTION_READY' ? 503 : 400;
+        return sendError(
+          res,
+          authReq.requestId,
+          status,
+          code,
+          err?.message || 'Failed to read final cutover receipt.'
         );
       }
     }
@@ -7361,42 +7908,57 @@ export function createApiApp(options: ApiAppOptions = {}) {
       const authReq = req as AuthenticatedRequest;
       const body = req.body || {};
       const backupPath = typeof body.backupPath === 'string' ? body.backupPath.trim() : '';
+      const durableBackupId =
+        typeof body.durableBackupId === 'string' && body.durableBackupId.trim()
+          ? body.durableBackupId.trim()
+          : undefined;
       const targetSnapshotPath =
         typeof body.targetSnapshotPath === 'string' && body.targetSnapshotPath.trim()
           ? body.targetSnapshotPath.trim()
           : persistenceFilePath;
-      if (!backupPath || !targetSnapshotPath) {
+      if ((!backupPath && !durableBackupId) || !targetSnapshotPath) {
         return sendError(
           res,
           authReq.requestId,
           400,
           'ROLLBACK_PATHS_REQUIRED',
-          'Both backupPath and targetSnapshotPath are required to execute a migration rollback.'
+          'Both (backupPath or durableBackupId) and targetSnapshotPath are required to execute a migration rollback.'
         );
       }
 
       try {
         const rollbackResult = await executeMigrationRollback({
           backupPath,
+          durableBackupId,
           targetSnapshotPath,
+          persistenceAdapter: activePersistenceAdapter,
+          operatorUid: authReq.authIdentity!.uid,
+          operatorEmail: authReq.authIdentity!.email,
         });
         recordAudit(
           authReq.authIdentity!.uid,
           authReq.authIdentity!.email,
           'MIGRATION_CUTOVER_ROLLED_BACK',
           rollbackResult.rollbackId,
-          `Restored snapshot from backup (legacyWritersRestored=${rollbackResult.legacyWritersRestored})`,
+          `Restored snapshot from backup (legacyWritersRestored=${rollbackResult.legacyWritersRestored}, preservedNewerRecords=${rollbackResult.preservedNewerTargetRecordsCount})`,
           authReq.requestId,
           'system',
           'success'
         );
         return sendOk(res, authReq.requestId, { rollbackResult });
       } catch (err: any) {
+        const code = err?.code || 'MIGRATION_ROLLBACK_FAILED';
+        const status =
+          typeof err?.statusCode === 'number'
+            ? err.statusCode
+            : code === 'MIGRATION_LOCK_ALREADY_HELD' || code === 'ROLLBACK_UNSAFE_PRECONDITIONS'
+            ? 409
+            : 400;
         return sendError(
           res,
           authReq.requestId,
-          400,
-          err?.code || 'MIGRATION_ROLLBACK_FAILED',
+          status,
+          code,
           err?.message || 'Migration rollback failed.'
         );
       }
@@ -7696,14 +8258,19 @@ export function createApiApp(options: ApiAppOptions = {}) {
     const authReq = req as AuthenticatedRequest;
     const uid = authReq.authIdentity!.uid;
     const isPrivileged = authReq.userRole === 'admin' || authReq.userRole === 'owner';
+    const { limit, offset } = parsePagination(req);
     try {
       const items = await listAuthoritativeReferenceLabSessions(
         uid,
         isPrivileged && req.query.all === 'true'
       );
+      const sliced = items.slice(offset, offset + limit);
       return sendOk(res, authReq.requestId, {
-        items,
+        items: sliced,
         total: items.length,
+        limit,
+        offset,
+        hasMore: offset + sliced.length < items.length,
       });
     } catch (err) {
       return sendPersistenceError(
@@ -8255,11 +8822,17 @@ export function createApiApp(options: ApiAppOptions = {}) {
   app.get('/api/v1/provider-hub/connections', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const uid = authReq.authIdentity!.uid;
+    const { limit, offset } = parsePagination(req);
     try {
       const connections = await getOrSeedAuthoritativeUserProviderConnections(uid);
+      const publicViews = connections.map(toPublicProviderConnectionView);
+      const sliced = publicViews.slice(offset, offset + limit);
       return sendOk(res, authReq.requestId, {
-        items: connections.map(toPublicProviderConnectionView),
-        total: connections.length,
+        items: sliced,
+        total: publicViews.length,
+        limit,
+        offset,
+        hasMore: offset + sliced.length < publicViews.length,
         vaultStatus: getVaultConfigurationDiagnostics(),
       });
     } catch (err) {
@@ -8888,11 +9461,16 @@ export function createApiApp(options: ApiAppOptions = {}) {
   app.get('/api/v1/extensions', requireAuth, async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const uid = authReq.authIdentity!.uid;
+    const { limit, offset } = parsePagination(req);
     try {
       const items = await getOrSeedAuthoritativeUserExtensions(uid);
+      const sliced = items.slice(offset, offset + limit);
       return sendOk(res, authReq.requestId, {
-        items,
+        items: sliced,
         total: items.length,
+        limit,
+        offset,
+        hasMore: offset + sliced.length < items.length,
       });
     } catch (err) {
       return sendPersistenceError(
@@ -9282,13 +9860,18 @@ export function createApiApp(options: ApiAppOptions = {}) {
     const uid = authReq.authIdentity!.uid;
     const isAdmin = authReq.userRole === 'owner' || authReq.userRole === 'admin';
     const includeAll = isAdmin && req.query.scope === 'all';
+    const { limit, offset } = parsePagination(req);
     try {
       const items = (await listAuthoritativeAiDirectorSessions(uid, includeAll)).sort((a, b) =>
         b.updatedAt.localeCompare(a.updatedAt)
       );
+      const sliced = items.slice(offset, offset + limit);
       return sendOk(res, authReq.requestId, {
-        items,
+        items: sliced,
         total: items.length,
+        limit,
+        offset,
+        hasMore: offset + sliced.length < items.length,
       });
     } catch (err) {
       return sendPersistenceError(
@@ -10438,6 +11021,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
     const authReq = req as AuthenticatedRequest;
     res.setHeader('Cache-Control', 'private, no-store');
     const uid = authReq.authIdentity!.uid;
+    const { limit, offset } = parsePagination(req);
 
     try {
       const drafts = (await listAuthoritativeTemplateFactoryDrafts(uid)).sort((a, b) =>
@@ -10445,10 +11029,14 @@ export function createApiApp(options: ApiAppOptions = {}) {
       );
       const consent = await getOrInitAuthoritativeUserPreferenceConsent(uid);
       const signals = await listAuthoritativePreferenceSignals(uid);
+      const sliced = drafts.slice(offset, offset + limit);
 
       return sendOk(res, authReq.requestId, {
-        items: drafts,
+        items: sliced,
         total: drafts.length,
+        limit,
+        offset,
+        hasMore: offset + sliced.length < drafts.length,
         preferenceConsent: consent,
         preferenceSignals: signals,
       });
@@ -10466,7 +11054,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
     const authReq = req as AuthenticatedRequest;
     res.setHeader('Cache-Control', 'private, no-store');
     const uid = authReq.authIdentity!.uid;
-    const r = roleStore.get(uid) || 'user';
+    const r = authReq.userRole || (await resolveCallerRoleAsync(uid));
     const isAdmin = r === 'admin' || r === 'owner';
     const draftId = req.params.id;
 
@@ -11401,13 +11989,20 @@ export function createApiApp(options: ApiAppOptions = {}) {
     const authReq = req as AuthenticatedRequest;
     res.setHeader('Cache-Control', 'private, no-store');
     const uid = authReq.authIdentity!.uid;
+    const { limit, offset } = parsePagination(req);
 
     try {
       const owned = await listAuthoritativeRenderExportJobs(uid);
-      const jobs = owned.map(toPublicRenderJobView);
+      const allJobs = owned.map(toPublicRenderJobView);
+      const sliced = allJobs.slice(offset, offset + limit);
 
       return sendOk(res, authReq.requestId, {
-        jobs,
+        jobs: sliced,
+        items: sliced,
+        total: allJobs.length,
+        limit,
+        offset,
+        hasMore: offset + sliced.length < allJobs.length,
         sampleProject: createKnownGoodSampleCanonicalProject(uid),
       });
     } catch (err) {

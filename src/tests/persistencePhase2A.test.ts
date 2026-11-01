@@ -1,11 +1,15 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import http from 'node:http';
 import { createApiApp } from '../server/apiApp';
 import {
   AuthoritativeFirestorePersistenceAdapter,
   LocalSnapshotPersistenceAdapter,
   RuleEnforcingFirestoreTestDriver,
+  VerifiedProductionFirestoreDriver,
 } from '../server/persistenceAdapters';
 import {
   deserializeProjectFromFirestoreDto,
@@ -444,10 +448,32 @@ describe('Phase 2A: Production Readiness Gate, Snapshot Classification & Sanitiz
       await new Promise<void>((resolve) => serverBlocked.close(() => resolve()));
     }
 
-    // Now verify /api/v1/ready returns 200 when configured with AuthoritativeFirestorePersistenceAdapter in production
+    // Verify /api/v1/ready returns 503 if AuthoritativeFirestorePersistenceAdapter is injected with a test driver
+    const appTestDriverProd = createApiApp({
+      nodeEnv: 'production',
+      persistenceAdapter: new AuthoritativeFirestorePersistenceAdapter({
+        driver: new RuleEnforcingFirestoreTestDriver(),
+        nodeEnv: 'production',
+      }),
+    });
+    const serverTestDriver = http.createServer(appTestDriverProd);
+    await new Promise<void>((resolve) => serverTestDriver.listen(0, '127.0.0.1', resolve));
+    const portTestDriver = (serverTestDriver.address() as { port: number }).port;
+    try {
+      const readyRes = await fetch(`http://127.0.0.1:${portTestDriver}/api/v1/ready`);
+      assert.equal(readyRes.status, 503);
+    } finally {
+      await new Promise<void>((resolve) => serverTestDriver.close(() => resolve()));
+    }
+
+    // Now verify /api/v1/ready returns 200 when configured with a verified production Firestore driver
+    const tmpProdDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sowveil-phase2a-prod-driver-'));
     const appReadyProd = createApiApp({
       nodeEnv: 'production',
-      persistenceAdapter: new AuthoritativeFirestorePersistenceAdapter(),
+      persistenceAdapter: new AuthoritativeFirestorePersistenceAdapter({
+        driver: new VerifiedProductionFirestoreDriver({ storageDir: tmpProdDir }),
+        nodeEnv: 'production',
+      }),
     });
     const serverReady = http.createServer(appReadyProd);
     await new Promise<void>((resolve) => serverReady.listen(0, '127.0.0.1', resolve));
@@ -465,6 +491,7 @@ describe('Phase 2A: Production Readiness Gate, Snapshot Classification & Sanitiz
       assert.equal(readyJson.data.readyForProductionTraffic, true);
     } finally {
       await new Promise<void>((resolve) => serverReady.close(() => resolve()));
+      fs.rmSync(tmpProdDir, { recursive: true, force: true });
     }
   });
 
