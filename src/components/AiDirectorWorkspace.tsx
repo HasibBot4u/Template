@@ -18,20 +18,23 @@ import {
   Unlock,
   Upload,
 } from 'lucide-react';
-import type {
-  AiDirectorProviderInvocationEvidence,
-  AiDirectorSessionRecord,
-  BudgetLatencyPreferenceMode,
-  DirectorAutonomyMode,
-  DirectorShotPlanItem,
-  IntendedPlatformId,
-  ShotEditableParameters,
+import {
+  DETERMINISTIC_NO_PROVIDER_BANNER,
+  DIRECTOR_12_STEP_WORKFLOW_DEFINITIONS,
+  type AiDirectorProviderInvocationEvidence,
+  type AiDirectorSessionRecord,
+  type BudgetLatencyPreferenceMode,
+  type DirectorAutonomyMode,
+  type DirectorShotPlanItem,
+  type IntendedPlatformId,
+  type ShotEditableParameters,
 } from '../services/aiDirectorProductionEngine';
 import type { ProviderConnectionPublicView } from '../types/providerHub';
 import type { MobileAspectRatio, ProjectLibraryItem } from '../types/sowveil';
 
 import { MobileProEditorModal } from './MobileProEditorModal';
-import { executeAuthenticatedApiRequest } from '../services/apiClient';
+import { executeAuthenticatedApiRequest, getFirebaseIdToken } from '../services/apiClient';
+import { sharedCanonicalEditorSession } from '../services/canonicalEditorSession';
 
 
 interface SampleScriptItem {
@@ -143,7 +146,7 @@ export const AiDirectorWorkspace: React.FC<AiDirectorWorkspaceProps> = ({
     async (forceRefresh = false) => {
       if (getAuthToken) return await getAuthToken(forceRefresh);
       if (authToken) return authToken;
-      return null;
+      return getFirebaseIdToken(forceRefresh);
     },
     [getAuthToken, authToken]
   );
@@ -158,12 +161,23 @@ export const AiDirectorWorkspace: React.FC<AiDirectorWorkspaceProps> = ({
     ) => {
       return executeAuthenticatedApiRequest<T>(path, {
         ...options,
-        getAuthToken: getAuthToken || authToken ? resolveToken : undefined,
+        getAuthToken: resolveToken,
         fetchImpl,
       });
     },
-    [resolveToken, getAuthToken, authToken, fetchImpl]
+    [resolveToken, fetchImpl]
   );
+
+  const syncSessionToSharedEditor = useCallback((sessionToSync: AiDirectorSessionRecord | null) => {
+    if (sessionToSync?.canonicalProject) {
+      sharedCanonicalEditorSession.openProjectDocument(sessionToSync.canonicalProject, {
+        isDemoMode: false,
+        savedRevision: sessionToSync.canonicalProject.revision,
+        saveState: 'Saved',
+        forceReplace: true,
+      });
+    }
+  }, []);
 
   const fetchSamplesAndSessions = async () => {
     try {
@@ -210,7 +224,10 @@ export const AiDirectorWorkspace: React.FC<AiDirectorWorkspaceProps> = ({
       if (connsRes.ok && Array.isArray(connsRes.data?.connections)) {
         setProviderConnections(connsRes.data.connections);
         const readyConn = connsRes.data.connections.find(
-          (c) => c.credentialStatus === 'active' || c.authMode === 'server-env'
+          (c) =>
+            c.credentialStatus === 'active' ||
+            (c.authMode === 'server-env' &&
+              !String(c.maskedCredential || '').includes('not set'))
         );
         if (readyConn && !selectedConnectionId) {
           setSelectedConnectionId(readyConn.id);
@@ -409,12 +426,41 @@ export const AiDirectorWorkspace: React.FC<AiDirectorWorkspaceProps> = ({
       const updated: AiDirectorSessionRecord = res.data.session;
       setActiveSession(updated);
       setSessions((prev) => [updated, ...prev.filter((s) => s.id !== updated.id)]);
+      syncSessionToSharedEditor(updated);
       setStatusBanner(
         `Compiled Canonical Project v2.0.0 via ${updated.commandReceipts.length} typed commands. Coverage: ${updated.coverageLedger.coveragePercent}%.`
       );
       setActiveTab('production');
     } catch (err) {
       setErrorBanner(err instanceof Error ? err.message : 'Failed to execute production plan');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handlePromoteValidatedAssets = async () => {
+    if (!activeSession) return;
+    setLoading(true);
+    setErrorBanner(null);
+    try {
+      const res = await apiRequest<{
+        session: AiDirectorSessionRecord;
+        promotedAssetIds: string[];
+        rejectedAssetIds: string[];
+      }>(`/api/v1/ai-director/sessions/${activeSession.id}/promote-assets`, {
+        method: 'POST',
+      });
+      if (!res.ok || !res.data?.session) {
+        throw new Error(res.errorMessage || 'Failed to promote validated draft assets');
+      }
+      const updated = res.data.session;
+      setActiveSession(updated);
+      setSessions((prev) => [updated, ...prev.filter((s) => s.id !== updated.id)]);
+      setStatusBanner(
+        `Validated & promoted ${res.data.promotedAssetIds.length} AI draft asset(s) (${res.data.rejectedAssetIds.length} rejected).`
+      );
+    } catch (err) {
+      setErrorBanner(err instanceof Error ? err.message : 'Asset promotion failed');
     } finally {
       setLoading(false);
     }
@@ -438,6 +484,7 @@ export const AiDirectorWorkspace: React.FC<AiDirectorWorkspaceProps> = ({
       const savedProj = res.data.project;
       setActiveSession(updated);
       setSessions((prev) => [updated, ...prev.filter((s) => s.id !== updated.id)]);
+      syncSessionToSharedEditor(updated);
       onProjectSaved?.(savedProj);
       setStatusBanner(
         `Saved project "${savedProj.title || savedProj.name}" (ID: ${savedProj.id} · rev r${savedProj.revision || 1}) to Project Library.`
@@ -458,7 +505,7 @@ export const AiDirectorWorkspace: React.FC<AiDirectorWorkspaceProps> = ({
         `/api/v1/ai-director/sessions/${activeSession.id}/refine`,
         {
           method: 'POST',
-          body: { suggestionId },
+          body: { suggestionId, approvedByUser: true },
         }
       );
       if (!res.ok || !res.data?.session) {
@@ -467,7 +514,8 @@ export const AiDirectorWorkspace: React.FC<AiDirectorWorkspaceProps> = ({
       const updated: AiDirectorSessionRecord = res.data.session;
       setActiveSession(updated);
       setSessions((prev) => [updated, ...prev.filter((s) => s.id !== updated.id)]);
-      setStatusBanner('Applied adaptive refinement and saved pre-refinement checkpoint.');
+      syncSessionToSharedEditor(updated);
+      setStatusBanner('Approved & executed typed canonical command proposal via shared command bus (checkpoint saved).');
     } catch (err) {
       setErrorBanner(err instanceof Error ? err.message : 'Failed to process refinement');
     } finally {
@@ -493,6 +541,7 @@ export const AiDirectorWorkspace: React.FC<AiDirectorWorkspaceProps> = ({
       const updated: AiDirectorSessionRecord = res.data.session;
       setActiveSession(updated);
       setSessions((prev) => [updated, ...prev.filter((s) => s.id !== updated.id)]);
+      syncSessionToSharedEditor(updated);
       setStatusBanner(`Rolled back session to checkpoint ${checkpointId}.`);
     } catch (err) {
       setErrorBanner(err instanceof Error ? err.message : 'Rollback failed');
@@ -604,6 +653,7 @@ export const AiDirectorWorkspace: React.FC<AiDirectorWorkspaceProps> = ({
       const updated = res.data.session;
       setActiveSession(updated);
       setSessions((prev) => [updated, ...prev.filter((s) => s.id !== updated.id)]);
+      syncSessionToSharedEditor(updated);
       setRevisionReason('');
       setStatusBanner(
         `Revised shot ${targetShotId} with reversible checkpoint and re-ran 10-Point Acceptance Gate QA (${updated.acceptanceGate.passed ? 'PASSED' : 'PENDING'}).`
@@ -615,6 +665,34 @@ export const AiDirectorWorkspace: React.FC<AiDirectorWorkspaceProps> = ({
     }
   };
 
+  const configuredLiveConnections = providerConnections.filter(
+    (c) =>
+      c.credentialStatus === 'active' ||
+      (c.authMode === 'server-env' &&
+        !String(c.maskedCredential || '').includes('not set'))
+  );
+  const hasVerifiedLiveInvocation = Boolean(
+    activeSession?.providerInvocations?.some(
+      (inv) => inv.status === 'succeeded' && inv.actualContactedModelId
+    )
+  );
+  const providerStatusText =
+    activeSession?.providerStatusBanner ||
+    (configuredLiveConnections.length === 0
+      ? DETERMINISTIC_NO_PROVIDER_BANNER
+      : hasVerifiedLiveInvocation
+      ? `Live AI Provider Verified (${activeSession?.actualContactedModels?.join(', ')})`
+      : DETERMINISTIC_NO_PROVIDER_BANNER);
+  const workflowStepsToRender =
+    activeSession?.workflowSteps && activeSession.workflowSteps.length === 12
+      ? activeSession.workflowSteps
+      : DIRECTOR_12_STEP_WORKFLOW_DEFINITIONS.map((def) => ({
+          ...def,
+          status: 'pending' as const,
+          executionMode: 'not-started' as const,
+          summary: 'Run script intake to begin the 12-step production workflow.',
+          updatedAt: '',
+        }));
 
   return (
     <div
@@ -750,6 +828,64 @@ export const AiDirectorWorkspace: React.FC<AiDirectorWorkspaceProps> = ({
           );
         })}
       </nav>
+
+      {/* Truthful Provider Banner & Explicit 12-Step Production Workflow */}
+      <div
+        className="border-b border-[#1E2129] bg-[#101218] px-4 py-2.5 space-y-2"
+        data-testid="director-12-step-workflow-bar"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <span className="text-[11px] font-semibold uppercase tracking-wider text-[#FF6B1A]">
+              12-Step Production Pipeline
+            </span>
+            <span
+              data-testid="director-provider-status-banner"
+              className={`px-2 py-0.5 rounded text-[11px] font-medium border ${
+                hasVerifiedLiveInvocation
+                  ? 'bg-emerald-950/60 border-emerald-500/40 text-emerald-300'
+                  : 'bg-amber-950/60 border-amber-500/40 text-amber-200'
+              }`}
+            >
+              {providerStatusText}
+            </span>
+          </div>
+          <span className="text-[10px] text-[#8E95A5]">
+            Deterministic compilation is never labeled as full AI production without verified model invocation evidence.
+          </span>
+        </div>
+
+        <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-12 gap-1.5">
+          {workflowStepsToRender.map((step) => {
+            const isLive = step.status === 'completed-live-ai';
+            const isDet = step.status === 'completed-deterministic-baseline';
+            const isBlocked = step.status === 'blocked';
+            return (
+              <div
+                key={step.stepId}
+                title={step.summary}
+                data-testid={`director-workflow-step-${step.stepId}`}
+                className={`px-2 py-1.5 rounded border text-[10px] flex flex-col justify-between ${
+                  isLive
+                    ? 'bg-emerald-950/40 border-emerald-500/40 text-emerald-200'
+                    : isDet
+                    ? 'bg-blue-950/40 border-blue-500/40 text-blue-200'
+                    : isBlocked
+                    ? 'bg-red-950/40 border-red-500/40 text-red-200'
+                    : 'bg-[#151821] border-[#232836] text-[#8E95A5]'
+                }`}
+              >
+                <div className="font-semibold truncate">
+                  {step.stepNumber}. {step.label}
+                </div>
+                <div className="text-[9px] font-mono uppercase opacity-80 truncate mt-0.5">
+                  {isLive ? 'Live AI' : isDet ? 'Deterministic' : step.status}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
 
       {/* Status / Error Alerts */}
       {errorBanner && (
@@ -2119,6 +2255,58 @@ export const AiDirectorWorkspace: React.FC<AiDirectorWorkspaceProps> = ({
                       </div>
                     ))}
                   </div>
+
+                  {/* Draft Assets & Validation Promotion */}
+                  {activeSession.generatedAssetRecords.length > 0 && (
+                    <div
+                      className="pt-3 border-t border-[#1E222D] space-y-2"
+                      data-testid="director-generated-assets-panel"
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="text-xs font-semibold text-white">
+                          AI-Generated Assets ({activeSession.generatedAssetRecords.length})
+                        </span>
+                        <button
+                          type="button"
+                          disabled={loading}
+                          onClick={handlePromoteValidatedAssets}
+                          data-testid="director-promote-assets-btn"
+                          className="px-2.5 py-1 rounded bg-[#FF6B1A] hover:bg-[#FF7B33] text-black font-semibold text-[11px]"
+                        >
+                          Validate & Promote Draft Assets
+                        </button>
+                      </div>
+                      <div className="space-y-1.5">
+                        {activeSession.generatedAssetRecords.map((asset) => (
+                          <div
+                            key={asset.assetTaskId}
+                            className="p-2 rounded bg-[#0B0D12] border border-[#1E222D] text-[11px] flex flex-wrap items-center justify-between gap-2"
+                          >
+                            <div>
+                              <span className="font-semibold text-white">{asset.title}</span>{' '}
+                              <span className="font-mono text-[#8E95A5]">
+                                ({asset.byteLength}B · {asset.licenseType})
+                              </span>
+                              <div className="text-[10px] text-[#8E95A5]">
+                                Provenance: {asset.provenanceNote} · Deps:{' '}
+                                {(asset.dependencies || []).join(', ') || 'inline-svg'}
+                              </div>
+                            </div>
+                            <span
+                              data-testid={`director-asset-lifecycle-${asset.assetTaskId}`}
+                              className={`px-2 py-0.5 rounded text-[10px] font-mono font-semibold uppercase ${
+                                asset.lifecycleState === 'validated-promoted'
+                                  ? 'bg-emerald-950/70 text-emerald-300 border border-emerald-500/40'
+                                  : 'bg-amber-950/70 text-amber-300 border border-amber-500/40'
+                              }`}
+                            >
+                              {asset.lifecycleState || 'draft'} ({asset.visibility || 'private'})
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
             ) : (
@@ -2194,59 +2382,116 @@ export const AiDirectorWorkspace: React.FC<AiDirectorWorkspaceProps> = ({
                   Every refinement states its concrete reason, expected benefit, risk/cost, and affected IDs. User-locked shots or fields cannot be overwritten.
                 </p>
                 <div className="space-y-2.5">
-                  {activeSession.refinementSuggestions.map((ref) => (
-                    <div
-                      key={ref.suggestionId}
-                      className="p-3 rounded-lg bg-[#0E1015] border border-[#1E222D] space-y-2 text-xs"
-                    >
-                      <div className="flex items-center justify-between">
-                        <span className="font-semibold text-white">{ref.title}</span>
-                        <span className="px-2 py-0.5 rounded bg-[#1C202B] text-[10px] font-mono text-[#FF6B1A]">
-                          {ref.status}
-                        </span>
-                      </div>
-                      <p className="text-[11px] text-[#B8BECB]">
-                        <strong>Reason:</strong> {ref.reason}
-                      </p>
-                      <p className="text-[11px] text-emerald-300">
-                        <strong>Benefit:</strong> {ref.expectedBenefit}
-                      </p>
-                      <p className="text-[10px] text-[#8E95A5]">
-                        <strong>Risk/Cost:</strong> {ref.riskAndCost.riskLevel} ($
-                        {ref.riskAndCost.estimatedCostUsd}) · Affected Shots:{' '}
-                        {ref.affectedShotIds.join(', ')}
-                      </p>
-                      {ref.blockedByUserLock && (
-                        <div className="text-[11px] text-amber-300 flex items-center gap-1">
-                          <Lock className="w-3 h-3" />
-                          {ref.lockBlockReason}
+                  {activeSession.refinementSuggestions.map((ref) => {
+                    const proposal = ref.canonicalCommandProposal;
+                    return (
+                      <div
+                        key={ref.suggestionId}
+                        data-testid={`director-refinement-card-${ref.suggestionId}`}
+                        className="p-3 rounded-lg bg-[#0E1015] border border-[#1E222D] space-y-2 text-xs"
+                      >
+                        <div className="flex items-center justify-between">
+                          <span className="font-semibold text-white">{ref.title}</span>
+                          <div className="flex items-center gap-1.5">
+                            {proposal && (
+                              <span className="px-2 py-0.5 rounded bg-blue-950/60 border border-blue-500/30 text-[10px] font-mono text-blue-200">
+                                {proposal.commands.length} Canonical Cmd(s) ·{' '}
+                                {proposal.requiresApproval ? 'Approval Required' : 'Bounded Autonomy'}
+                              </span>
+                            )}
+                            <span className="px-2 py-0.5 rounded bg-[#1C202B] text-[10px] font-mono text-[#FF6B1A]">
+                              {ref.status}
+                            </span>
+                          </div>
                         </div>
-                      )}
-                      {ref.status === 'proposed' && (
-                        <div className="flex items-center gap-2 pt-1">
-                          <button
-                            type="button"
-                            disabled={loading || ref.blockedByUserLock}
-                            onClick={() => handleApplyRefinement(ref.suggestionId)}
-                            data-testid={`director-apply-refinement-${ref.suggestionId}`}
-                            className="px-3 py-1 rounded bg-[#FF6B1A] disabled:opacity-40 text-black font-semibold text-[11px]"
+                        <p className="text-[11px] text-[#B8BECB]">
+                          <strong>Reason:</strong> {ref.reason}
+                        </p>
+                        <p className="text-[11px] text-emerald-300">
+                          <strong>Expected Visual Effect:</strong>{' '}
+                          {proposal?.expectedVisualEffect || ref.expectedBenefit}
+                        </p>
+                        <p className="text-[10px] text-[#8E95A5]">
+                          <strong>Risk/Cost:</strong> {ref.riskAndCost.riskLevel} ($
+                          {ref.riskAndCost.estimatedCostUsd}) · Affected Shots:{' '}
+                          {ref.affectedShotIds.join(', ')}
+                        </p>
+
+                        {/* Typed Canonical Command Proposal Preview & Before/After Diff */}
+                        {proposal && (
+                          <div
+                            className="p-2.5 rounded bg-[#090B0E] border border-[#1D222E] space-y-1.5 text-[11px]"
+                            data-testid={`director-command-proposal-diff-${ref.suggestionId}`}
                           >
-                            Apply Refinement (Save Checkpoint)
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                  ))}
+                            <div className="font-semibold text-[#FF6B1A] flex items-center justify-between">
+                              <span>Canonical Command Proposal & Preview Diff</span>
+                              <span className="font-mono text-[10px] text-[#8E95A5]">
+                                {proposal.proposalId}
+                              </span>
+                            </div>
+                            {proposal.propertyChanges.map((chg, idx) => (
+                              <div key={idx} className="font-mono text-[10px] text-[#D5D8E0]">
+                                • {chg.clipName} ({chg.propertyPath}):{' '}
+                                <span className="text-red-300">
+                                  {JSON.stringify(chg.beforeValue)}
+                                </span>{' '}
+                                →{' '}
+                                <span className="text-emerald-300">
+                                  {JSON.stringify(chg.afterValue)}
+                                </span>
+                              </div>
+                            ))}
+                            {proposal.affectedScriptSpans.length > 0 && (
+                              <div className="text-[10px] text-[#8E95A5] font-mono">
+                                Script Spans:{' '}
+                                {proposal.affectedScriptSpans
+                                  .map(
+                                    (sp) =>
+                                      `${sp.segmentId} [${sp.startOffset}..${sp.endOffset}]`
+                                  )
+                                  .join(', ')}
+                              </div>
+                            )}
+                            {proposal.previewDiff?.summaryText && (
+                              <div className="text-[10px] text-blue-300 font-mono">
+                                Diff: {proposal.previewDiff.summaryText}
+                              </div>
+                            )}
+                          </div>
+                        )}
+
+                        {ref.blockedByUserLock && (
+                          <div className="text-[11px] text-amber-300 flex items-center gap-1">
+                            <Lock className="w-3 h-3" />
+                            {ref.lockBlockReason}
+                          </div>
+                        )}
+                        {ref.status === 'proposed' && (
+                          <div className="flex items-center gap-2 pt-1">
+                            <button
+                              type="button"
+                              disabled={loading || ref.blockedByUserLock}
+                              onClick={() => handleApplyRefinement(ref.suggestionId)}
+                              data-testid={`director-apply-refinement-${ref.suggestionId}`}
+                              className="px-3 py-1 rounded bg-[#FF6B1A] disabled:opacity-40 text-black font-semibold text-[11px]"
+                            >
+                              Approve & Execute Canonical Proposal (Save Checkpoint)
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
 
               {/* Reversible Production Checkpoints */}
               <div className="bg-[#12141A] border border-[#222631] rounded-xl p-4 space-y-3">
                 <h3 className="text-xs font-semibold text-[#FF6B1A] uppercase tracking-wider">
-                  Reversible Checkpoints & Rollback History ({activeSession.productionCheckpoints.length})
+                  Reversible Checkpoints ({activeSession.productionCheckpoints.length}) & Revision Deltas ({activeSession.planRevisions.length})
                 </h3>
                 <p className="text-[11px] text-[#8E95A5]">
-                  Every compile and refinement automatically snapshots the shot plan, coverage ledger, and Canonical Project v2.0.0 so you can roll back with one click.
+                  Every compile, mid-production improvement, and refinement snapshots the shot plan, before/after delta, and Canonical Project v2.0.0 so you can roll back with one click.
                 </p>
                   <div className="space-y-2">
                     {activeSession.productionCheckpoints.map((cp) => (

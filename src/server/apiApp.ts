@@ -166,11 +166,14 @@ import {
   applyAdaptiveRefinement,
   BUILT_IN_DIRECTOR_SAMPLE_SCRIPTS,
   createAiDirectorSession,
+  DETERMINISTIC_NO_PROVIDER_BANNER,
   evaluateDirectorAcceptanceGate,
   executeDirectorProductionPlan,
   orchestrateLiveAiDirectorSession,
+  promoteValidatedDirectorAssets,
   reviseDirectorPlanDuringProduction,
   rollbackDirectorToCheckpoint,
+  syncDirectorWorkflowAndProviderState,
   updateDirectorShotPlanAndApprovals,
   validateGeneratedAssetRecord,
 } from '../services/aiDirectorProductionEngine';
@@ -448,11 +451,14 @@ const ProjectCreateSchema = z
     archived: z.boolean().default(false),
     tags: z.array(z.string().trim().max(64)).max(20).default([]),
     createdAt: z.string().trim().max(64).optional(),
+    updatedAt: z.string().trim().max(64).optional(),
   })
   .strict();
 
 const ProjectPatchSchema = z
   .object({
+    id: z.string().trim().max(128).optional(),
+    ownerUid: z.string().trim().max(128).optional(),
     title: z.string().trim().min(1).max(160).optional(),
     description: z.string().trim().max(2000).optional(),
     compCount: z.number().int().min(0).max(5000).nullable().optional(),
@@ -493,6 +499,8 @@ const ProjectPatchSchema = z
     hasExternalFootageWarning: z.boolean().optional(),
     archived: z.boolean().optional(),
     tags: z.array(z.string().trim().max(64)).max(20).optional(),
+    createdAt: z.string().trim().max(64).optional(),
+    updatedAt: z.string().trim().max(64).optional(),
     lastOpenedAt: z.string().trim().max(64).optional(),
   })
   .strict();
@@ -4839,12 +4847,23 @@ export function createApiApp(options: ApiAppOptions = {}) {
     try {
       const existing = await getAuthoritativeProject(projId, uid);
       if (existing) {
+        const nextRevision = Math.max(revision, (existing.revision || 1) + 1);
+        if (canonicalProjectJson) {
+          try {
+            const parsedDoc = JSON.parse(canonicalProjectJson) as CanonicalProjectDocument;
+            parsedDoc.revision = nextRevision;
+            canonicalProjectJson = serializeCanonicalProject(parsedDoc);
+          } catch {
+            // preserve validated canonicalProjectJson
+          }
+          canonicalProjectStores.delete(projId);
+        }
         const updated = await updateAuthoritativeProject(projId, uid, {
           ...parsed.data,
           id: projId,
           ownerUid: uid,
           ...(canonicalProjectJson ? { canonicalProjectJson } : {}),
-          revision: Math.max(revision, (existing.revision || 1) + 1),
+          revision: nextRevision,
           activeBranch,
           updatedAt: now,
         });
@@ -5107,6 +5126,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
         check.project.id = proj.id;
         check.project.ownerUid = uid;
         patchFields.canonicalProjectJson = serializeCanonicalProject(check.project);
+        canonicalProjectStores.delete(proj.id);
       } catch {
         return sendError(
           res,
@@ -5128,6 +5148,20 @@ export function createApiApp(options: ApiAppOptions = {}) {
         },
         { expectedRevision }
       );
+      if (updated.canonicalProjectJson) {
+        try {
+          const parsedDoc = JSON.parse(updated.canonicalProjectJson) as CanonicalProjectDocument;
+          if (parsedDoc.revision !== updated.revision) {
+            parsedDoc.revision = updated.revision || parsedDoc.revision;
+            updated.canonicalProjectJson = serializeCanonicalProject(parsedDoc);
+            projectsStore.set(updated.id, updated);
+            canonicalProjectStores.delete(updated.id);
+            getOrInitCanonicalStore(updated);
+          }
+        } catch {
+          // ignore
+        }
+      }
       return sendOk(res, authReq.requestId, updated);
     } catch (err) {
       return sendPersistenceError(
@@ -11143,6 +11177,10 @@ export function createApiApp(options: ApiAppOptions = {}) {
           connections: userConns,
           routingProfiles,
           preferredConnectionId: requestedConnectionId,
+          preferredModelId:
+            typeof body.preferredModelId === 'string' && body.preferredModelId.trim()
+              ? body.preferredModelId.trim()
+              : null,
           taskType: (body.taskType as HubTaskType) || 'planning',
           stream: Boolean(body.stream),
           fetchImpl: options.providerProbeFetchImpl ?? fetch,
@@ -11557,7 +11595,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
       return sendError(res, authReq.requestId, 404, 'DIRECTOR_SESSION_NOT_FOUND', 'AI Director session not found.');
     }
 
-    const body = (req.body || {}) as { suggestionId?: string };
+    const body = (req.body || {}) as { suggestionId?: string; approvedByUser?: boolean };
     if (!body.suggestionId) {
       return sendError(
         res,
@@ -11569,7 +11607,9 @@ export function createApiApp(options: ApiAppOptions = {}) {
     }
 
     try {
-      const updated = applyAdaptiveRefinement(session, body.suggestionId);
+      const updated = applyAdaptiveRefinement(session, body.suggestionId, {
+        approvedByUser: body.approvedByUser !== false,
+      });
       const saved = await saveAuthoritativeAiDirectorSession(updated);
       return sendOk(res, authReq.requestId, { session: saved });
     } catch (err) {
@@ -11699,6 +11739,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
 
       const body = (req.body || {}) as {
         connectionId?: string | null;
+        preferredModelId?: string | null;
         taskType?: HubTaskType;
         stream?: boolean;
       };
@@ -11713,6 +11754,10 @@ export function createApiApp(options: ApiAppOptions = {}) {
           preferredConnectionId:
             typeof body.connectionId === 'string' && body.connectionId.trim()
               ? body.connectionId.trim()
+              : null,
+          preferredModelId:
+            typeof body.preferredModelId === 'string' && body.preferredModelId.trim()
+              ? body.preferredModelId.trim()
               : null,
           taskType: body.taskType || 'planning',
           stream: Boolean(body.stream),
@@ -11956,7 +12001,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
           });
         }
 
-        const updatedSession: AiDirectorSessionRecord = {
+        const updatedSession: AiDirectorSessionRecord = syncDirectorWorkflowAndProviderState({
           ...session,
           savedProjectId: projectRecord.id,
           canonicalProject: {
@@ -11965,7 +12010,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
           },
           acceptanceGate: gate,
           updatedAt: now,
-        };
+        });
         const savedSession = await saveAuthoritativeAiDirectorSession(updatedSession);
 
         recordAudit(
@@ -11989,6 +12034,96 @@ export function createApiApp(options: ApiAppOptions = {}) {
           authReq.requestId,
           err,
           'Unable to save AI Director project to Project Library.'
+        );
+      }
+    }
+  );
+
+  app.post(
+    '/api/v1/ai-director/sessions/:id/promote-assets',
+    requireAuth,
+    async (req: Request, res: Response) => {
+      const authReq = req as AuthenticatedRequest;
+      const uid = authReq.authIdentity!.uid;
+      res.setHeader('Cache-Control', 'private, no-store');
+      let session: AiDirectorSessionRecord | null = null;
+      try {
+        session = await getAuthoritativeAiDirectorSession(req.params.id, uid, false);
+      } catch (err) {
+        if (err instanceof PersistenceContractError && err.code === 'CROSS_USER_ACCESS_FORBIDDEN') {
+          return sendError(
+            res,
+            authReq.requestId,
+            403,
+            'FORBIDDEN_DIRECTOR_SESSION',
+            'You do not own this AI Director session.'
+          );
+        }
+        return sendPersistenceError(
+          res,
+          authReq.requestId,
+          err,
+          'Unable to load AI Director session.'
+        );
+      }
+      if (!session) {
+        return sendError(
+          res,
+          authReq.requestId,
+          404,
+          'DIRECTOR_SESSION_NOT_FOUND',
+          'AI Director session not found.'
+        );
+      }
+
+      try {
+        const promotedResult = promoteValidatedDirectorAssets(session);
+        const savedSession = await saveAuthoritativeAiDirectorSession(promotedResult.session);
+
+        for (const assetId of promotedResult.promotedAssetIds) {
+          const existing = assetsStore.get(assetId);
+          if (existing && existing.ownerUid === uid) {
+            existing.labels = Array.from(
+              new Set([
+                ...(existing.labels || []).filter((l) => l !== 'ai-generated-draft'),
+                'validated-promoted',
+              ])
+            );
+            existing.tags = Array.from(
+              new Set([...(existing.tags || []).filter((t) => t !== 'draft'), 'validated'])
+            );
+            existing.updatedAt = new Date().toISOString();
+            assetsStore.set(assetId, existing);
+          }
+        }
+        persistState();
+
+        const rejectedAssetIds = promotedResult.blockedAssets.map((b) => b.assetTaskId);
+
+        recordAudit(
+          uid,
+          authReq.authIdentity!.email,
+          'AI_DIRECTOR_PROMOTE_ASSETS',
+          `/aiDirectorSessions/${savedSession.id}`,
+          `Promoted ${promotedResult.promotedAssetIds.length} validated AI draft assets (${rejectedAssetIds.length} rejected)`,
+          authReq.requestId,
+          'user',
+          'success'
+        );
+
+        return sendOk(res, authReq.requestId, {
+          session: savedSession,
+          promotedAssetIds: promotedResult.promotedAssetIds,
+          rejectedAssetIds,
+          blockedAssets: promotedResult.blockedAssets,
+        });
+      } catch (err) {
+        return sendError(
+          res,
+          authReq.requestId,
+          400,
+          'ASSET_PROMOTION_FAILED',
+          err instanceof Error ? err.message : 'Unable to promote AI Director assets.'
         );
       }
     }

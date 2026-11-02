@@ -28,8 +28,10 @@ import {
 } from '../types/providerHub';
 import { decryptCredentialFromVault } from '../server/credentialVault';
 import { sanitizeAndValidateSvgContent } from './marketplaceEngine';
+import { CanonicalProjectDiff, diffCanonicalProjects } from './coEditingEngine';
 
-
+export const DETERMINISTIC_NO_PROVIDER_BANNER =
+  'No provider configured — deterministic baseline only';
 
 // ============================================================================
 // 1. DURABLE PRODUCTION STATE MACHINE & INTAKE TYPES
@@ -43,6 +45,57 @@ export type DirectorProductionStage =
   | 'production-execution'
   | 'adaptive-refinement'
   | 'acceptance-verified';
+
+export type DirectorWorkflowStepId =
+  | 'ingest'
+  | 'analyze'
+  | 'clarify'
+  | 'production-brief'
+  | 'shot-plan'
+  | 'asset-template-match'
+  | 'generate-missing-assets'
+  | 'rough-cut'
+  | 'refine'
+  | 'qa'
+  | 'save-editable-project'
+  | 'render';
+
+export type DirectorWorkflowStepStatus =
+  | 'pending'
+  | 'in-progress'
+  | 'completed-deterministic-baseline'
+  | 'completed-live-ai'
+  | 'blocked';
+
+export interface DirectorWorkflowStepRecord {
+  stepNumber: number;
+  stepId: DirectorWorkflowStepId;
+  label: string;
+  status: DirectorWorkflowStepStatus;
+  executionMode: 'not-started' | 'deterministic-baseline' | 'live-provider-verified';
+  summary: string;
+  updatedAt: string;
+  invocationId?: string | null;
+}
+
+export const DIRECTOR_12_STEP_WORKFLOW_DEFINITIONS: ReadonlyArray<{
+  stepNumber: number;
+  stepId: DirectorWorkflowStepId;
+  label: string;
+}> = [
+  { stepNumber: 1, stepId: 'ingest', label: 'Ingest' },
+  { stepNumber: 2, stepId: 'analyze', label: 'Analyze' },
+  { stepNumber: 3, stepId: 'clarify', label: 'Clarify' },
+  { stepNumber: 4, stepId: 'production-brief', label: 'Production Brief' },
+  { stepNumber: 5, stepId: 'shot-plan', label: 'Shot Plan' },
+  { stepNumber: 6, stepId: 'asset-template-match', label: 'Asset/Template Match' },
+  { stepNumber: 7, stepId: 'generate-missing-assets', label: 'Generate Missing Assets' },
+  { stepNumber: 8, stepId: 'rough-cut', label: 'Rough Cut' },
+  { stepNumber: 9, stepId: 'refine', label: 'Refine' },
+  { stepNumber: 10, stepId: 'qa', label: 'QA' },
+  { stepNumber: 11, stepId: 'save-editable-project', label: 'Save Editable Project' },
+  { stepNumber: 12, stepId: 'render', label: 'Render' },
+];
 
 export type IntendedPlatformId =
   | 'youtube-shorts'
@@ -388,12 +441,56 @@ export interface DirectorShotPlanItem {
   productionStatus: 'not-started' | 'compiled-to-timeline' | 'fallback-isolated' | 'skipped-by-rejection';
 }
 
+export interface DirectorAffectedScriptSpan {
+  segmentId: string;
+  startOffset: number;
+  endOffset: number;
+  exactText: string;
+}
+
+export interface DirectorPropertyBeforeAfter {
+  clipId: string;
+  clipName: string;
+  propertyPath: string;
+  beforeValue: unknown;
+  afterValue: unknown;
+}
+
+export interface DirectorCanonicalCommandProposal {
+  proposalId: string;
+  title: string;
+  rationale: string;
+  expectedVisualEffect: string;
+  commands: CanonicalProjectCommand[];
+  targetClipIds: string[];
+  targetProperties: string[];
+  propertyChanges: DirectorPropertyBeforeAfter[];
+  affectedScriptSpans: DirectorAffectedScriptSpan[];
+  previewDiff: CanonicalProjectDiff;
+  requiresApproval: boolean;
+  autonomyEligibility: {
+    allowedUnderBoundedAutonomy: boolean;
+    touchesLockedDecision: boolean;
+    withinBudgetCeiling: boolean;
+    reason: string;
+  };
+  status: 'proposed' | 'approved-executed' | 'rejected' | 'rolled-back';
+  rollbackCheckpointId: string | null;
+  executedAt?: string | null;
+  executedRevision?: number | null;
+}
+
 export interface DirectorPlanRevisionSnapshot {
   revisionNumber: number;
   savedAt: string;
   reason: string;
   shotsSnapshot: DirectorShotPlanItem[];
   coveragePercent: number;
+  checkpointId?: string | null;
+  revisionDelta?: CanonicalProjectDiff | null;
+  propertyDeltas?: DirectorPropertyBeforeAfter[];
+  qaRecheckPassed?: boolean;
+  qaBlockingReasons?: string[];
 }
 
 // ============================================================================
@@ -409,6 +506,11 @@ export interface GeneratedAssetProvenanceRecord {
   provenanceNote: string;
   createdAt: string;
   status: 'completed' | 'fallback-substituted' | 'metadata-only';
+  /** Draft-by-default lifecycle: all AI-generated assets/templates start as private drafts and promote only after validation */
+  lifecycleState?: 'draft' | 'validated-promoted';
+  visibility?: 'private' | 'workspace' | 'public';
+  dependencies?: string[];
+  promotedAt?: string | null;
   /** Real verified asset payload fields (never represent metadata placeholders as generated media) */
   svgContent: string;
   byteLength: number;
@@ -428,6 +530,15 @@ export type DirectorProviderInvocationStatus =
   | 'failed-schema-validation'
   | 'failed-capability-or-quota'
   | 'skipped-no-live-provider';
+
+export interface DirectorRejectedToolCallRecord {
+  toolCallId: string;
+  toolName: string;
+  rawArguments: Record<string, unknown>;
+  rejectionCode: string;
+  rejectionReason: string;
+  rejectedAt: string;
+}
 
 export interface AiDirectorProviderInvocationEvidence {
   invocationId: string;
@@ -457,6 +568,7 @@ export interface AiDirectorProviderInvocationEvidence {
     estimatedCostUsd: number;
   };
   streamStages: string[];
+  rejectedToolCalls?: DirectorRejectedToolCallRecord[];
   sanitizedError: {
     code: string;
     message: string;
@@ -553,6 +665,7 @@ export interface AdaptiveRefinementSuggestion {
   lockBlockReason: string | null;
   status: 'proposed' | 'applied' | 'rejected' | 'rolled-back';
   appliedCheckpointId?: string;
+  canonicalCommandProposal?: DirectorCanonicalCommandProposal;
 }
 
 export interface ProductionCheckpointRecord {
@@ -603,12 +716,18 @@ export interface AiDirectorSessionRecord {
   generatedAssetRecords: GeneratedAssetProvenanceRecord[];
   canonicalProject: CanonicalProjectDocument | null;
   savedProjectId?: string;
+  lastRenderJobId?: string;
   commandReceipts: ProjectCommandReceipt[];
   refinementSuggestions: AdaptiveRefinementSuggestion[];
+  canonicalCommandProposals?: DirectorCanonicalCommandProposal[];
   productionCheckpoints: ProductionCheckpointRecord[];
   acceptanceGate: DirectorAcceptanceGateReport;
   estimatedTotalCostUsd: number;
   spentBudgetUsd: number;
+  /** Explicit 12-Step Production Workflow State */
+  workflowSteps?: DirectorWorkflowStepRecord[];
+  currentWorkflowStep?: DirectorWorkflowStepId;
+  providerStatusBanner?: string;
   /** Live Provider Hub Orchestration Telemetry & Model Synthesis */
   executionMode?: 'live-provider' | 'deterministic-fallback' | 'hybrid-live-and-deterministic';
   selectedConnectionId?: string | null;
@@ -1789,6 +1908,7 @@ export function createAiDirectorSession(input: {
     canonicalProject: null,
     commandReceipts: [],
     refinementSuggestions: [],
+    canonicalCommandProposals: [],
     productionCheckpoints: [],
     acceptanceGate: {
       passed: false,
@@ -1810,6 +1930,7 @@ export function createAiDirectorSession(input: {
     },
     estimatedTotalCostUsd,
     spentBudgetUsd: 0.01,
+    providerStatusBanner: DETERMINISTIC_NO_PROVIDER_BANNER,
     executionMode: 'deterministic-fallback',
     selectedConnectionId: null,
     actualContactedModels: [],
@@ -1834,9 +1955,230 @@ export function createAiDirectorSession(input: {
   };
 
   session.acceptanceGate = evaluateDirectorAcceptanceGate(session);
-  return session;
+  return syncDirectorWorkflowAndProviderState(session);
 }
 
+/**
+ * Computes the truthful provider banner and explicit 12-Step Production Workflow state.
+ * Never labels deterministic compilation as full AI production.
+ */
+export function resolveDirectorProviderStatusBanner(
+  session: AiDirectorSessionRecord
+): string {
+  const succeededInv = (session.providerInvocations || []).find(
+    (inv) => inv.status === 'succeeded' && Boolean(inv.actualContactedModelId)
+  );
+  if (succeededInv && succeededInv.actualContactedModelId) {
+    return `Live model verified: ${succeededInv.actualContactedModelId} via ${succeededInv.connectionLabel} (${succeededInv.latencyMs}ms, HTTP ${succeededInv.httpStatus})`;
+  }
+  const latestInv = (session.providerInvocations || [])[0];
+  if (latestInv && latestInv.status !== 'skipped-no-live-provider') {
+    return `No live model completion (${latestInv.status}: ${latestInv.sanitizedError?.code || 'ERR'}) — deterministic baseline only`;
+  }
+  return DETERMINISTIC_NO_PROVIDER_BANNER;
+}
+
+export function computeDirector12StepWorkflow(
+  session: AiDirectorSessionRecord
+): {
+  workflowSteps: DirectorWorkflowStepRecord[];
+  currentWorkflowStep: DirectorWorkflowStepId;
+} {
+  const now = session.updatedAt || new Date().toISOString();
+  const succeededInv = (session.providerInvocations || []).find(
+    (inv) => inv.status === 'succeeded' && Boolean(inv.actualContactedModelId)
+  );
+  const hasLiveAi = Boolean(succeededInv && succeededInv.actualContactedModelId);
+  const modeLabel: 'deterministic-baseline' | 'live-provider-verified' = hasLiveAi
+    ? 'live-provider-verified'
+    : 'deterministic-baseline';
+  const stepDoneStatus: DirectorWorkflowStepStatus = hasLiveAi
+    ? 'completed-live-ai'
+    : 'completed-deterministic-baseline';
+
+  const hasBlockingUnanswered = session.questions.some(
+    (q) => q.classification === 'blocking' && q.status === 'unanswered'
+  );
+  const hasApprovedShots =
+    session.intake.autonomyMode === 'bounded-autonomy' ||
+    session.shots.some((s) => s.approvalState === 'approved' || s.approvalState === 'locked');
+  const hasCompiledProject = Boolean(session.canonicalProject);
+  const hasGeneratedAssets = session.generatedAssetRecords.length > 0;
+  const hasAppliedRefinementOrProposals =
+    session.refinementSuggestions.some((r) => r.status === 'applied') ||
+    (session.canonicalCommandProposals || []).some((p) => p.status === 'approved-executed') ||
+    session.planRevisions.length > 1;
+  const qaPassed = Boolean(session.acceptanceGate?.passed);
+  const isSaved = Boolean(session.savedProjectId);
+  const isRendered = Boolean(session.lastRenderJobId);
+
+  const steps: DirectorWorkflowStepRecord[] = [
+    {
+      stepNumber: 1,
+      stepId: 'ingest',
+      label: 'Ingest',
+      status: 'completed-deterministic-baseline',
+      executionMode: 'deterministic-baseline',
+      summary: `Ingested ${session.originalScriptText.length} chars across ${session.segments.length} immutable segment(s) with exact offsets.`,
+      updatedAt: now,
+    },
+    {
+      stepNumber: 2,
+      stepId: 'analyze',
+      label: 'Analyze',
+      status: stepDoneStatus,
+      executionMode: modeLabel,
+      summary: hasLiveAi
+        ? `Live semantic analysis by ${succeededInv!.actualContactedModelId} (${session.segments.length} segments, 100% coverage invariant).`
+        : `Deterministic baseline semantic & offset analysis (${session.segments.length} segments).`,
+      updatedAt: now,
+      invocationId: succeededInv?.invocationId || null,
+    },
+    {
+      stepNumber: 3,
+      stepId: 'clarify',
+      label: 'Clarify',
+      status: hasBlockingUnanswered ? 'in-progress' : stepDoneStatus,
+      executionMode: modeLabel,
+      summary: hasBlockingUnanswered
+        ? `${session.questions.filter((q) => q.status === 'unanswered').length} question(s) awaiting user answer or default.`
+        : `Clarifications resolved (${session.questions.length} question(s) recorded).`,
+      updatedAt: now,
+      invocationId: succeededInv?.invocationId || null,
+    },
+    {
+      stepNumber: 4,
+      stepId: 'production-brief',
+      label: 'Production Brief',
+      status: stepDoneStatus,
+      executionMode: modeLabel,
+      summary: hasLiveAi
+        ? `AI-synthesized Production Brief (${session.productionBrief.targetPlatform}, ${session.productionBrief.aspectRatio}).`
+        : `Deterministic baseline Production Brief (${session.productionBrief.targetPlatform}, ${session.productionBrief.aspectRatio}).`,
+      updatedAt: now,
+      invocationId: succeededInv?.invocationId || null,
+    },
+    {
+      stepNumber: 5,
+      stepId: 'shot-plan',
+      label: 'Shot Plan',
+      status: hasApprovedShots ? stepDoneStatus : 'in-progress',
+      executionMode: modeLabel,
+      summary: `${session.shots.length} planned shot(s) (${session.shots.filter((s) => s.approvalState === 'approved' || s.approvalState === 'locked').length} approved/locked).`,
+      updatedAt: now,
+      invocationId: succeededInv?.invocationId || null,
+    },
+    {
+      stepNumber: 6,
+      stepId: 'asset-template-match',
+      label: 'Asset/Template Match',
+      status: session.shots.length > 0 ? stepDoneStatus : 'pending',
+      executionMode: session.shots.length > 0 ? modeLabel : 'not-started',
+      summary: `Matched ${Object.keys(session.traceability.shotToTemplateMap || {}).length} shot(s) to verified catalog templates.`,
+      updatedAt: now,
+    },
+    {
+      stepNumber: 7,
+      stepId: 'generate-missing-assets',
+      label: 'Generate Missing Assets',
+      status: hasGeneratedAssets ? stepDoneStatus : 'pending',
+      executionMode: hasGeneratedAssets ? modeLabel : 'not-started',
+      summary: hasGeneratedAssets
+        ? `Synthesized ${session.generatedAssetRecords.length} SVG vector plate(s) (${session.generatedAssetRecords.filter((a) => a.lifecycleState === 'validated-promoted').length} promoted, ${session.generatedAssetRecords.filter((a) => a.lifecycleState !== 'validated-promoted').length} draft).`
+        : 'Awaiting rough cut compilation to synthesize missing vector motion plates.',
+      updatedAt: now,
+    },
+    {
+      stepNumber: 8,
+      stepId: 'rough-cut',
+      label: 'Rough Cut',
+      status: hasCompiledProject ? stepDoneStatus : 'pending',
+      executionMode: hasCompiledProject ? modeLabel : 'not-started',
+      summary: hasCompiledProject
+        ? `Compiled Canonical Project v2.0.0 rough cut (rev ${session.canonicalProject!.revision}, ${session.commandReceipts.length} typed command receipts).`
+        : 'Pending shot plan approval and timeline compilation.',
+      updatedAt: now,
+    },
+    {
+      stepNumber: 9,
+      stepId: 'refine',
+      label: 'Refine',
+      status: hasAppliedRefinementOrProposals
+        ? stepDoneStatus
+        : hasCompiledProject
+        ? 'in-progress'
+        : 'pending',
+      executionMode: hasAppliedRefinementOrProposals
+        ? modeLabel
+        : hasCompiledProject
+        ? modeLabel
+        : 'not-started',
+      summary: hasCompiledProject
+        ? `${session.refinementSuggestions.length} refinement proposal(s) & ${(session.canonicalCommandProposals || []).length} canonical command proposal(s).`
+        : 'Available after Rough Cut compilation.',
+      updatedAt: now,
+    },
+    {
+      stepNumber: 10,
+      stepId: 'qa',
+      label: 'QA',
+      status: qaPassed
+        ? stepDoneStatus
+        : hasCompiledProject
+        ? 'blocked'
+        : 'pending',
+      executionMode: hasCompiledProject ? modeLabel : 'not-started',
+      summary: session.acceptanceGate.summary,
+      updatedAt: now,
+    },
+    {
+      stepNumber: 11,
+      stepId: 'save-editable-project',
+      label: 'Save Editable Project',
+      status: isSaved
+        ? stepDoneStatus
+        : qaPassed
+        ? 'in-progress'
+        : 'pending',
+      executionMode: isSaved ? modeLabel : 'not-started',
+      summary: isSaved
+        ? `Saved authoritative editable project (${session.savedProjectId}).`
+        : 'Ready to save canonical project to authoritative Project Library.',
+      updatedAt: now,
+    },
+    {
+      stepNumber: 12,
+      stepId: 'render',
+      label: 'Render',
+      status: isRendered ? stepDoneStatus : isSaved ? 'in-progress' : 'pending',
+      executionMode: isRendered ? modeLabel : 'not-started',
+      summary: isRendered
+        ? `Render job queued/completed (${session.lastRenderJobId}).`
+        : 'Available in Render & QA / Export after saving editable project.',
+      updatedAt: now,
+    },
+  ];
+
+  const activeStep =
+    steps.find((s) => s.status === 'in-progress' || s.status === 'blocked') ||
+    steps.find((s) => s.status === 'pending') ||
+    steps[steps.length - 1];
+
+  return {
+    workflowSteps: steps,
+    currentWorkflowStep: activeStep.stepId,
+  };
+}
+
+export function syncDirectorWorkflowAndProviderState(
+  session: AiDirectorSessionRecord
+): AiDirectorSessionRecord {
+  session.providerStatusBanner = resolveDirectorProviderStatusBanner(session);
+  const { workflowSteps, currentWorkflowStep } = computeDirector12StepWorkflow(session);
+  session.workflowSteps = workflowSteps;
+  session.currentWorkflowStep = currentWorkflowStep;
+  return session;
+}
 
 /**
  * Answers or locks clarification questions, or applies recommended defaults,
@@ -1888,7 +2230,7 @@ export function answerDirectorQuestions(
   }
   next.updatedAt = now;
   next.acceptanceGate = evaluateDirectorAcceptanceGate(next);
-  return next;
+  return syncDirectorWorkflowAndProviderState(next);
 }
 
 /**
@@ -2060,7 +2402,7 @@ export function updateDirectorShotPlanAndApprovals(
 
   next.updatedAt = now;
   next.acceptanceGate = evaluateDirectorAcceptanceGate(next);
-  return next;
+  return syncDirectorWorkflowAndProviderState(next);
 }
 
 // ============================================================================
@@ -2174,7 +2516,7 @@ export function executeDirectorProductionPlan(
 
     shotToTemplateMap[shot.shotId] = effectiveTemplateId;
 
-    // Create real verified SVG procedural asset with actual bytes, SHA-256 checksum, storage location, and validation
+    // Create real verified SVG procedural asset in DRAFT state with actual bytes, SHA-256 checksum, storage location, dependencies, and validation
     const assetTaskId = `asset_dir_${shot.shotId}`;
     const verifiedPlate = synthesizeVerifiedSvgMotionPlate({
       assetTaskId,
@@ -2188,7 +2530,6 @@ export function executeDirectorProductionPlan(
     shotToAssetsMap[shot.shotId] = [assetTaskId];
 
     const createdClipIds: string[] = [];
-
 
     // 1. Instantiate Template / Vector Motion Clip via typed command
     const tplClipId = `clip_tpl_${shot.shotId}`;
@@ -2428,18 +2769,171 @@ export function executeDirectorProductionPlan(
     coverageLedgerSnapshot: JSON.parse(JSON.stringify(next.coverageLedger)),
   });
 
-  // Generate adaptive refinement suggestions comparing cut vs. plan
+  // Generate adaptive refinement suggestions & typed canonical command proposals comparing cut vs. plan
   next.refinementSuggestions = generateAdaptiveRefinementSuggestions(next);
+  next.canonicalCommandProposals = next.refinementSuggestions
+    .map((s) => s.canonicalCommandProposal)
+    .filter((p): p is DirectorCanonicalCommandProposal => Boolean(p));
   next.spentBudgetUsd = Number((next.spentBudgetUsd + eligibleShots.length * 0.015).toFixed(4));
   next.stage = next.coverageLedger.uncoveredSegments === 0 ? 'acceptance-verified' : 'adaptive-refinement';
   next.updatedAt = now;
   next.acceptanceGate = evaluateDirectorAcceptanceGate(next);
-  return next;
+  return syncDirectorWorkflowAndProviderState(next);
 }
 
 // ============================================================================
-// 15. ADAPTIVE REFINEMENT ENGINE & REVERSIBLE ROLLBACK
+// 15. ADAPTIVE REFINEMENT ENGINE, TYPED CANONICAL COMMAND PROPOSALS & ROLLBACK
 // ============================================================================
+
+export function buildCanonicalCommandProposalFromRefinement(
+  session: AiDirectorSessionRecord,
+  suggestion: Omit<AdaptiveRefinementSuggestion, 'canonicalCommandProposal'>
+): DirectorCanonicalCommandProposal {
+  const shot = session.shots.find((s) => s.shotId === suggestion.affectedShotIds[0]);
+  const affectedScriptSpans: DirectorAffectedScriptSpan[] = suggestion.affectedSegmentIds
+    .map((segId) => session.segments.find((seg) => seg.segmentId === segId))
+    .filter((seg): seg is ImmutableScriptSegment => Boolean(seg))
+    .map((seg) => ({
+      segmentId: seg.segmentId,
+      startOffset: seg.startOffset,
+      endOffset: seg.endOffset,
+      exactText: seg.exactOriginalText,
+    }));
+
+  const commands: CanonicalProjectCommand[] = [];
+  const propertyChanges: DirectorPropertyBeforeAfter[] = [];
+  const targetProperties: string[] = [];
+
+  if (shot && suggestion.targetEditableField === 'durationSec') {
+    const newDur = Number(suggestion.proposedNewValue);
+    targetProperties.push('durationSec');
+    for (const clipId of suggestion.affectedClipIds) {
+      commands.push({
+        type: 'trimClip',
+        clipId,
+        durationSec: newDur,
+      });
+      propertyChanges.push({
+        clipId,
+        clipName: clipId,
+        propertyPath: 'clip.durationSec',
+        beforeValue: shot.editableParameters.durationSec,
+        afterValue: newDur,
+      });
+    }
+  } else if (shot && suggestion.targetEditableField === 'cameraMotion') {
+    const clipId = suggestion.affectedClipIds[0] || `clip_tpl_${shot.shotId}`;
+    targetProperties.push('transform.scale', 'cameraMotion');
+    commands.push({
+      type: 'setTransform',
+      clipId,
+      transform: { scale: [1.05, 1.05] },
+    });
+    propertyChanges.push({
+      clipId,
+      clipName: clipId,
+      propertyPath: 'clip.transform.scale',
+      beforeValue: [1, 1],
+      afterValue: [1.05, 1.05],
+    });
+  } else if (shot && suggestion.targetEditableField === 'accentColorHex') {
+    const newColor = String(suggestion.proposedNewValue);
+    const textClipId =
+      suggestion.affectedClipIds.find((id) => id.startsWith('clip_txt_')) ||
+      suggestion.affectedClipIds[0] ||
+      `clip_txt_${shot.shotId}`;
+    targetProperties.push('textData.strokeColorHex', 'accentColorHex');
+    commands.push({
+      type: 'setTextProperties',
+      clipId: textClipId,
+      textData: {
+        content: shot.editableParameters.headlineText,
+        strokeColorHex: newColor,
+      },
+    });
+    propertyChanges.push({
+      clipId: textClipId,
+      clipName: shot.editableParameters.headlineText.slice(0, 32),
+      propertyPath: 'clip.textData.strokeColorHex',
+      beforeValue: shot.editableParameters.accentColorHex,
+      afterValue: newColor,
+    });
+  }
+
+  let previewDiff: CanonicalProjectDiff = {
+    beforeRevision: session.canonicalProject?.revision || 1,
+    afterRevision: session.canonicalProject?.revision || 1,
+    totalChanges: 0,
+    affectedClipIds: [],
+    affectedTrackIds: [],
+    affectedSceneIds: [],
+    affectedParameters: [],
+    summaryText: 'No changes',
+    entries: [],
+  };
+
+  if (session.canonicalProject && commands.length > 0) {
+    let simulated: CanonicalProjectDocument = JSON.parse(
+      JSON.stringify(session.canonicalProject)
+    );
+    for (const cmd of commands) {
+      const res = executeProjectCommand(simulated, cmd, {
+        actorId: session.ownerUid,
+        actorKind: 'ai-director',
+        rationale: suggestion.reason,
+        approvedByUser: false,
+      });
+      if (res.receipt.ok) {
+        simulated = res.project;
+      }
+    }
+    previewDiff = diffCanonicalProjects(session.canonicalProject, simulated);
+  }
+
+  const withinBudgetCeiling =
+    session.spentBudgetUsd + suggestion.riskAndCost.estimatedCostUsd <=
+    session.intake.maxBudgetUsd;
+  const touchesLockedDecision = Boolean(suggestion.blockedByUserLock);
+  const allowedUnderBoundedAutonomy =
+    session.intake.autonomyMode === 'bounded-autonomy' &&
+    !touchesLockedDecision &&
+    withinBudgetCeiling;
+
+  return {
+    proposalId: `prop_${suggestion.suggestionId}`,
+    title: suggestion.title,
+    rationale: suggestion.reason,
+    expectedVisualEffect: suggestion.expectedBenefit,
+    commands,
+    targetClipIds: [...suggestion.affectedClipIds],
+    targetProperties,
+    propertyChanges,
+    affectedScriptSpans,
+    previewDiff,
+    requiresApproval: !allowedUnderBoundedAutonomy,
+    autonomyEligibility: {
+      allowedUnderBoundedAutonomy,
+      touchesLockedDecision,
+      withinBudgetCeiling,
+      reason: touchesLockedDecision
+        ? suggestion.lockBlockReason || 'Target property or shot is locked by the user.'
+        : !withinBudgetCeiling
+        ? 'Applying proposal would exceed session budget ceiling.'
+        : session.intake.autonomyMode === 'require-approval'
+        ? 'Session autonomy mode is require-approval (explicit user approval required by default).'
+        : 'Eligible for bounded-autonomy execution with reversible checkpoint.',
+    },
+    status:
+      suggestion.status === 'applied'
+        ? 'approved-executed'
+        : suggestion.status === 'rolled-back'
+        ? 'rolled-back'
+        : suggestion.status === 'rejected'
+        ? 'rejected'
+        : 'proposed',
+    rollbackCheckpointId: suggestion.appliedCheckpointId || null,
+  };
+}
 
 export function generateAdaptiveRefinementSuggestions(
   session: AiDirectorSessionRecord
@@ -2455,7 +2949,7 @@ export function generateAdaptiveRefinementSuggestions(
       shot.approvalState === 'locked' || shot.lockedFields.includes('durationSec');
     if (shot.estimatedDurationSec < 3.2 && shot.exactTextCoverage.split(/\s+/).length >= 10) {
       const targetDur = Number((shot.estimatedDurationSec + 0.6).toFixed(2));
-      suggestions.push({
+      const baseSug: Omit<AdaptiveRefinementSuggestion, 'canonicalCommandProposal'> = {
         suggestionId: `ref_pacing_${shot.shotId}`,
         category: 'pacing',
         title: `Extend ${shot.shotId} reading hold by +0.6s`,
@@ -2478,6 +2972,10 @@ export function generateAdaptiveRefinementSuggestions(
           ? `Blocked: Shot ${shot.shotId} ("durationSec") is locked by the user.`
           : null,
         status: 'proposed',
+      };
+      suggestions.push({
+        ...baseSug,
+        canonicalCommandProposal: buildCanonicalCommandProposalFromRefinement(session, baseSug),
       });
     }
 
@@ -2488,7 +2986,7 @@ export function generateAdaptiveRefinementSuggestions(
       shot.shotNumber > 1 &&
       shot.editableParameters.cameraMotion === 'static'
     ) {
-      suggestions.push({
+      const baseSug: Omit<AdaptiveRefinementSuggestion, 'canonicalCommandProposal'> = {
         suggestionId: `ref_cam_${shot.shotId}`,
         category: 'visual-variety',
         title: `Add subtle 2.5D push-in camera drift on ${shot.shotId}`,
@@ -2509,6 +3007,10 @@ export function generateAdaptiveRefinementSuggestions(
           ? `Blocked: Shot ${shot.shotId} ("cameraMotion") is locked by the user.`
           : null,
         status: 'proposed',
+      };
+      suggestions.push({
+        ...baseSug,
+        canonicalCommandProposal: buildCanonicalCommandProposalFromRefinement(session, baseSug),
       });
     }
   }
@@ -2519,7 +3021,7 @@ export function generateAdaptiveRefinementSuggestions(
     const isColorLocked =
       firstShot.approvalState === 'locked' ||
       firstShot.lockedFields.includes('accentColorHex');
-    suggestions.push({
+    const baseSug: Omit<AdaptiveRefinementSuggestion, 'canonicalCommandProposal'> = {
       suggestionId: `ref_contrast_${firstShot.shotId}`,
       category: 'typography-contrast',
       title: `Boost hook accent highlight on ${firstShot.shotId}`,
@@ -2540,6 +3042,10 @@ export function generateAdaptiveRefinementSuggestions(
         ? `Blocked: Shot ${firstShot.shotId} ("accentColorHex") is locked by the user.`
         : null,
       status: 'proposed',
+    };
+    suggestions.push({
+      ...baseSug,
+      canonicalCommandProposal: buildCanonicalCommandProposalFromRefinement(session, baseSug),
     });
   }
 
@@ -2552,13 +3058,14 @@ export function generateAdaptiveRefinementSuggestions(
  */
 export function applyAdaptiveRefinement(
   session: AiDirectorSessionRecord,
-  suggestionId: string
+  suggestionId: string,
+  options: { approvedByUser?: boolean } = { approvedByUser: true }
 ): AiDirectorSessionRecord {
   const next: AiDirectorSessionRecord = JSON.parse(JSON.stringify(session));
   const now = new Date().toISOString();
 
   const suggestion = next.refinementSuggestions.find(
-    (s) => s.suggestionId === suggestionId
+    (s) => s.suggestionId === suggestionId || s.canonicalCommandProposal?.proposalId === suggestionId
   );
   if (!suggestion) {
     throw new Error(`SUGGESTION_NOT_FOUND: Refinement "${suggestionId}" not found.`);
@@ -2580,6 +3087,16 @@ export function applyAdaptiveRefinement(
     );
   }
 
+  // Enforce approval-by-default unless bounded autonomy is explicitly active
+  if (
+    next.intake.autonomyMode === 'require-approval' &&
+    options.approvedByUser === false
+  ) {
+    throw new Error(
+      `APPROVAL_REQUIRED_FOR_PROPOSAL: Proposal "${suggestion.title}" requires explicit user approval before executing canonical commands.`
+    );
+  }
+
   // Enforce budget cap
   if (
     next.spentBudgetUsd + suggestion.riskAndCost.estimatedCostUsd >
@@ -2590,9 +3107,14 @@ export function applyAdaptiveRefinement(
     );
   }
 
+  const beforeProject: CanonicalProjectDocument | null = next.canonicalProject
+    ? JSON.parse(JSON.stringify(next.canonicalProject))
+    : null;
+
   // Save reversible checkpoint BEFORE mutating shot or canonical project
+  let checkpointId: string | null = null;
   if (next.canonicalProject) {
-    const checkpointId = `chk_pre_${suggestion.suggestionId}_${Date.now()}`;
+    checkpointId = `chk_pre_${suggestion.suggestionId}_${Date.now()}`;
     next.productionCheckpoints.unshift({
       checkpointId,
       label: `Pre-Refinement Checkpoint (${suggestion.title})`,
@@ -2605,7 +3127,7 @@ export function applyAdaptiveRefinement(
     suggestion.appliedCheckpointId = checkpointId;
   }
 
-  // Apply change to shot editable parameters
+  // Apply change to shot editable parameters and execute through shared canonical command bus
   if (suggestion.targetEditableField === 'durationSec') {
     const newDur = Number(suggestion.proposedNewValue);
     targetShot.editableParameters.durationSec = newDur;
@@ -2624,7 +3146,7 @@ export function applyAdaptiveRefinement(
             actorId: next.ownerUid,
             actorKind: 'ai-director',
             rationale: `Refinement ${suggestion.suggestionId}: ${suggestion.title}`,
-            approvedByUser: true,
+            approvedByUser: Boolean(options.approvedByUser ?? true),
           }
         );
         next.canonicalProject = res.project;
@@ -2648,7 +3170,7 @@ export function applyAdaptiveRefinement(
           actorId: next.ownerUid,
           actorKind: 'ai-director',
           rationale: `Refinement ${suggestion.suggestionId}: ${suggestion.title}`,
-          approvedByUser: true,
+          approvedByUser: Boolean(options.approvedByUser ?? true),
         }
       );
       next.canonicalProject = res.project;
@@ -2658,9 +3180,43 @@ export function applyAdaptiveRefinement(
     const newColor = String(suggestion.proposedNewValue);
     targetShot.editableParameters.accentColorHex = newColor;
     targetShot.paletteAndLighting.primaryHex = newColor;
+
+    const textClipId = suggestion.affectedClipIds.find((id) => id.startsWith('clip_txt_'));
+    if (next.canonicalProject && textClipId) {
+      const res = executeProjectCommand(
+        next.canonicalProject,
+        {
+          type: 'setTextProperties',
+          clipId: textClipId,
+          textData: {
+            content: targetShot.editableParameters.headlineText,
+            strokeColorHex: newColor,
+          },
+        },
+        {
+          actorId: next.ownerUid,
+          actorKind: 'ai-director',
+          rationale: `Refinement ${suggestion.suggestionId}: ${suggestion.title}`,
+          approvedByUser: Boolean(options.approvedByUser ?? true),
+        }
+      );
+      next.canonicalProject = res.project;
+      next.commandReceipts.unshift(res.receipt);
+    }
   }
 
   suggestion.status = 'applied';
+  if (suggestion.canonicalCommandProposal) {
+    suggestion.canonicalCommandProposal.status = 'approved-executed';
+    suggestion.canonicalCommandProposal.rollbackCheckpointId = checkpointId;
+    suggestion.canonicalCommandProposal.executedAt = now;
+    suggestion.canonicalCommandProposal.executedRevision =
+      next.canonicalProject?.revision || null;
+  }
+  next.canonicalCommandProposals = next.refinementSuggestions
+    .map((s) => s.canonicalCommandProposal)
+    .filter((p): p is DirectorCanonicalCommandProposal => Boolean(p));
+
   next.spentBudgetUsd = Number(
     (next.spentBudgetUsd + suggestion.riskAndCost.estimatedCostUsd).toFixed(4)
   );
@@ -2671,9 +3227,28 @@ export function applyAdaptiveRefinement(
     next.segments,
     next.shots
   );
-  next.updatedAt = now;
   next.acceptanceGate = evaluateDirectorAcceptanceGate(next);
-  return next;
+
+  const revisionDelta =
+    beforeProject && next.canonicalProject
+      ? diffCanonicalProjects(beforeProject, next.canonicalProject)
+      : null;
+
+  next.planRevisions.unshift({
+    revisionNumber: next.planRevisions.length + 1,
+    savedAt: now,
+    reason: `Applied refinement proposal "${suggestion.title}": ${suggestion.reason}`,
+    shotsSnapshot: JSON.parse(JSON.stringify(next.shots)),
+    coveragePercent: next.coverageLedger.coveragePercent,
+    checkpointId,
+    revisionDelta,
+    propertyDeltas: suggestion.canonicalCommandProposal?.propertyChanges || [],
+    qaRecheckPassed: next.acceptanceGate.passed,
+    qaBlockingReasons: [...next.acceptanceGate.blockingReasons],
+  });
+
+  next.updatedAt = now;
+  return syncDirectorWorkflowAndProviderState(next);
 }
 
 /**
@@ -2701,12 +3276,18 @@ export function rollbackDirectorToCheckpoint(
   for (const sug of next.refinementSuggestions) {
     if (sug.appliedCheckpointId === checkpointId) {
       sug.status = 'rolled-back';
+      if (sug.canonicalCommandProposal) {
+        sug.canonicalCommandProposal.status = 'rolled-back';
+      }
     }
   }
+  next.canonicalCommandProposals = next.refinementSuggestions
+    .map((s) => s.canonicalCommandProposal)
+    .filter((p): p is DirectorCanonicalCommandProposal => Boolean(p));
 
   next.updatedAt = new Date().toISOString();
   next.acceptanceGate = evaluateDirectorAcceptanceGate(next);
-  return next;
+  return syncDirectorWorkflowAndProviderState(next);
 }
 
 // ============================================================================
@@ -2824,7 +3405,7 @@ export function evaluateDirectorAcceptanceGate(
 }
 
 // ============================================================================
-// 17. VERIFIED ASSET SYNTHESIS & HONEST PROVENANCE VALIDATION
+// 17. VERIFIED ASSET SYNTHESIS, DRAFT LIFECYCLE & HONEST PROVENANCE VALIDATION
 // ============================================================================
 
 function escapeXmlText(text: string): string {
@@ -2838,8 +3419,8 @@ function escapeXmlText(text: string): string {
 
 /**
  * Generates a real, self-contained SVG vector motion plate with verified UTF-8 bytes,
- * SHA-256 digest, storage location, provenance, and security sanitization.
- * Never represents metadata-only placeholders as generated media.
+ * SHA-256 digest, storage location, provenance, dependency metadata, and security sanitization.
+ * Starts in 'draft' lifecycleState and 'private' visibility until explicitly promoted after validation.
  */
 export function synthesizeVerifiedSvgMotionPlate(input: {
   assetTaskId: string;
@@ -2891,6 +3472,14 @@ export function synthesizeVerifiedSvgMotionPlate(input: {
       : `Compiled & SHA-256 verified SVG vector plate from template ${effectiveTemplateId} for shot ${shot.shotId}`,
     createdAt,
     status: dependencyFailed ? 'fallback-substituted' : 'completed',
+    lifecycleState: 'draft',
+    visibility: 'private',
+    dependencies: [
+      `template:${effectiveTemplateId}`,
+      `font:${brandKit.headingFont || 'Syne'}`,
+      `font:${brandKit.bodyFont || 'Plus Jakarta Sans'}`,
+    ],
+    promotedAt: null,
     svgContent: sanitizedSvg,
     byteLength,
     checksumSha256,
@@ -2900,6 +3489,46 @@ export function synthesizeVerifiedSvgMotionPlate(input: {
   };
 }
 
+/**
+ * Promotes AI-generated assets in a session from 'draft' to 'validated-promoted'
+ * ONLY after `validateGeneratedAssetRecord` passes all byte, SHA-256, provenance, and license checks.
+ */
+export function promoteValidatedDirectorAssets(
+  session: AiDirectorSessionRecord
+): {
+  session: AiDirectorSessionRecord;
+  promotedAssetIds: string[];
+  blockedAssets: Array<{ assetTaskId: string; errors: string[] }>;
+} {
+  const next: AiDirectorSessionRecord = JSON.parse(JSON.stringify(session));
+  const now = new Date().toISOString();
+  const promotedAssetIds: string[] = [];
+  const blockedAssets: Array<{ assetTaskId: string; errors: string[] }> = [];
+
+  for (const asset of next.generatedAssetRecords) {
+    const check = validateGeneratedAssetRecord(asset);
+    if (check.valid) {
+      asset.lifecycleState = 'validated-promoted';
+      asset.promotedAt = now;
+      promotedAssetIds.push(asset.assetTaskId);
+    } else {
+      asset.lifecycleState = 'draft';
+      asset.promotedAt = null;
+      blockedAssets.push({
+        assetTaskId: asset.assetTaskId,
+        errors: check.errors,
+      });
+    }
+  }
+
+  next.updatedAt = now;
+  next.acceptanceGate = evaluateDirectorAcceptanceGate(next);
+  return {
+    session: syncDirectorWorkflowAndProviderState(next),
+    promotedAssetIds,
+    blockedAssets,
+  };
+}
 
 /**
  * Validates that a generated asset record is not a fake metadata placeholder.
@@ -2944,7 +3573,7 @@ export function validateGeneratedAssetRecord(
 }
 
 // ============================================================================
-// 18. REVISE PLAN DURING PRODUCTION (WITH REASON, CHECKPOINT, TYPED COMMANDS & QA RE-RUN)
+// 18. REVISE PLAN DURING PRODUCTION (WITH REASON, CHECKPOINT, TYPED COMMANDS, DELTA & QA RE-RUN)
 // ============================================================================
 
 export interface ReviseDirectorPlanDuringProductionInput {
@@ -2962,8 +3591,9 @@ export interface ReviseDirectorPlanDuringProductionInput {
  * 3. Creates a reversible `ProductionCheckpointRecord` BEFORE mutating.
  * 4. Executes timeline updates exclusively through typed canonical project commands
  *    (`invokeRegisteredTool` / `executeProjectCommand`), never raw arbitrary code.
- * 5. Records a new `DirectorPlanRevisionSnapshot` and automatically re-runs
- *    `computeCompleteCoverageLedger`, `generateAdaptiveRefinementSuggestions`, and `evaluateDirectorAcceptanceGate`.
+ * 5. Records a new `DirectorPlanRevisionSnapshot` with before/after `revisionDelta` and `propertyDeltas`,
+ *    and automatically re-runs `computeCompleteCoverageLedger`, `generateAdaptiveRefinementSuggestions`,
+ *    and `evaluateDirectorAcceptanceGate`.
  */
 export function reviseDirectorPlanDuringProduction(
   session: AiDirectorSessionRecord,
@@ -3003,6 +3633,11 @@ export function reviseDirectorPlanDuringProduction(
     );
   }
 
+  const beforeProject: CanonicalProjectDocument | null = next.canonicalProject
+    ? JSON.parse(JSON.stringify(next.canonicalProject))
+    : null;
+  const propertyDeltas: DirectorPropertyBeforeAfter[] = [];
+
   // Create reversible checkpoint before mutating
   const checkpointId = `chk_rev_${Date.now()}_${crypto.randomBytes(2).toString('hex')}`;
   if (next.canonicalProject) {
@@ -3019,22 +3654,61 @@ export function reviseDirectorPlanDuringProduction(
 
   const patch = input.editablePatch;
   if (patch.headlineText !== undefined && patch.headlineText.trim()) {
-    targetShot.editableParameters.headlineText = patch.headlineText.trim();
-    targetShot.typographyAndGraphics.headlineText = patch.headlineText.trim();
+    const beforeVal = targetShot.editableParameters.headlineText;
+    const afterVal = patch.headlineText.trim();
+    propertyDeltas.push({
+      clipId: `clip_txt_${targetShot.shotId}`,
+      clipName: beforeVal.slice(0, 32),
+      propertyPath: 'editableParameters.headlineText',
+      beforeValue: beforeVal,
+      afterValue: afterVal,
+    });
+    targetShot.editableParameters.headlineText = afterVal;
+    targetShot.typographyAndGraphics.headlineText = afterVal;
   }
   if (patch.subheadText !== undefined) {
+    propertyDeltas.push({
+      clipId: `clip_txt_${targetShot.shotId}`,
+      clipName: targetShot.editableParameters.headlineText.slice(0, 32),
+      propertyPath: 'editableParameters.subheadText',
+      beforeValue: targetShot.editableParameters.subheadText,
+      afterValue: patch.subheadText,
+    });
     targetShot.editableParameters.subheadText = patch.subheadText;
     targetShot.typographyAndGraphics.subheadText = patch.subheadText;
   }
   if (patch.durationSec !== undefined && patch.durationSec >= 0.5) {
-    targetShot.editableParameters.durationSec = Number(patch.durationSec.toFixed(2));
-    targetShot.estimatedDurationSec = targetShot.editableParameters.durationSec;
+    const afterDur = Number(patch.durationSec.toFixed(2));
+    propertyDeltas.push({
+      clipId: `clip_txt_${targetShot.shotId}`,
+      clipName: targetShot.editableParameters.headlineText.slice(0, 32),
+      propertyPath: 'editableParameters.durationSec',
+      beforeValue: targetShot.editableParameters.durationSec,
+      afterValue: afterDur,
+    });
+    targetShot.editableParameters.durationSec = afterDur;
+    targetShot.estimatedDurationSec = afterDur;
   }
   if (patch.accentColorHex !== undefined && patch.accentColorHex.trim()) {
-    targetShot.editableParameters.accentColorHex = patch.accentColorHex.trim();
-    targetShot.paletteAndLighting.primaryHex = patch.accentColorHex.trim();
+    const afterHex = patch.accentColorHex.trim();
+    propertyDeltas.push({
+      clipId: `clip_txt_${targetShot.shotId}`,
+      clipName: targetShot.editableParameters.headlineText.slice(0, 32),
+      propertyPath: 'editableParameters.accentColorHex',
+      beforeValue: targetShot.editableParameters.accentColorHex,
+      afterValue: afterHex,
+    });
+    targetShot.editableParameters.accentColorHex = afterHex;
+    targetShot.paletteAndLighting.primaryHex = afterHex;
   }
   if (patch.cameraMotion !== undefined) {
+    propertyDeltas.push({
+      clipId: `clip_tpl_${targetShot.shotId}`,
+      clipName: targetShot.editableParameters.headlineText.slice(0, 32),
+      propertyPath: 'editableParameters.cameraMotion',
+      beforeValue: targetShot.editableParameters.cameraMotion,
+      afterValue: patch.cameraMotion,
+    });
     targetShot.editableParameters.cameraMotion = patch.cameraMotion;
     targetShot.compositionFramingCameraMovement.cameraMovement = patch.cameraMotion;
   }
@@ -3067,7 +3741,7 @@ export function reviseDirectorPlanDuringProduction(
     const clipIds = next.traceability.shotToTimelineClipsMap[targetShot.shotId] || [];
     const textClipId = clipIds.find((id) => id.startsWith('clip_txt_'));
 
-    if (patch.headlineText !== undefined && textClipId) {
+    if ((patch.headlineText !== undefined || patch.accentColorHex !== undefined) && textClipId) {
       const toolReceipt = invokeRegisteredTool({
         ownerUid: input.actorUid || next.ownerUid,
         toolId: 'timeline.execute_command',
@@ -3149,7 +3823,7 @@ export function reviseDirectorPlanDuringProduction(
       next.commandReceipts.unshift(cmdRes.receipt);
     }
 
-    // Regenerate verified SVG asset for the revised shot so checksum & bytes match the new parameters
+    // Regenerate verified SVG asset in draft state for the revised shot so checksum & bytes match the new parameters
     const existingAssetIdx = next.generatedAssetRecords.findIndex(
       (a) => a.shotId === targetShot.shotId
     );
@@ -3168,12 +3842,18 @@ export function reviseDirectorPlanDuringProduction(
     }
   }
 
-  // Recompute coverage ledger, record plan revision snapshot, and re-run affected QA
+  // Recompute coverage ledger, record plan revision snapshot with before/after delta, and re-run affected QA
   next.coverageLedger = computeCompleteCoverageLedger(
     next.originalScriptText,
     next.segments,
     next.shots
   );
+  next.acceptanceGate = evaluateDirectorAcceptanceGate(next);
+
+  const revisionDelta =
+    beforeProject && next.canonicalProject
+      ? diffCanonicalProjects(beforeProject, next.canonicalProject)
+      : null;
 
   next.planRevisions.unshift({
     revisionNumber: next.planRevisions.length + 1,
@@ -3181,17 +3861,127 @@ export function reviseDirectorPlanDuringProduction(
     reason,
     shotsSnapshot: JSON.parse(JSON.stringify(next.shots)),
     coveragePercent: next.coverageLedger.coveragePercent,
+    checkpointId: next.canonicalProject ? checkpointId : null,
+    revisionDelta,
+    propertyDeltas,
+    qaRecheckPassed: next.acceptanceGate.passed,
+    qaBlockingReasons: [...next.acceptanceGate.blockingReasons],
   });
 
   next.refinementSuggestions = generateAdaptiveRefinementSuggestions(next);
+  next.canonicalCommandProposals = next.refinementSuggestions
+    .map((s) => s.canonicalCommandProposal)
+    .filter((p): p is DirectorCanonicalCommandProposal => Boolean(p));
   next.updatedAt = now;
-  next.acceptanceGate = evaluateDirectorAcceptanceGate(next);
-  return next;
+  return syncDirectorWorkflowAndProviderState(next);
 }
 
 // ============================================================================
 // 19. LIVE MODEL-DRIVEN AI DIRECTOR ORCHESTRATOR (PROVIDER HUB + VAULT + ZOD)
 // ============================================================================
+
+export const DirectorToolCallProposalSchema = z.object({
+  id: z.string().min(1).optional(),
+  name: z.enum([
+    'project.inspect_state',
+    'script.analyze_coverage',
+    'catalog.search_templates',
+    'timeline.execute_command',
+    'timeline.create_checkpoint',
+    'project.delete_track_or_clip',
+  ]),
+  arguments: z.record(z.string(), z.unknown()),
+});
+
+export function validateAndSanitizeDirectorToolCalls(
+  rawToolCalls: Array<{
+    id?: string;
+    name?: string;
+    arguments?: Record<string, unknown>;
+  }>
+): {
+  acceptedToolCalls: Array<{
+    id: string;
+    name: string;
+    arguments: Record<string, unknown>;
+  }>;
+  rejectedToolCalls: DirectorRejectedToolCallRecord[];
+} {
+  const acceptedToolCalls: Array<{
+    id: string;
+    name: string;
+    arguments: Record<string, unknown>;
+  }> = [];
+  const rejectedToolCalls: DirectorRejectedToolCallRecord[] = [];
+  const now = new Date().toISOString();
+
+  for (let i = 0; i < (rawToolCalls || []).length; i++) {
+    const raw = rawToolCalls[i] || {};
+    const callId = String(raw.id || `tc_${i + 1}`);
+    const callName = String(raw.name || '');
+    const argsObj =
+      raw.arguments && typeof raw.arguments === 'object' ? raw.arguments : {};
+    const serializedArgs = JSON.stringify(argsObj);
+
+    if (
+      serializedArgs.includes('..') ||
+      /<script\b/i.test(serializedArgs) ||
+      /child_process|process\.env/i.test(serializedArgs)
+    ) {
+      rejectedToolCalls.push({
+        toolCallId: callId,
+        toolName: callName || 'unknown',
+        rawArguments: argsObj,
+        rejectionCode: 'UNSAFE_TOOL_ARGUMENTS_REJECTED',
+        rejectionReason:
+          'Tool call arguments contained forbidden path traversal, script tags, or process access tokens.',
+        rejectedAt: now,
+      });
+      continue;
+    }
+
+    const parsed = DirectorToolCallProposalSchema.safeParse({
+      id: callId,
+      name: callName,
+      arguments: argsObj,
+    });
+    if (!parsed.success) {
+      rejectedToolCalls.push({
+        toolCallId: callId,
+        toolName: callName || 'unknown',
+        rawArguments: argsObj,
+        rejectionCode: 'UNREGISTERED_OR_MALFORMED_TOOL',
+        rejectionReason: `Tool "${callName}" is not registered in REGISTERED_AI_TOOLS or failed schema validation.`,
+        rejectedAt: now,
+      });
+      continue;
+    }
+
+    if (
+      parsed.data.name === 'project.delete_track_or_clip' &&
+      parsed.data.arguments.userApprovalToken !== 'CONFIRM_DESTRUCTIVE_DELETE'
+    ) {
+      rejectedToolCalls.push({
+        toolCallId: callId,
+        toolName: parsed.data.name,
+        rawArguments: argsObj,
+        rejectionCode: 'DESTRUCTIVE_TOOL_APPROVAL_REQUIRED',
+        rejectionReason:
+          'Destructive tool call project.delete_track_or_clip was rejected because explicit userApprovalToken was not provided.',
+        rejectedAt: now,
+      });
+      continue;
+    }
+
+    acceptedToolCalls.push({
+      id: callId,
+      name: parsed.data.name,
+      arguments: parsed.data.arguments,
+    });
+  }
+
+  return { acceptedToolCalls, rejectedToolCalls };
+}
 
 export const LiveModelDirectorSynthesisSchema = z.object({
   narrativeStructure: z.object({
@@ -3448,7 +4238,7 @@ ${segmentListText}`;
 /**
  * Executes a single AI Director task against a resolved ProviderConnectionRecord
  * using server-only vault credential decryption, protocol formatting, SSRF-hardened transport,
- * SSE stream or JSON response parsing, and strict Zod schema validation.
+ * SSE stream or JSON response parsing, tool proposal validation, and strict Zod schema validation.
  */
 export async function executeAiDirectorLiveProviderTask(input: {
   session: AiDirectorSessionRecord;
@@ -3704,11 +4494,12 @@ export async function executeAiDirectorLiveProviderTask(input: {
     };
   }
 
-  // 6. Parse response (supporting SSE streaming chunks or standard JSON body)
+  // 6. Parse response (supporting SSE streaming chunks or standard JSON body) and validate tool proposals
   let extractedText = '';
   let promptTokens = Math.max(64, Math.ceil((systemPrompt.length + userPrompt.length) / 4));
   let completionTokens = 128;
   let reasoningTokens = 0;
+  let rejectedToolCalls: DirectorRejectedToolCallRecord[] = [];
 
   if (useStreaming && upstreamRes.rawText.includes('data:')) {
     const lines = upstreamRes.rawText.split(/\r?\n/);
@@ -3760,6 +4551,14 @@ export async function executeAiDirectorLiveProviderTask(input: {
     completionTokens = protocolParsed.usage.completionTokens || Math.max(32, Math.ceil(extractedText.length / 4));
     reasoningTokens = protocolParsed.usage.reasoningTokens || 0;
     streamStages.push('protocol-response-parsed');
+
+    if (protocolParsed.toolCalls && protocolParsed.toolCalls.length > 0) {
+      const toolCheck = validateAndSanitizeDirectorToolCalls(protocolParsed.toolCalls);
+      rejectedToolCalls = toolCheck.rejectedToolCalls;
+      if (rejectedToolCalls.length > 0) {
+        streamStages.push(`rejected-${rejectedToolCalls.length}-unsafe-or-malformed-tool-calls`);
+      }
+    }
   }
 
   const totalTokens = promptTokens + completionTokens + reasoningTokens;
@@ -3795,6 +4594,7 @@ export async function executeAiDirectorLiveProviderTask(input: {
         latencyMs: upstreamRes.latencyMs,
         usage: { promptTokens, completionTokens, reasoningTokens, totalTokens, estimatedCostUsd },
         streamStages,
+        rejectedToolCalls,
         sanitizedError: {
           code: 'DIRECTOR_JSON_PARSE_FAILED',
           message: 'Model response did not contain a parseable JSON object.',
@@ -3804,6 +4604,25 @@ export async function executeAiDirectorLiveProviderTask(input: {
       },
       synthesis: null,
     };
+  }
+
+  // Also check if the JSON payload included an inline `toolRequests` array and validate/reject unsafe calls
+  if (
+    rawObject &&
+    typeof rawObject === 'object' &&
+    Array.isArray((rawObject as Record<string, unknown>).toolRequests)
+  ) {
+    const inlineCheck = validateAndSanitizeDirectorToolCalls(
+      (rawObject as Record<string, unknown>).toolRequests as Array<{
+        id?: string;
+        name?: string;
+        arguments?: Record<string, unknown>;
+      }>
+    );
+    rejectedToolCalls = [...rejectedToolCalls, ...inlineCheck.rejectedToolCalls];
+    if (inlineCheck.rejectedToolCalls.length > 0) {
+      streamStages.push(`rejected-${inlineCheck.rejectedToolCalls.length}-inline-tool-requests`);
+    }
   }
 
   const zodResult = LiveModelDirectorSynthesisSchema.safeParse(rawObject);
@@ -3827,6 +4646,7 @@ export async function executeAiDirectorLiveProviderTask(input: {
         latencyMs: upstreamRes.latencyMs,
         usage: { promptTokens, completionTokens, reasoningTokens, totalTokens, estimatedCostUsd },
         streamStages,
+        rejectedToolCalls,
         sanitizedError: {
           code: 'DIRECTOR_SCHEMA_VALIDATION_FAILED',
           message: `Structured output failed Zod schema validation at "${firstIssue?.path.join('.') || 'root'}": ${firstIssue?.message || 'invalid field'}`,
@@ -3859,6 +4679,7 @@ export async function executeAiDirectorLiveProviderTask(input: {
       latencyMs: upstreamRes.latencyMs,
       usage: { promptTokens, completionTokens, reasoningTokens, totalTokens, estimatedCostUsd },
       streamStages,
+      rejectedToolCalls,
       sanitizedError: null,
       createdAt: now,
     },
@@ -4050,9 +4871,139 @@ export function applyLiveModelSynthesisToSession(
     coveragePercent: next.coverageLedger.coveragePercent,
   });
 
+  next.refinementSuggestions = generateAdaptiveRefinementSuggestions(next);
+  next.canonicalCommandProposals = next.refinementSuggestions
+    .map((s) => s.canonicalCommandProposal)
+    .filter((p): p is DirectorCanonicalCommandProposal => Boolean(p));
+
   next.updatedAt = now;
   next.acceptanceGate = evaluateDirectorAcceptanceGate(next);
-  return next;
+  return syncDirectorWorkflowAndProviderState(next);
+}
+
+/**
+ * Resolves the best ProviderConnectionRecord for a given AI Director task by honoring:
+ * 1. Explicit user `preferredConnectionId` (and optional `preferredModelId` override),
+ * 2. User-configured `TaskRoutingProfile` for `taskType`,
+ * 3. Task complexity & budget/latency preference:
+ *    - `gemini-4-argon` is preferred for difficult whole-script reasoning, planning, and evaluation when the user has a connection for it;
+ *    - `gemini-3.8-flash` is preferred for cheaper routine tasks (`routine-tasks`, `asset-research`) or when `budgetLatencyPreference === 'low-cost-fast-flash'`.
+ * Treat `gemini-4-argon` and `gemini-3.8-flash` as configurable runtime settings and verify actual connection availability.
+ */
+export function resolveDirectorModelRouterConnection(input: {
+  ownerUid?: string;
+  session?: AiDirectorSessionRecord;
+  connections: ProviderConnectionRecord[];
+  routingProfiles?: TaskRoutingProfile[] | Record<string, TaskRoutingProfile>;
+  preferredConnectionId?: string | null;
+  preferredModelId?: string | null;
+  taskType: HubTaskType;
+  budgetLatencyPreference?: BudgetLatencyPreferenceMode;
+}): {
+  primaryConnection: ProviderConnectionRecord | null;
+  fallbackConnection: ProviderConnectionRecord | null;
+  routingReason: string;
+} {
+  const resolvedOwnerUid = input.ownerUid || input.session?.ownerUid || '';
+  const resolvedBudgetPref =
+    input.budgetLatencyPreference || input.session?.intake.budgetLatencyPreference;
+  const userConnections = input.connections.filter((c) => c.ownerUid === resolvedOwnerUid);
+  const routingProfileList: TaskRoutingProfile[] = Array.isArray(input.routingProfiles)
+    ? input.routingProfiles
+    : Object.values(input.routingProfiles || {});
+  const routeProfile = routingProfileList.find((r) => r.taskType === input.taskType);
+
+  const isComplexReasoningTask =
+    input.taskType === 'planning' ||
+    input.taskType === 'script-analysis' ||
+    input.taskType === 'evaluation';
+  const prefersArgon =
+    resolvedBudgetPref === 'quality-first-argon' ||
+    (resolvedBudgetPref !== 'low-cost-fast-flash' && isComplexReasoningTask);
+  const targetPreferredModelId =
+    (input.preferredModelId || '').trim() ||
+    (prefersArgon ? 'gemini-4-argon' : 'gemini-3.8-flash');
+
+  const isConnCredentialConfigured = (c: ProviderConnectionRecord): boolean => {
+    if (c.credentialStatus === 'active' && Boolean(c.encryptedCredential)) return true;
+    if (c.authMode === 'server-env' && Boolean((process.env.GEMINI_API_KEY || '').trim())) {
+      return true;
+    }
+    return false;
+  };
+
+  let primaryConnection: ProviderConnectionRecord | null = null;
+  let routingReason = '';
+
+  // 1. Explicit preferredConnectionId
+  if (input.preferredConnectionId) {
+    primaryConnection =
+      userConnections.find((c) => c.id === input.preferredConnectionId) || null;
+    if (primaryConnection) {
+      routingReason = `User-selected connection "${primaryConnection.label}" (${primaryConnection.modelId}).`;
+    }
+  }
+
+  // 2. Match user's configured connections by task-preferred model ID (gemini-4-argon for complex reasoning, gemini-3.8-flash for routine)
+  if (!primaryConnection) {
+    const modelMatched = userConnections.find(
+      (c) =>
+        isConnCredentialConfigured(c) &&
+        c.modelId === targetPreferredModelId &&
+        c.capabilities?.text?.state !== 'Unsupported'
+    );
+    if (modelMatched) {
+      primaryConnection = modelMatched;
+      routingReason = `Matched task "${input.taskType}" to preferred model "${targetPreferredModelId}" via connection "${modelMatched.label}".`;
+    }
+  }
+
+  // 3. Task routing profile primaryConnectionId (if configured with credentials)
+  if (!primaryConnection && routeProfile?.primaryConnectionId) {
+    const candidate = userConnections.find((c) => c.id === routeProfile.primaryConnectionId);
+    if (candidate && isConnCredentialConfigured(candidate)) {
+      primaryConnection = candidate;
+      routingReason = `Routed via TaskRoutingProfile for "${input.taskType}" to "${candidate.label}" (${candidate.modelId}).`;
+    }
+  }
+
+  // 4. Any configured user connection supporting text
+  if (!primaryConnection) {
+    const anyConfigured = userConnections.find(
+      (c) => isConnCredentialConfigured(c) && c.capabilities?.text?.state !== 'Unsupported'
+    );
+    if (anyConfigured) {
+      primaryConnection = anyConfigured;
+      routingReason = `Selected available configured connection "${anyConfigured.label}" (${anyConfigured.modelId}).`;
+    }
+  }
+
+  // Apply explicit runtime model override if requested by caller
+  if (primaryConnection && input.preferredModelId && input.preferredModelId.trim()) {
+    primaryConnection = {
+      ...primaryConnection,
+      modelId: input.preferredModelId.trim(),
+    };
+  }
+
+  const fallbackConnId =
+    routeProfile?.fallbackConnectionId || primaryConnection?.fallbackConnectionId || null;
+  const fallbackConnection =
+    fallbackConnId && fallbackConnId !== primaryConnection?.id
+      ? userConnections.find((c) => c.id === fallbackConnId) || null
+      : userConnections.find(
+          (c) =>
+            c.id !== primaryConnection?.id &&
+            isConnCredentialConfigured(c) &&
+            c.capabilities?.text?.state !== 'Unsupported'
+        ) || null;
+
+  return {
+    primaryConnection,
+    fallbackConnection,
+    routingReason:
+      routingReason || DETERMINISTIC_NO_PROVIDER_BANNER,
+  };
 }
 
 /**
@@ -4066,6 +5017,7 @@ export async function orchestrateLiveAiDirectorSession(input: {
   connections: ProviderConnectionRecord[];
   routingProfiles?: TaskRoutingProfile[] | Record<string, TaskRoutingProfile>;
   preferredConnectionId?: string | null;
+  preferredModelId?: string | null;
   taskType?: HubTaskType;
   stream?: boolean;
   timeoutMs?: number;
@@ -4079,6 +5031,7 @@ export async function orchestrateLiveAiDirectorSession(input: {
     connections,
     routingProfiles = [],
     preferredConnectionId = null,
+    preferredModelId = null,
     taskType = 'planning',
     stream = false,
     timeoutMs = 15000,
@@ -4090,21 +5043,18 @@ export async function orchestrateLiveAiDirectorSession(input: {
   next.actualContactedModels = Array.isArray(next.actualContactedModels) ? next.actualContactedModels : [];
   next.executionStageTrace = Array.isArray(next.executionStageTrace) ? next.executionStageTrace : [];
 
-  const userConnections = connections.filter((c) => c.ownerUid === next.ownerUid);
-  const routingProfileList: TaskRoutingProfile[] = Array.isArray(routingProfiles)
-    ? routingProfiles
-    : Object.values(routingProfiles || {});
-  const routeProfile = routingProfileList.find((r) => r.taskType === taskType);
+  const resolvedRoute = resolveDirectorModelRouterConnection({
+    ownerUid: next.ownerUid,
+    connections,
+    routingProfiles,
+    preferredConnectionId,
+    preferredModelId,
+    taskType,
+    budgetLatencyPreference: next.intake.budgetLatencyPreference,
+  });
 
-  const primaryConnId =
-    preferredConnectionId ||
-    routeProfile?.primaryConnectionId ||
-    userConnections[0]?.id ||
-    null;
-
-  const primaryConnection = primaryConnId
-    ? userConnections.find((c) => c.id === primaryConnId) || null
-    : null;
+  const primaryConnection = resolvedRoute.primaryConnection;
+  const fallbackConnection = resolvedRoute.fallbackConnection;
 
   if (!primaryConnection) {
     const skippedInv: AiDirectorProviderInvocationEvidence = {
@@ -4125,7 +5075,7 @@ export async function orchestrateLiveAiDirectorSession(input: {
       streamStages: ['no-provider-connection-configured'],
       sanitizedError: {
         code: 'NO_PROVIDER_CONNECTION_CONFIGURED',
-        message: 'No live Provider Hub connection was selected or available; preserving deterministic baseline.',
+        message: DETERMINISTIC_NO_PROVIDER_BANNER,
         retryable: true,
       },
       createdAt: new Date().toISOString(),
@@ -4134,10 +5084,13 @@ export async function orchestrateLiveAiDirectorSession(input: {
     next.executionStageTrace.push({
       stage: `live-orchestration-${taskType}`,
       status: 'fallback',
-      detail: skippedInv.sanitizedError!.message,
+      detail: DETERMINISTIC_NO_PROVIDER_BANNER,
       timestamp: skippedInv.createdAt,
     });
-    return { session: next, latestInvocation: skippedInv };
+    return {
+      session: syncDirectorWorkflowAndProviderState(next),
+      latestInvocation: skippedInv,
+    };
   }
 
   // Attempt primary connection
@@ -4160,7 +5113,7 @@ export async function orchestrateLiveAiDirectorSession(input: {
     next.executionStageTrace.push({
       stage: `live-orchestration-${taskType}`,
       status: 'completed',
-      detail: `Contacted ${primaryResult.invocation.actualContactedModelId} via "${primaryConnection.label}" (${primaryResult.invocation.latencyMs}ms, ${primaryResult.invocation.usage.totalTokens} tokens).`,
+      detail: `Contacted ${primaryResult.invocation.actualContactedModelId} via "${primaryConnection.label}" (${primaryResult.invocation.latencyMs}ms, ${primaryResult.invocation.usage.totalTokens} tokens). ${resolvedRoute.routingReason}`,
       timestamp: primaryResult.invocation.createdAt,
     });
     next = applyLiveModelSynthesisToSession(
@@ -4169,16 +5122,11 @@ export async function orchestrateLiveAiDirectorSession(input: {
       primaryResult.invocation.actualContactedModelId,
       primaryConnection.id
     );
-    return { session: next, latestInvocation: primaryResult.invocation };
+    return {
+      session: syncDirectorWorkflowAndProviderState(next),
+      latestInvocation: primaryResult.invocation,
+    };
   }
-
-  // Check if fallback connection is configured and error is retryable
-  const fallbackConnId =
-    routeProfile?.fallbackConnectionId || primaryConnection.fallbackConnectionId || null;
-  const fallbackConnection =
-    fallbackConnId && fallbackConnId !== primaryConnection.id
-      ? userConnections.find((c) => c.id === fallbackConnId) || null
-      : null;
 
   if (fallbackConnection && primaryResult.invocation.sanitizedError?.retryable) {
     next.executionStageTrace.push({
@@ -4221,7 +5169,10 @@ export async function orchestrateLiveAiDirectorSession(input: {
         fallbackResult.invocation.actualContactedModelId,
         fallbackConnection.id
       );
-      return { session: next, latestInvocation: fallbackResult.invocation };
+      return {
+        session: syncDirectorWorkflowAndProviderState(next),
+        latestInvocation: fallbackResult.invocation,
+      };
     }
 
     next.executionStageTrace.push({
@@ -4230,7 +5181,10 @@ export async function orchestrateLiveAiDirectorSession(input: {
       detail: `Fallback connection "${fallbackConnection.label}" also failed (${fallbackResult.invocation.sanitizedError?.code || 'ERR'}). Preserving deterministic script coverage ledger.`,
       timestamp: fallbackResult.invocation.createdAt,
     });
-    return { session: next, latestInvocation: fallbackResult.invocation };
+    return {
+      session: syncDirectorWorkflowAndProviderState(next),
+      latestInvocation: fallbackResult.invocation,
+    };
   }
 
   next.executionStageTrace.push({
@@ -4240,6 +5194,10 @@ export async function orchestrateLiveAiDirectorSession(input: {
     timestamp: primaryResult.invocation.createdAt,
   });
 
-  return { session: next, latestInvocation: primaryResult.invocation };
+  return {
+    session: syncDirectorWorkflowAndProviderState(next),
+    latestInvocation: primaryResult.invocation,
+  };
 }
+
 

@@ -297,7 +297,29 @@ export function toPublicProviderConnectionView(
   record: ProviderConnectionRecord
 ): ProviderConnectionPublicView {
   const { encryptedCredential: _omitted, ...publicRest } = record;
+  if (publicRest.authMode === 'server-env') {
+    const hasEnvKey = Boolean(process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY.trim());
+    publicRest.maskedCredential = hasEnvKey ? 'server-env (GEMINI_API_KEY)' : 'server-env (not set)';
+  }
   return publicRest;
+}
+
+export function isProviderConnectionReadyForLiveInvocation(
+  conn:
+    | Pick<ProviderConnectionPublicView, 'authMode' | 'credentialStatus' | 'maskedCredential'>
+    | null
+    | undefined
+): boolean {
+  if (!conn) return false;
+  if (conn.credentialStatus === 'active') return true;
+  if (
+    conn.authMode === 'server-env' &&
+    conn.credentialStatus === 'server-managed' &&
+    !String(conn.maskedCredential || '').includes('not set')
+  ) {
+    return true;
+  }
+  return false;
 }
 
 /**

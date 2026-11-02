@@ -30,10 +30,22 @@ export interface ApiResponse<T = unknown> {
   details?: unknown;
 }
 
+let testAuthTokenResolverOverride: ((forceRefresh?: boolean) => Promise<string | null>) | null =
+  null;
+
+export function setDefaultAuthTokenResolverForTesting(
+  resolver: ((forceRefresh?: boolean) => Promise<string | null>) | null
+): void {
+  testAuthTokenResolverOverride = resolver;
+}
+
 /**
  * Default token retriever using active Firebase Auth state.
  */
 export async function getFirebaseIdToken(forceRefresh = false): Promise<string | null> {
+  if (testAuthTokenResolverOverride) {
+    return testAuthTokenResolverOverride(forceRefresh);
+  }
   try {
     const current = auth?.currentUser;
     if (!current) return null;

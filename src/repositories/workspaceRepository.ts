@@ -20,6 +20,7 @@ import {
   TemplateVariantInstance,
   UserPreferences,
 } from '../types/sowveil';
+import { CanonicalProjectDocument } from '../types/canonicalProject';
 import { SEED_CATALOG_ITEMS, SEED_PROJECT_LIBRARY } from '../data/catalogSeeds';
 import { enrichCatalogItemWithMarketplaceDefaults } from '../services/marketplaceEngine';
 import { transitionJobRecord } from '../services/jobStateMachine';
@@ -79,6 +80,9 @@ export interface IWorkspaceRepository {
     > & { expectedRevision?: number }
   ): Promise<ProjectLibraryItem>;
   upsertProjectRecord?(project: ProjectLibraryItem): Promise<ProjectLibraryItem>;
+  getCanonicalProjectById?(
+    id: string
+  ): Promise<{ project: CanonicalProjectDocument; canUndo?: boolean; canRedo?: boolean } | null>;
   deleteProject(id: string): Promise<void>;
   listJobs(): Promise<JobRecord[]>;
   createJob(
@@ -608,6 +612,33 @@ export class FirestoreWorkspaceRepository implements IWorkspaceRepository {
     } catch (err) {
       handleFirestoreError(err, OperationType.DELETE, `projects/${safeId}`);
     }
+  }
+
+  public async getCanonicalProjectById(id: string): Promise<{
+    project: CanonicalProjectDocument;
+    canUndo?: boolean;
+    canRedo?: boolean;
+  } | null> {
+    const safeId = sanitizeFirestoreId(id);
+    if (this.shouldUseServerApi()) {
+      const apiRes = await this.callServerApi<{
+        project: CanonicalProjectDocument;
+        canUndo?: boolean;
+        canRedo?: boolean;
+      }>(`/api/v1/projects/${encodeURIComponent(safeId)}/canonical`, {
+        method: 'GET',
+      });
+      if (apiRes.ok && apiRes.data && apiRes.data.project) {
+        return apiRes.data;
+      }
+      if (apiRes.status === 403 || apiRes.errorCode === 'CROSS_USER_ACCESS_FORBIDDEN') {
+        throw new Error(`403 CROSS_USER_ACCESS_FORBIDDEN: ${apiRes.errorMessage}`);
+      }
+      if (apiRes.status === 404 || apiRes.errorCode === 'NOT_FOUND') {
+        return null;
+      }
+    }
+    return null;
   }
 
   public async listJobs(): Promise<JobRecord[]> {

@@ -1,9 +1,16 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import React from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { MemoryRouter } from 'react-router-dom';
 import { SOWVEIL_MODULES } from '../data/modules';
 import { SEED_CATALOG_ITEMS } from '../data/catalogSeeds';
+import {
+  LandscapeCreativeStudio,
+  computeStudioViewportLayout,
+} from '../components/LandscapeCreativeStudio';
 
-describe('Prompt G: Mobile Landscape Creative Studio UI & Viewport QA', () => {
+describe('Prompt G & Responsive Reconstruction: Mobile Landscape Creative Studio UI & Viewport QA', () => {
   it('preserves all 20 canonical reference modules in exact order with authentic counts', () => {
     assert.equal(SOWVEIL_MODULES.length, 20);
 
@@ -140,4 +147,141 @@ describe('Prompt G: Mobile Landscape Creative Studio UI & Viewport QA', () => {
     assert.ok(!engineCopy.includes('After Effects'));
     assert.ok(engineCopy.includes('Mobile Creative Engine'));
   });
+
+  it('prevents preview collapse on Phone Portrait (390×844 & 360×780) and reports truthful PORTRAIT badge', () => {
+    const portrait390 = computeStudioViewportLayout(390, 844, {
+      requestedLeftOpen: true,
+      requestedRightOpen: true,
+      lastInteractedDrawer: 'left',
+    });
+
+    assert.equal(portrait390.mode, 'phone-portrait');
+    assert.equal(portrait390.isPortrait, true);
+    assert.equal(portrait390.orientationBadge, 'PORTRAIT');
+    assert.equal(portrait390.drawerPresentation, 'portrait-sheet');
+    assert.equal(portrait390.allowSimultaneousSidebars, false);
+    // Mutual exclusion enforced
+    assert.equal(portrait390.effectiveLeftOpen && portrait390.effectiveRightOpen, false);
+    assert.equal(portrait390.leftDockedWidthPx, 0);
+    assert.equal(portrait390.rightDockedWidthPx, 0);
+    // Central preview bounding box is guaranteed positive and full-width (never 0px)
+    assert.equal(portrait390.previewBoundingBox.width, 390);
+    assert.ok(portrait390.previewBoundingBox.height >= 450);
+
+    // Render component at Phone Portrait (390x844) and verify DOM attributes & badge
+    const html = renderToStaticMarkup(
+      React.createElement(
+        MemoryRouter,
+        null,
+        React.createElement(LandscapeCreativeStudio, {
+          initialViewportWidth: 390,
+          initialViewportHeight: 844,
+        })
+      )
+    );
+
+    assert.ok(html.includes('data-viewport-mode="phone-portrait"'));
+    assert.ok(html.includes('data-drawer-presentation="portrait-sheet"'));
+    assert.ok(html.includes('>PORTRAIT<'));
+    assert.ok(html.includes('data-testid="portrait-bottom-nav"'));
+    assert.ok(html.includes('data-preview-width="390"'));
+  });
+
+  it('prevents preview collapse on Phone Landscape (844×390 & 780×360) with mutually exclusive overlay drawers and compact timeline', () => {
+    const landscape844 = computeStudioViewportLayout(844, 390, {
+      requestedLeftOpen: true,
+      requestedRightOpen: true,
+      lastInteractedDrawer: 'right',
+    });
+
+    assert.equal(landscape844.mode, 'phone-landscape');
+    assert.equal(landscape844.isPortrait, false);
+    assert.equal(landscape844.orientationBadge, 'LANDSCAPE');
+    assert.equal(landscape844.drawerPresentation, 'landscape-overlay');
+    assert.equal(landscape844.allowSimultaneousSidebars, false);
+    // Mutual exclusion: both drawers cannot be open simultaneously
+    assert.equal(landscape844.effectiveLeftOpen, false);
+    assert.equal(landscape844.effectiveRightOpen, true);
+    // Overlay drawers do not subtract from flex stage width
+    assert.equal(landscape844.leftDockedWidthPx, 0);
+    assert.equal(landscape844.rightDockedWidthPx, 0);
+    assert.equal(landscape844.previewBoundingBox.width, 844);
+    assert.ok(landscape844.previewBoundingBox.height >= 140);
+    // Timeline is compact on short phone landscape heights
+    assert.ok(landscape844.timelineHeightPx <= 116);
+
+    const html = renderToStaticMarkup(
+      React.createElement(
+        MemoryRouter,
+        null,
+        React.createElement(LandscapeCreativeStudio, {
+          initialViewportWidth: 844,
+          initialViewportHeight: 390,
+        })
+      )
+    );
+
+    assert.ok(html.includes('data-viewport-mode="phone-landscape"'));
+    assert.ok(html.includes('data-drawer-presentation="landscape-overlay"'));
+    assert.ok(html.includes('>LANDSCAPE<'));
+    assert.ok(html.includes('data-timeline-preset="compact"'));
+  });
+
+  it('maintains valid preview bounding boxes across Tablet (820×1180, 1024×768) and Wide Desktop (1440×900)', () => {
+    const tabletPortrait = computeStudioViewportLayout(820, 1180, {
+      requestedLeftOpen: true,
+      requestedRightOpen: true,
+      lastInteractedDrawer: 'left',
+    });
+    assert.equal(tabletPortrait.mode, 'tablet');
+    assert.equal(tabletPortrait.orientationBadge, 'TABLET');
+    assert.equal(tabletPortrait.allowSimultaneousSidebars, false);
+    assert.equal(tabletPortrait.effectiveLeftOpen && tabletPortrait.effectiveRightOpen, false);
+    assert.ok(tabletPortrait.previewBoundingBox.width >= 500);
+    assert.ok(tabletPortrait.previewBoundingBox.height >= 600);
+
+    const tabletLandscape = computeStudioViewportLayout(1024, 768, {
+      requestedLeftOpen: true,
+      requestedRightOpen: true,
+    });
+    assert.equal(tabletLandscape.mode, 'tablet');
+    assert.equal(tabletLandscape.allowSimultaneousSidebars, true);
+    assert.ok(tabletLandscape.previewBoundingBox.width >= 420);
+    assert.ok(tabletLandscape.previewBoundingBox.height >= 420);
+
+    const desktopWide = computeStudioViewportLayout(1440, 900, {
+      requestedLeftOpen: true,
+      requestedRightOpen: true,
+    });
+    assert.equal(desktopWide.mode, 'desktop');
+    assert.equal(desktopWide.orientationBadge, 'DESKTOP');
+    assert.equal(desktopWide.drawerPresentation, 'desktop-dual-dock');
+    assert.equal(desktopWide.allowSimultaneousSidebars, true);
+    assert.equal(desktopWide.effectiveLeftOpen, true);
+    assert.equal(desktopWide.effectiveRightOpen, true);
+    assert.ok(desktopWide.previewBoundingBox.width >= 800);
+    assert.ok(desktopWide.previewBoundingBox.height >= 550);
+  });
+
+  it('shows explicit Project Chooser gate when no project is selected and renders active Keyframe command bus when a canonical project is loaded', () => {
+    const chooserHtml = renderToStaticMarkup(
+      React.createElement(
+        MemoryRouter,
+        null,
+        React.createElement(LandscapeCreativeStudio, {
+          initialViewportWidth: 1440,
+          initialViewportHeight: 900,
+        })
+      )
+    );
+
+    // Explicit chooser gate is shown when no project is selected
+    assert.ok(chooserHtml.includes('data-testid="studio-project-chooser"'));
+    assert.ok(chooserHtml.includes('data-testid="chooser-new-project-btn"'));
+    assert.ok(chooserHtml.includes('data-testid="chooser-load-demo-btn"'));
+    // Timeline Keyframe button is now an active canonical command button
+    assert.ok(chooserHtml.includes('data-testid="timeline-keyframe-btn"'));
+    assert.ok(chooserHtml.includes('data-testid="studio-save-status-badge"'));
+  });
 });
+

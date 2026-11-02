@@ -64,6 +64,7 @@ import { ProviderHubWorkspace } from './components/ProviderHubWorkspace';
 import { AiDirectorWorkspace } from './components/AiDirectorWorkspace';
 import { EditingStudioWorkspace } from './components/EditingStudioWorkspace';
 import { LandscapeCreativeStudio } from './components/LandscapeCreativeStudio';
+import { sharedCanonicalEditorSession } from './services/canonicalEditorSession';
 import { TemplateFactoryWorkspace } from './components/TemplateFactoryWorkspace';
 import { RenderExportQaWorkspace } from './components/RenderExportQaWorkspace';
 import { OfflineIndicator, PWAInstallButton } from './components/PWAInstallBanner';
@@ -890,7 +891,7 @@ export default function App() {
         id?: string;
         createdAt?: string;
       }
-    ) => {
+    ): Promise<void> => {
       await workspaceRepository.createProject(proj);
       const list = await workspaceRepository.listProjects();
       setProjects(list);
@@ -911,7 +912,7 @@ export default function App() {
   }, []);
 
   const updateProject = useCallback(
-    async (id: string, patch: Partial<ProjectLibraryItem>) => {
+    async (id: string, patch: Partial<ProjectLibraryItem> & { expectedRevision?: number }): Promise<void> => {
       await workspaceRepository.updateProject(id, patch);
       const list = await workspaceRepository.listProjects();
       setProjects(list);
@@ -1222,6 +1223,22 @@ export default function App() {
           element={
             <ProtectedUserRoute authReady={authReady} currentUser={currentUser}>
               <LandscapeStudioRouteWrapper
+                catalogItems={catalogItems}
+                projects={projects}
+                ownerUid={currentUser?.uid || 'user-local'}
+                onAddProject={addProject}
+                onUpdateProject={updateProject}
+                onNotify={notify}
+              />
+            </ProtectedUserRoute>
+          }
+        />
+        <Route
+          path="/app/landscape-studio/:projectId"
+          element={
+            <ProtectedUserRoute authReady={authReady} currentUser={currentUser}>
+              <LandscapeStudioRouteWrapper
+                catalogItems={catalogItems}
                 projects={projects}
                 ownerUid={currentUser?.uid || 'user-local'}
                 onAddProject={addProject}
@@ -1391,7 +1408,10 @@ const EditingStudioRouteWrapper: React.FC<{
   onAddProject: (
     p: Omit<ProjectLibraryItem, 'id' | 'updatedAt'> & { id?: string; createdAt?: string }
   ) => Promise<void>;
-  onUpdateProject: (id: string, patch: Partial<ProjectLibraryItem>) => Promise<void>;
+  onUpdateProject: (
+    id: string,
+    patch: Partial<ProjectLibraryItem> & { expectedRevision?: number }
+  ) => Promise<void>;
   onNotify: (message: string, tone?: 'info' | 'warning' | 'error' | 'success') => void;
 }> = ({ projects, ownerUid, onAddProject, onUpdateProject, onNotify }) => {
   const { projectId } = useParams<{ projectId?: string }>();
@@ -1405,17 +1425,31 @@ const EditingStudioRouteWrapper: React.FC<{
       const found = projects.find((p) => p.id === targetId);
       if (found) return found;
     }
+    const sessionActiveId = sharedCanonicalEditorSession.getState().project?.id;
+    if (sessionActiveId) {
+      const foundSessionProj = projects.find((p) => p.id === sessionActiveId);
+      if (foundSessionProj) return foundSessionProj;
+      return null;
+    }
     return projects[0] || null;
   }, [projectId, location.search, projects]);
 
+  const activeSessionDoc = sharedCanonicalEditorSession.getState().project;
+
   return (
     <EditingStudioWorkspace
-      key={`${ownerUid}:${targetLibraryProject?.id || 'draft'}`}
+      key={`${ownerUid}:${targetLibraryProject?.id || activeSessionDoc?.id || 'draft'}`}
       mode="standalone-route"
       onClose={() => navigate('/app/text-animation')}
       sourceLibraryProject={targetLibraryProject}
       availableProjects={projects}
       ownerUid={ownerUid}
+      sessionManager={sharedCanonicalEditorSession}
+      onFetchCanonicalProject={
+        workspaceRepository.getCanonicalProjectById
+          ? (id) => workspaceRepository.getCanonicalProjectById!(id)
+          : undefined
+      }
       onSaveToProjectLibrary={async (record, existingId) => {
         const stableId = existingId || record.id;
         if (stableId && projects.some((p) => p.id === stableId)) {
@@ -1433,24 +1467,46 @@ const EditingStudioRouteWrapper: React.FC<{
 };
 
 const LandscapeStudioRouteWrapper: React.FC<{
+  catalogItems: CatalogItem[];
   projects: ProjectLibraryItem[];
   ownerUid: string;
   onAddProject: (
     p: Omit<ProjectLibraryItem, 'id' | 'updatedAt'> & { id?: string; createdAt?: string }
   ) => Promise<void>;
-  onUpdateProject: (id: string, patch: Partial<ProjectLibraryItem>) => Promise<void>;
+  onUpdateProject: (
+    id: string,
+    patch: Partial<ProjectLibraryItem> & { expectedRevision?: number }
+  ) => Promise<void>;
   onNotify: (message: string, tone?: 'info' | 'warning' | 'error' | 'success') => void;
-}> = ({ projects, ownerUid, onAddProject, onUpdateProject, onNotify }) => {
+}> = ({ catalogItems, projects, ownerUid, onAddProject, onUpdateProject, onNotify }) => {
+  const { projectId } = useParams<{ projectId?: string }>();
+  const location = useLocation();
+  const resolvedProjectId = useMemo(() => {
+    const queryParams = new URLSearchParams(location.search);
+    return projectId || queryParams.get('projectId') || null;
+  }, [projectId, location.search]);
+
   return (
     <LandscapeCreativeStudio
+      projectId={resolvedProjectId}
+      catalogItems={catalogItems}
       projects={projects}
       ownerUid={ownerUid}
-      onSaveProject={async (proj) => {
+      sessionManager={sharedCanonicalEditorSession}
+      onFetchCanonicalProject={
+        workspaceRepository.getCanonicalProjectById
+          ? (id) => workspaceRepository.getCanonicalProjectById!(id)
+          : undefined
+      }
+      onSaveProject={async (proj, expectedRevision) => {
         if (projects.some((p) => p.id === proj.id)) {
-          await onUpdateProject(proj.id, proj);
-        } else {
-          await onAddProject(proj);
+          await onUpdateProject(proj.id, {
+            ...proj,
+            expectedRevision,
+          });
+          return;
         }
+        await onAddProject(proj);
       }}
       onNotify={onNotify}
     />

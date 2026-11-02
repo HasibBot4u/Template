@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 import {
   CanonicalBlendMode,
   CanonicalClip,
@@ -27,6 +28,11 @@ import {
   serializeCanonicalProject,
   validateCanonicalProject,
 } from '../services/canonicalProjectEngine';
+import {
+  CanonicalEditorSessionManager,
+  CanonicalSaveState,
+  sharedCanonicalEditorSession,
+} from '../services/canonicalEditorSession';
 import {
   AiCoEditLogEntry,
   AiCoEditTransaction,
@@ -57,6 +63,7 @@ import {
   Link2,
   Lock,
   Magnet,
+  MonitorPlay,
   Pause,
   Play,
   Plus,
@@ -101,6 +108,14 @@ export interface EditingStudioWorkspaceProps {
   sourceVariant?: TemplateVariantInstance | null;
   availableProjects?: ProjectLibraryItem[];
   ownerUid?: string;
+  sessionManager?: CanonicalEditorSessionManager;
+  onFetchCanonicalProject?: (
+    projectId: string
+  ) => Promise<{
+    project: CanonicalProjectDocument;
+    canUndo?: boolean;
+    canRedo?: boolean;
+  } | null>;
   onSaveToProjectLibrary: (
     record: Omit<ProjectLibraryItem, 'id' | 'updatedAt'> & { id?: string },
     existingProjectId?: string
@@ -163,13 +178,28 @@ export const EditingStudioWorkspace: React.FC<EditingStudioWorkspaceProps> = ({
   sourceVariant,
   availableProjects = [],
   ownerUid = 'user-local',
+  sessionManager = sharedCanonicalEditorSession,
+  onFetchCanonicalProject,
   onSaveToProjectLibrary,
   onNotify,
 }) => {
-  // Resolve initial CanonicalProjectDocument with owner-scoped, revision-checked localStorage draft recovery
+  const isStandalone = mode === 'standalone-route';
+
+  // Resolve initial CanonicalProjectDocument with shared session + owner-scoped localStorage draft recovery
   const initialCanonicalDoc = useMemo<CanonicalProjectDocument>(() => {
     const safeOwnerUid = ownerUid || 'user-local';
+    const existingSession = isStandalone ? sessionManager.getState() : null;
+    const existingSessionDoc = existingSession?.project || null;
+
     if (initialProject) {
+      if (
+        existingSessionDoc &&
+        existingSessionDoc.id === initialProject.id &&
+        existingSessionDoc.ownerUid === safeOwnerUid &&
+        existingSessionDoc.revision >= initialProject.revision
+      ) {
+        return existingSessionDoc;
+      }
       try {
         const savedDraft = window.localStorage.getItem(
           `sowveil.canonical.autosave.${safeOwnerUid}.${initialProject.id}`
@@ -193,6 +223,15 @@ export const EditingStudioWorkspace: React.FC<EditingStudioWorkspaceProps> = ({
     }
 
     if (sourceLibraryProject) {
+      if (
+        existingSessionDoc &&
+        existingSessionDoc.id === sourceLibraryProject.id &&
+        existingSessionDoc.ownerUid === safeOwnerUid &&
+        existingSessionDoc.revision >= (sourceLibraryProject.revision || 1)
+      ) {
+        return existingSessionDoc;
+      }
+
       let baseProject: CanonicalProjectDocument | null = null;
       try {
         const migrated = migrateToCanonicalProject(sourceLibraryProject, safeOwnerUid);
@@ -240,6 +279,13 @@ export const EditingStudioWorkspace: React.FC<EditingStudioWorkspaceProps> = ({
       });
     }
 
+    if (
+      existingSessionDoc &&
+      existingSessionDoc.ownerUid === safeOwnerUid
+    ) {
+      return existingSessionDoc;
+    }
+
     // Try recovering last active project in standalone route mode (strictly owner-scoped)
     try {
       const lastActiveRaw = window.localStorage.getItem(
@@ -267,10 +313,29 @@ export const EditingStudioWorkspace: React.FC<EditingStudioWorkspaceProps> = ({
       fps: 60,
       durationSec: 6,
     });
-  }, [initialProject, sourceLibraryProject, sourceTemplate, sourceVariant, ownerUid]);
+  }, [
+    initialProject,
+    sourceLibraryProject,
+    sourceTemplate,
+    sourceVariant,
+    ownerUid,
+    isStandalone,
+    sessionManager,
+  ]);
+
+  const initialSessionSnapshot = isStandalone ? sessionManager.getState() : null;
+  const reuseExistingSessionStore = Boolean(
+    isStandalone &&
+      sessionManager.getStore() &&
+      initialSessionSnapshot?.project &&
+      initialSessionSnapshot.project.id === initialCanonicalDoc.id &&
+      initialSessionSnapshot.project.revision >= initialCanonicalDoc.revision
+  );
 
   const storeRef = useRef<CanonicalProjectStore>(
-    new CanonicalProjectStore(initialCanonicalDoc)
+    reuseExistingSessionStore && sessionManager.getStore()
+      ? (sessionManager.getStore() as CanonicalProjectStore)
+      : new CanonicalProjectStore(initialCanonicalDoc)
   );
   const [project, setProject] = useState<CanonicalProjectDocument>(() =>
     storeRef.current.getProject()
@@ -283,51 +348,190 @@ export const EditingStudioWorkspace: React.FC<EditingStudioWorkspaceProps> = ({
   const [lastReceipt, setLastReceipt] = useState<ProjectCommandReceipt | null>(null);
   const [receiptHistory, setReceiptHistory] = useState<ProjectCommandReceipt[]>([]);
 
-  // Reset store when initialCanonicalDoc identity changes
-  useEffect(() => {
-    const nextStore = new CanonicalProjectStore(initialCanonicalDoc);
-    storeRef.current = nextStore;
-    const doc = nextStore.getProject();
-    setProject(doc);
-    setSelectedClipId(doc.tracks[0]?.clips[0]?.id || null);
-    setSelectedTrackId(doc.tracks[0]?.id || null);
-    setSelectedSceneId(doc.scenes[0]?.id || null);
-    setMultiSelectedClipIds([]);
-    setPlayheadSec(0);
-    setIsPlaying(false);
-    setReceiptHistory([]);
-    setLastReceipt(null);
-  }, [initialCanonicalDoc]);
-
-  const [playheadSec, setPlayheadSec] = useState<number>(0);
+  const [playheadSec, setPlayheadSec] = useState<number>(() =>
+    reuseExistingSessionStore && initialSessionSnapshot
+      ? initialSessionSnapshot.playheadSec
+      : 0
+  );
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
-  const [loopEnabled, setLoopEnabled] = useState<boolean>(true);
-  const [snapEnabled, setSnapEnabled] = useState<boolean>(true);
+  const [loopEnabled, setLoopEnabled] = useState<boolean>(() =>
+    reuseExistingSessionStore && initialSessionSnapshot
+      ? initialSessionSnapshot.loopEnabled
+      : true
+  );
+  const [snapEnabled, setSnapEnabled] = useState<boolean>(() =>
+    reuseExistingSessionStore && initialSessionSnapshot
+      ? initialSessionSnapshot.snapEnabled
+      : true
+  );
   const [timelineZoom, setTimelineZoom] = useState<number>(1.0);
 
-  const [selectedTrackId, setSelectedTrackId] = useState<string | null>(
-    project.tracks[0]?.id || null
+  const [selectedTrackId, setSelectedTrackId] = useState<string | null>(() =>
+    reuseExistingSessionStore && initialSessionSnapshot?.selectedTrackId
+      ? initialSessionSnapshot.selectedTrackId
+      : project.tracks[0]?.id || null
   );
-  const [selectedClipId, setSelectedClipId] = useState<string | null>(
-    project.tracks[0]?.clips[0]?.id || null
+  const [selectedClipId, setSelectedClipId] = useState<string | null>(() =>
+    reuseExistingSessionStore && initialSessionSnapshot?.selectedClipId
+      ? initialSessionSnapshot.selectedClipId
+      : project.tracks[0]?.clips[0]?.id || null
   );
-  const [selectedSceneId, setSelectedSceneId] = useState<string | null>(
-    project.scenes[0]?.id || null
+  const [selectedSceneId, setSelectedSceneId] = useState<string | null>(() =>
+    reuseExistingSessionStore && initialSessionSnapshot?.selectedSceneId
+      ? initialSessionSnapshot.selectedSceneId
+      : project.scenes[0]?.id || null
   );
-  const [multiSelectedClipIds, setMultiSelectedClipIds] = useState<string[]>([]);
+  const [multiSelectedClipIds, setMultiSelectedClipIds] = useState<string[]>(() =>
+    reuseExistingSessionStore && initialSessionSnapshot
+      ? initialSessionSnapshot.multiSelectedClipIds
+      : []
+  );
 
   const [openInspectorSection, setOpenInspectorSection] =
     useState<ProInspectorTab>('transform');
   const lastSyncedRevisionRef = useRef<number>(
-    sourceLibraryProject?.revision || initialCanonicalDoc.revision || 1
+    reuseExistingSessionStore && initialSessionSnapshot?.lastSavedRevision != null
+      ? initialSessionSnapshot.lastSavedRevision
+      : sourceLibraryProject?.revision || initialCanonicalDoc.revision || 1
   );
+  const [saveState, setSaveState] = useState<CanonicalSaveState>(() => {
+    if (reuseExistingSessionStore && initialSessionSnapshot) {
+      return initialSessionSnapshot.saveState;
+    }
+    return typeof navigator !== 'undefined' && navigator.onLine === false
+      ? 'Offline Draft'
+      : 'Saved';
+  });
   const [autosaveState, setAutosaveState] = useState<
     'synced' | 'local-draft-unsynced' | 'saving'
   >(() =>
     typeof navigator !== 'undefined' && navigator.onLine === false
       ? 'local-draft-unsynced'
+      : reuseExistingSessionStore &&
+        initialSessionSnapshot &&
+        initialSessionSnapshot.saveState !== 'Saved'
+      ? 'local-draft-unsynced'
       : 'synced'
   );
+
+  // Reset or sync store when initialCanonicalDoc identity changes
+  useEffect(() => {
+    const existingStore = isStandalone ? sessionManager.getStore() : null;
+    const existingState = isStandalone ? sessionManager.getState() : null;
+    if (
+      existingStore &&
+      existingState?.project &&
+      existingState.project.id === initialCanonicalDoc.id &&
+      existingState.project.revision >= initialCanonicalDoc.revision
+    ) {
+      storeRef.current = existingStore;
+      const doc = existingStore.getProject();
+      setProject(doc);
+      setSelectedClipId(existingState.selectedClipId || doc.tracks[0]?.clips[0]?.id || null);
+      setSelectedTrackId(existingState.selectedTrackId || doc.tracks[0]?.id || null);
+      setSelectedSceneId(existingState.selectedSceneId || doc.scenes[0]?.id || null);
+      setMultiSelectedClipIds(existingState.multiSelectedClipIds || []);
+      setPlayheadSec(existingState.playheadSec || 0);
+      setSaveState(existingState.saveState);
+      if (existingState.lastSavedRevision != null) {
+        lastSyncedRevisionRef.current = existingState.lastSavedRevision;
+      }
+      return;
+    }
+
+    const nextStore = new CanonicalProjectStore(initialCanonicalDoc);
+    storeRef.current = nextStore;
+    const doc = nextStore.getProject();
+    setProject(doc);
+    const firstClipId = doc.tracks[0]?.clips[0]?.id || null;
+    const firstTrackId = doc.tracks[0]?.id || null;
+    const firstSceneId = doc.scenes[0]?.id || null;
+    setSelectedClipId(firstClipId);
+    setSelectedTrackId(firstTrackId);
+    setSelectedSceneId(firstSceneId);
+    setMultiSelectedClipIds(firstClipId ? [firstClipId] : []);
+    setPlayheadSec(0);
+    setIsPlaying(false);
+    setReceiptHistory([]);
+    setLastReceipt(null);
+    lastSyncedRevisionRef.current = doc.revision;
+    const nextSaveState: CanonicalSaveState =
+      typeof navigator !== 'undefined' && navigator.onLine === false
+        ? 'Offline Draft'
+        : 'Saved';
+    setSaveState(nextSaveState);
+
+    if (isStandalone) {
+      sessionManager.syncExternalStore(nextStore, {
+        mode: 'active-project',
+        saveState: nextSaveState,
+        lastSavedRevision: doc.revision,
+      });
+    }
+  }, [initialCanonicalDoc, isStandalone, sessionManager]);
+
+  // If onFetchCanonicalProject is provided and sourceLibraryProject has an ID, verify authoritative server revision
+  useEffect(() => {
+    if (!isStandalone || !sourceLibraryProject?.id || !onFetchCanonicalProject) return;
+    let cancelled = false;
+    void onFetchCanonicalProject(sourceLibraryProject.id)
+      .then((res) => {
+        if (cancelled || !res?.project) return;
+        const currentDoc = storeRef.current.getProject();
+        if (
+          res.project.id === currentDoc.id &&
+          res.project.revision > currentDoc.revision
+        ) {
+          const nextStore = new CanonicalProjectStore(res.project);
+          storeRef.current = nextStore;
+          const doc = nextStore.getProject();
+          setProject(doc);
+          lastSyncedRevisionRef.current = doc.revision;
+          setSaveState('Saved');
+          setAutosaveState('synced');
+          sessionManager.syncExternalStore(nextStore, {
+            mode: 'active-project',
+            saveState: 'Saved',
+            lastSavedRevision: doc.revision,
+          });
+        }
+      })
+      .catch(() => {
+        // Keep current hydrated project if offline or unpersisted
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isStandalone, sourceLibraryProject?.id, onFetchCanonicalProject, sessionManager]);
+
+  // Sync selection and transport into shared session when in standalone route mode
+  useEffect(() => {
+    if (!isStandalone) return;
+    sessionManager.setSelection({
+      selectedClipId,
+      multiSelectedClipIds,
+      selectedTrackId,
+      selectedSceneId,
+    });
+  }, [
+    isStandalone,
+    sessionManager,
+    selectedClipId,
+    multiSelectedClipIds,
+    selectedTrackId,
+    selectedSceneId,
+  ]);
+
+  useEffect(() => {
+    if (!isStandalone) return;
+    sessionManager.setTransport({
+      playheadSec,
+      isPlaying,
+      loopEnabled,
+      snapEnabled,
+    });
+  }, [isStandalone, sessionManager, playheadSec, isPlaying, loopEnabled, snapEnabled]);
+
   const [titleInput, setTitleInput] = useState<string>(project.title);
   const [snapshotLabelInput, setSnapshotLabelInput] = useState<string>('');
   const [branchNameInput, setBranchNameInput] = useState<string>('');
@@ -434,6 +638,20 @@ export const EditingStudioWorkspace: React.FC<EditingStudioWorkspaceProps> = ({
     setLastReceipt(receipt);
     setReceiptHistory((prev) => [receipt, ...prev].slice(0, 35));
 
+    if (receipt.ok) {
+      const nextSaveState: CanonicalSaveState =
+        typeof navigator !== 'undefined' && navigator.onLine === false
+          ? 'Offline Draft'
+          : 'Unsaved Changes';
+      setSaveState(nextSaveState);
+      if (isStandalone) {
+        sessionManager.syncExternalStore(storeRef.current, {
+          mode: 'active-project',
+          saveState: nextSaveState,
+        });
+      }
+    }
+
     if (!receipt.ok) {
       onNotify(
         `Command rejected (${cmd.type}): ${receipt.errors.join('; ')}`,
@@ -447,10 +665,22 @@ export const EditingStudioWorkspace: React.FC<EditingStudioWorkspaceProps> = ({
 
   const handleUndo = () => {
     const receipt = storeRef.current.undo(ownerUid);
-    setProject(storeRef.current.getProject());
+    const updatedDoc = storeRef.current.getProject();
+    setProject(updatedDoc);
     setLastReceipt(receipt);
     setReceiptHistory((prev) => [receipt, ...prev].slice(0, 35));
     if (receipt.ok) {
+      const nextSaveState: CanonicalSaveState =
+        typeof navigator !== 'undefined' && navigator.onLine === false
+          ? 'Offline Draft'
+          : 'Unsaved Changes';
+      setSaveState(nextSaveState);
+      if (isStandalone) {
+        sessionManager.syncExternalStore(storeRef.current, {
+          mode: 'active-project',
+          saveState: nextSaveState,
+        });
+      }
       onNotify(`Undid edit → Revision r${receipt.revision}`, 'info');
     } else {
       onNotify(receipt.errors[0] || 'Nothing to undo.', 'warning');
@@ -459,10 +689,22 @@ export const EditingStudioWorkspace: React.FC<EditingStudioWorkspaceProps> = ({
 
   const handleRedo = () => {
     const receipt = storeRef.current.redo(ownerUid);
-    setProject(storeRef.current.getProject());
+    const updatedDoc = storeRef.current.getProject();
+    setProject(updatedDoc);
     setLastReceipt(receipt);
     setReceiptHistory((prev) => [receipt, ...prev].slice(0, 35));
     if (receipt.ok) {
+      const nextSaveState: CanonicalSaveState =
+        typeof navigator !== 'undefined' && navigator.onLine === false
+          ? 'Offline Draft'
+          : 'Unsaved Changes';
+      setSaveState(nextSaveState);
+      if (isStandalone) {
+        sessionManager.syncExternalStore(storeRef.current, {
+          mode: 'active-project',
+          saveState: nextSaveState,
+        });
+      }
       onNotify(`Redid edit → Revision r${receipt.revision}`, 'info');
     } else {
       onNotify(receipt.errors[0] || 'Nothing to redo.', 'warning');
@@ -606,6 +848,13 @@ export const EditingStudioWorkspace: React.FC<EditingStudioWorkspaceProps> = ({
         // Ignore storage quota
       }
       setAutosaveState('local-draft-unsynced');
+      setSaveState('Offline Draft');
+      if (isStandalone) {
+        sessionManager.syncExternalStore(storeRef.current, {
+          mode: 'active-project',
+          saveState: 'Offline Draft',
+        });
+      }
       onNotify(
         `Offline: Saved "${syncedDoc.title}" (rev r${syncedDoc.revision}) as a local draft on this device. It is not yet synced to cloud Project Library.`,
         'warning'
@@ -618,20 +867,40 @@ export const EditingStudioWorkspace: React.FC<EditingStudioWorkspaceProps> = ({
       id: targetProjectId,
       ownerUid: safeOwnerUid,
     };
+    setSaveState('Saving');
     try {
       await onSaveToProjectLibrary(record, targetProjectId);
       lastSyncedRevisionRef.current = syncedDoc.revision;
       setAutosaveState('synced');
+      setSaveState('Saved');
+      if (isStandalone) {
+        sessionManager.syncExternalStore(storeRef.current, {
+          mode: 'active-project',
+          saveState: 'Saved',
+          lastSavedRevision: syncedDoc.revision,
+        });
+      }
       onNotify(
         `Saved canonical project "${syncedDoc.title}" (ID: ${targetProjectId} · rev r${syncedDoc.revision}) to Project Library.`,
         'success'
       );
     } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Persistence error';
+      const isConflict =
+        msg.includes('409') ||
+        msg.includes('REVISION_CONFLICT') ||
+        msg.toLowerCase().includes('conflict');
+      const nextSaveState: CanonicalSaveState = isConflict ? 'Conflict' : 'Failed';
       setAutosaveState('local-draft-unsynced');
+      setSaveState(nextSaveState);
+      if (isStandalone) {
+        sessionManager.syncExternalStore(storeRef.current, {
+          mode: 'active-project',
+          saveState: nextSaveState,
+        });
+      }
       onNotify(
-        `Failed to sync project to Project Library (changes kept as local draft only): ${
-          err instanceof Error ? err.message : 'Persistence error'
-        }`,
+        `Failed to sync project to Project Library (changes kept as local draft only): ${msg}`,
         'error'
       );
     }
@@ -715,7 +984,19 @@ export const EditingStudioWorkspace: React.FC<EditingStudioWorkspaceProps> = ({
     }
 
     storeRef.current.commitValidatedProjectState(res.project, 'createSnapshot');
-    setProject(storeRef.current.getProject());
+    const updatedDoc = storeRef.current.getProject();
+    setProject(updatedDoc);
+    const nextSaveState: CanonicalSaveState =
+      typeof navigator !== 'undefined' && navigator.onLine === false
+        ? 'Offline Draft'
+        : 'Unsaved Changes';
+    setSaveState(nextSaveState);
+    if (isStandalone) {
+      sessionManager.syncExternalStore(storeRef.current, {
+        mode: 'active-project',
+        saveState: nextSaveState,
+      });
+    }
     if (res.receipts.length > 0) {
       setLastReceipt(res.receipts[res.receipts.length - 1]);
       setReceiptHistory((prev) => [...res.receipts.reverse(), ...prev].slice(0, 35));
@@ -814,12 +1095,26 @@ export const EditingStudioWorkspace: React.FC<EditingStudioWorkspaceProps> = ({
                 if (chosen) {
                   try {
                     const migrated = migrateToCanonicalProject(chosen, ownerUid);
+                    migrated.project.id = chosen.id;
+                    if (typeof chosen.revision === 'number' && chosen.revision >= 1) {
+                      migrated.project.revision = chosen.revision;
+                    }
                     const nextStore = new CanonicalProjectStore(migrated.project);
                     storeRef.current = nextStore;
-                    setProject(nextStore.getProject());
-                    setSelectedClipId(
-                      nextStore.getProject().tracks[0]?.clips[0]?.id || null
-                    );
+                    const doc = nextStore.getProject();
+                    setProject(doc);
+                    setSelectedClipId(doc.tracks[0]?.clips[0]?.id || null);
+                    setSelectedTrackId(doc.tracks[0]?.id || null);
+                    lastSyncedRevisionRef.current = doc.revision;
+                    setSaveState('Saved');
+                    setAutosaveState('synced');
+                    if (isStandalone) {
+                      sessionManager.syncExternalStore(nextStore, {
+                        mode: 'active-project',
+                        saveState: 'Saved',
+                        lastSavedRevision: doc.revision,
+                      });
+                    }
                     onNotify(`Opened project "${chosen.title}" in Editing Studio.`, 'info');
                   } catch (err) {
                     onNotify(
@@ -872,6 +1167,21 @@ export const EditingStudioWorkspace: React.FC<EditingStudioWorkspaceProps> = ({
           </form>
 
           <span
+            data-testid="editor-save-status-badge"
+            className={`px-2 py-0.5 rounded border text-[10px] font-mono-tabular font-semibold ${
+              saveState === 'Saved'
+                ? 'border-[#55B98B]/40 bg-[#55B98B]/10 text-[#55B98B]'
+                : saveState === 'Saving'
+                ? 'border-[#F06424]/40 bg-[#F06424]/15 text-[#F06424]'
+                : saveState === 'Unsaved Changes' || saveState === 'Offline Draft'
+                ? 'border-[#E4B45A]/40 bg-[#E4B45A]/15 text-[#E4B45A]'
+                : 'border-[#F06464]/50 bg-[#F06464]/15 text-[#F06464]'
+            }`}
+          >
+            {saveState} · r{project.revision}
+          </span>
+
+          <span
             data-testid="editor-autosave-status"
             className={`hidden xl:inline text-[11px] font-mono-tabular ${
               autosaveState === 'local-draft-unsynced'
@@ -920,6 +1230,18 @@ export const EditingStudioWorkspace: React.FC<EditingStudioWorkspaceProps> = ({
 
         {/* Touch-Safe Undo / Redo / Save / Export / Close Controls (>= 44px height) */}
         <div className="flex items-center gap-1.5">
+          {isStandalone && (
+            <Link
+              to={`/app/landscape-studio/${project.id}`}
+              data-testid="switch-to-landscape-studio-link"
+              title="Open same canonical project in Landscape Creative Studio"
+              className="min-h-[44px] px-2.5 rounded-lg border border-[#2A231E] bg-[#141210] hover:border-[#F06424] inline-flex items-center gap-1.5 text-xs font-medium text-[#D8CFC8]"
+            >
+              <MonitorPlay className="w-3.5 h-3.5 text-[#F06424]" />
+              <span className="hidden md:inline">Landscape Studio</span>
+            </Link>
+          )}
+
           <button
             type="button"
             onClick={handleUndo}
